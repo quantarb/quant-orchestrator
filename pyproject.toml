@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quant-orchestrator"
+version = "0.1.0"
+description = "Workflow and backtesting adapters around Quant Warehouse data."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Quant Orchestrator" }]
+keywords = ["quant", "trading", "backtesting", "orchestration", "dagster"]
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "quant-warehouse @ git+https://github.com/quantarb/quant-warehouse.git@main",
+]
+
+[project.optional-dependencies]
+ml = [
+    "scikit-learn>=1.4",
+]
+backtests = [
+    "zipline-reloaded==3.1.1",
+    "nautilus-trader==1.228.0",
+]
+dagster = [
+    "dagster>=1.13,<2",
+]
+tracking = [
+    "mlflow>=3.1,<4",
+]
+options = [
+    "optopsy>=2.3,<3",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+all = [
+    "scikit-learn>=1.4",
+    "zipline-reloaded==3.1.1",
+    "nautilus-trader==1.228.0",
+    "dagster>=1.13,<2",
+    "mlflow>=3.1,<4",
+    "optopsy>=2.3,<3",
+]
+
+[project.scripts]
+quant-orchestrator = "quant_orchestrator.cli:main"
+
+[project.entry-points."quant_orchestrator.ml_framework"]
+sklearn = "quant_orchestrator.ml_frameworks.sklearn:sklearn_provider"
+torch = "quant_orchestrator.ml_frameworks.torch:torch_provider"
+transformers = "quant_orchestrator.ml_frameworks.transformers:transformers_provider"
+
+[project.entry-points."quant_orchestrator.backtest_engine"]
+pandas = "quant_orchestrator.backtest_engines.pandas:pandas_provider"
+zipline = "quant_orchestrator.backtest_engines.zipline:zipline_provider"
+nautilus = "quant_orchestrator.backtest_engines.nautilus:nautilus_provider"
+optopsy = "quant_orchestrator.backtest_engines.optopsy:optopsy_provider"
+
+[project.entry-points."quant_orchestrator.broker"]
+alpaca = "quant_orchestrator.brokers.alpaca:alpaca_provider"
+robinhood = "quant_orchestrator.brokers.robinhood:robinhood_provider"
+
+[project.entry-points."quant_orchestrator.experiment_tracker"]
+mlflow = "quant_orchestrator.experiment_trackers.mlflow:mlflow_provider"
+
+[tool.hatch.build.targets.wheel]
+packages = ["quant_orchestrator"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
