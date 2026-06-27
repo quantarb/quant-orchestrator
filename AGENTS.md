@@ -51,3 +51,7 @@
 - Optimize model training and simulation code for CUDA-first execution when the selected ML framework supports it.
 - Prefer GPU-native libraries such as PyTorch CUDA and RAPIDS/CuPy where they fit the workflow.
 - Do not keep slow CPU compatibility paths unless they are the only practical path for a required dependency.
+
+## Resume Point
+
+- Before extending the platform shape, read `docs/orchestrator-vision.md` and keep the current repository code as the source of truth for any claims.
