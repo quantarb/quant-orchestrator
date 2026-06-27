@@ -39,9 +39,3 @@ class BacktestingFramework(Protocol):
 
     def run(self, strategy: Any, data: Any, **kwargs: Any) -> Any:
         """Run a strategy against data and return an engine-specific result."""
-
-
-# Backward-compatible name for older research code.
-BacktestEngine = BacktestingFramework
-
-

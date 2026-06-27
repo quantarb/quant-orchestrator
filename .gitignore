@@ -9,3 +9,5 @@ build/
 dist/
 artifacts/
 mlruns/
+notebooks/outputs/
+notebooks/.ipynb_checkpoints/

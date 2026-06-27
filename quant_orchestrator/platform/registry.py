@@ -10,10 +10,6 @@ ENTRY_POINT_GROUPS = {
     "backtesting_framework": "quant_orchestrator.backtesting_framework",
 }
 
-LEGACY_ENTRY_POINT_GROUPS = {
-    "backtesting_framework": ("quant_orchestrator.backtest_engine",),
-}
-
 
 class ProviderRegistry:
     """Runtime registry for built-in and installed orchestrator providers."""
@@ -65,25 +61,24 @@ class ProviderRegistry:
         if self._loaded_entry_points:
             return
         for category, group in ENTRY_POINT_GROUPS.items():
-            for candidate_group in (group, *LEGACY_ENTRY_POINT_GROUPS.get(category, ())):
-                for entry_point in entry_points(group=candidate_group):
-                    loaded = entry_point.load()
-                    manifest = (
-                        loaded()
-                        if callable(loaded) and not isinstance(loaded, ProviderManifest)
-                        else loaded
+            for entry_point in entry_points(group=group):
+                loaded = entry_point.load()
+                manifest = (
+                    loaded()
+                    if callable(loaded) and not isinstance(loaded, ProviderManifest)
+                    else loaded
+                )
+                if not isinstance(manifest, ProviderManifest):
+                    raise TypeError(
+                        f"Entry point {entry_point.name!r} in {group!r} "
+                        "did not return ProviderManifest",
                     )
-                    if not isinstance(manifest, ProviderManifest):
-                        raise TypeError(
-                            f"Entry point {entry_point.name!r} in {candidate_group!r} "
-                            "did not return ProviderManifest",
-                        )
-                    if _normalize_category(manifest.category) != category:
-                        raise ValueError(
-                            f"Entry point {entry_point.name!r} category mismatch: "
-                            f"{manifest.category!r}",
-                        )
-                    self.register(manifest)
+                if _normalize_category(manifest.category) != category:
+                    raise ValueError(
+                        f"Entry point {entry_point.name!r} category mismatch: "
+                        f"{manifest.category!r}",
+                    )
+                self.register(manifest)
         self._loaded_entry_points = True
 
 
@@ -94,13 +89,7 @@ def _normalize_category(category: str) -> str:
     normalized = str(category).strip().lower().replace("-", "_")
     aliases = {
         "ml": "ml_framework",
-        "ml_frameworks": "ml_framework",
-        "backtest": "backtesting_framework",
-        "backtests": "backtesting_framework",
-        "backtest_engine": "backtesting_framework",
-        "backtest_engines": "backtesting_framework",
         "backtesting": "backtesting_framework",
-        "backtesting_frameworks": "backtesting_framework",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in ENTRY_POINT_GROUPS:

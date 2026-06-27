@@ -23,6 +23,10 @@ dependencies = [
 ml = [
     "scikit-learn>=1.4",
 ]
+cuda = [
+    "torch>=2.5",
+    "cupy-cuda12x>=13",
+]
 backtesting = [
     "zipline-reloaded==3.1.1",
     "nautilus-trader==1.228.0",
@@ -36,6 +40,8 @@ dev = [
 ]
 all = [
     "scikit-learn>=1.4",
+    "torch>=2.5",
+    "cupy-cuda12x>=13",
     "zipline-reloaded==3.1.1",
     "nautilus-trader==1.228.0",
     "optopsy>=2.3,<3",

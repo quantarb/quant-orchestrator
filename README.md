@@ -31,6 +31,14 @@ For just ThetaData-backed options backtests through Optopsy:
 pip install -e ".[options]"
 ```
 
+For CUDA-first PyTorch workflows, install the CUDA extra and use the PyTorch wheel index that matches the host driver:
+
+```bash
+pip install -e ".[cuda]"
+# Example for CUDA 12.4:
+pip install --index-url https://download.pytorch.org/whl/cu124 torch
+```
+
 ## Provider Platform
 
 `quant-orchestrator` follows an OpenBB-style provider layout for model and backtesting extension categories:
@@ -58,8 +66,6 @@ engine_cls = registry.adapter("backtesting_framework", "optopsy")
 engine = engine_cls()
 ```
 
-Legacy `backtest_engine` registry lookups are accepted as aliases for `backtesting_framework`.
-
 ## Experiment Tracking
 
 MLflow is the built-in experiment tracker. Use it through the orchestrator tracking interface so Dagster jobs, backtests, and model training code have one consistent tracking API:
@@ -80,6 +86,10 @@ log_backtest_run(
 
 By default, tracking uses `sqlite:///artifacts/mlflow/mlflow.db`. Override it
 with `tracking_uri=...`, `QUANT_ORCHESTRATOR_MLFLOW_TRACKING_URI`, or `MLFLOW_TRACKING_URI`.
+
+## Notebook Boundary
+
+Use `notebooks/` for one-off research workflows that consume prepared datasets from `quant-warehouse`: model training, backtesting, walk-forward analysis, Monte Carlo analysis, and equity-curve analysis. Do not build feature families, labels, warehouse refreshes, or vendor data pulls in this repo; implement those in `quant-warehouse` first and consume the resulting dataset here.
 
 ## Load data
 
