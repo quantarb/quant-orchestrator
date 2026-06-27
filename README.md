@@ -1,6 +1,8 @@
 # Quant Orchestrator
 
-Opinionated Dagster and MLflow research orchestration around data stored in `quant-warehouse`.
+Composable Dagster and MLflow research orchestration around data stored in `quant-warehouse`.
+
+`quant-orchestrator` should coordinate research workflows without assuming a single shape. A run can be ML training only, backtesting only, training followed by backtesting, or an external-engine strategy run that uses warehouse data and stores the native outputs.
 
 ## Environment
 
@@ -39,7 +41,17 @@ pip install -e ".[cuda]"
 pip install --index-url https://download.pytorch.org/whl/cu124 torch
 ```
 
-## Provider Platform
+## Platform Capabilities
+
+The platform contract is intentionally small:
+
+- resolve prepared datasets from `quant-warehouse`
+- run ML framework adapters when a workflow needs model training or inference
+- run backtesting framework adapters when a workflow needs strategy evaluation
+- track runs in MLflow
+- store native model, report, prediction, backtest, and strategy artifacts in the artifact registry
+
+These capabilities are independent. A workflow does not need an ML model to run a backtest, and it does not need a backtest to train a model.
 
 `quant-orchestrator` follows an OpenBB-style provider layout for model and backtesting extension categories:
 
@@ -66,6 +78,8 @@ engine_cls = registry.adapter("backtesting_framework", "optopsy")
 engine = engine_cls()
 ```
 
+Backtesting framework providers are adapters around native engines, not strategy assumptions. For example, a QuantConnect strategy should be exposed through a backtesting framework adapter or runner that receives prepared `quant-warehouse` data, runs the native QuantConnect strategy, and registers whatever files/reports that engine emits.
+
 ## Experiment Tracking
 
 MLflow is the built-in experiment tracker. Use it through the orchestrator tracking interface so Dagster jobs, backtests, and model training code have one consistent tracking API:
@@ -89,7 +103,7 @@ with `tracking_uri=...`, `QUANT_ORCHESTRATOR_MLFLOW_TRACKING_URI`, or `MLFLOW_TR
 
 ## Artifact Registry
 
-`quant-orchestrator` owns ML training, backtest, model, prediction, and strategy artifacts. Apps such as `optimal_trader` should ask the orchestrator to train or backtest, then load the returned artifact URI or path instead of maintaining separate research storage.
+`quant-orchestrator` owns ML training, backtest, model, prediction, and strategy artifacts. Downstream apps should ask the orchestrator to train, infer, backtest, or run external strategy evaluations, then load the returned artifact URI or path instead of maintaining separate research storage.
 
 The registry is intentionally schema-light: sklearn, PyTorch, Flair NLP, Zipline, NautilusTrader, and other frameworks can save their native files, directories, dataframes, JSON, text reports, or pickled objects without forcing every output into one common report shape.
 
@@ -117,7 +131,7 @@ By default artifacts are written under `artifacts/orchestrator`. Override this w
 
 ## Notebook Boundary
 
-Use `notebooks/` for one-off research workflows that consume prepared datasets from `quant-warehouse`: model training, backtesting, walk-forward analysis, Monte Carlo analysis, and equity-curve analysis. Do not build feature families, labels, warehouse refreshes, or vendor data pulls in this repo; implement those in `quant-warehouse` first and consume the resulting dataset here.
+Use `notebooks/` for one-off research workflows and demonstrations that consume prepared datasets from `quant-warehouse`. If a workflow becomes a repeated platform capability, move the reusable part into package code and keep the notebook as an example. Do not build feature families, labels, warehouse refreshes, or vendor data pulls in this repo; implement those in `quant-warehouse` first and consume the resulting dataset here.
 
 ## Load data
 
@@ -134,7 +148,7 @@ conda activate quant-warehouse
 quant-warehouse refresh AAPL --sections prices --providers yfinance
 ```
 
-## Run examples
+## Built-In Examples
 
 ```bash
 quant-orchestrator --framework all --symbols AAPL --start 2023-01-01 --fast-window 5 --slow-window 10
@@ -145,38 +159,7 @@ quant-orchestrator --framework nautilus --symbols AAPL --start 2020-01-01
 
 Zipline Reloaded uses `run_algorithm()` with a temporary CSV bundle built from Quant Warehouse prices. NautilusTrader uses `BacktestEngine` and `BarDataWrangler` to convert the same OHLCV frame into Nautilus bar objects.
 
-The printed table separates normalized strategy performance from framework runtime. All frameworks are scored with the same daily close, long/flat, fixed-share SMA crossover model so return, drawdown, volatility, and trade counts are comparable. Runtime still includes each framework adapter's setup and backtest execution.
-
-## Trading App Equity
-
-The `trading-app-equity` strategy ports the equity-only variant of the `optimal_trader` trading app signal into Zipline Reloaded and NautilusTrader. It loads an ML prediction artifact with `date`, `symbol`, and score columns, selects top `prob_buy` long candidates, and runs equal-weight equity targets.
-
-```bash
-quant-orchestrator --strategy trading-app-equity --framework all \
-  --prediction-artifact artifact:<id> \
-  --top-k 40 --gross-exposure 0.95
-```
-
-Use `--prediction-artifact /path/to/ml_predictions.csv` or `--prediction-artifact artifact:<id>` to pin a historical prediction artifact. If no artifact is provided, the latest registered `trading_app_equity_predictions` artifact is used.
-
-To train the simple equity variant on 2020 Quant Warehouse price features, register its model/prediction artifacts, and backtest from 2021 onward:
-
-```bash
-quant-orchestrator --strategy trading-app-equity --framework all --train-model \
-  --train-start 2020-01-01 --train-end 2020-12-31 --backtest-start 2021-01-01 \
-  --top-k 40 --gross-exposure 0.75
-```
-
-Add `--end 2021-12-31` to run only the 2021 calendar year.
-
-Train and backtest universes can be separated. If `--train-model` is used without `--train-symbols`, the current code falls back to the local `optimal_trader` MoE scored universe file configured in `quant_orchestrator.trading_app_equity`.
-
-```bash
-quant-orchestrator --strategy trading-app-equity --framework zipline --train-model \
-  --train-symbols AAPL MSFT NVDA AMZN GOOGL META TSLA \
-  --backtest-symbols SPY QQQ IWM \
-  --train-start 2020-01-01 --train-end 2021-12-31 --backtest-start 2022-01-01
-```
+The CLI examples are smoke tests and adapter demonstrations, not the platform contract. They use a simple SMA strategy so framework runtime and output shape can be compared without implying that every workflow is equity-only or ML-driven.
 
 ## Scheduled Orchestration
 
@@ -186,41 +169,25 @@ Dagster definitions live in `quant_orchestrator.dagster_defs`:
 dagster dev -m quant_orchestrator.dagster_defs
 ```
 
-The module exposes `trading_app_experiment_job` plus daily and weekday schedules. The job
-uses `TradingAppExperimentSpec`, can train on one symbol universe and backtest on another,
-and logs summaries through MLflow.
+The current module exposes an example scheduled experiment job. Production research jobs should compose the same platform capabilities: load warehouse data, run the selected ML framework or backtesting framework only when needed, and register native artifacts.
 
-## Walk-Forward and Monte Carlo
+## Optional Experiment Primitives
 
-The experiment layer supports fixed, anchored, and rolling windows:
+Walk-forward windows and Monte Carlo simulation are reusable primitives, not required workflow assumptions. Use them when the experiment needs them; train-only and backtest-only workflows can ignore them.
 
 ```python
-from quant_orchestrator.experiments import TradingAppExperimentSpec, UniverseSplit, WindowSpec
-from quant_orchestrator.trading_app_experiments import run_trading_app_experiment
+from quant_orchestrator.experiments import WindowSpec, build_walk_forward_windows
 
-spec = TradingAppExperimentSpec(
-    name="anchored-trading-app",
-    train_model=True,
-    framework="zipline",
-    universe=UniverseSplit(
-        train=("AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA"),
-        backtest=("SPY", "QQQ", "IWM"),
-    ),
-    window=WindowSpec(
-        mode="anchored",
+windows = build_walk_forward_windows(
+    WindowSpec(
+        mode="rolling",
         train_start="2020-01-01",
         train_end="2020-12-31",
         test_start="2021-01-01",
-        test_end="2022-12-31",
-        step="30D",
-        test_length="30D",
-    ),
+        test_end="2021-12-31",
+    )
 )
-
-summary = run_trading_app_experiment(spec)
 ```
-
-Monte Carlo simulations are available as reusable primitives:
 
 ```python
 from quant_orchestrator.monte_carlo import simulate_return_paths
