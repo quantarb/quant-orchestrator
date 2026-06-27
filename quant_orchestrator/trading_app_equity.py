@@ -7,15 +7,12 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from quant_orchestrator.artifacts import ArtifactRecord, get_artifact_store
 from quant_orchestrator.data import load_ohlcv, write_zipline_csv
 
-DEFAULT_ARTIFACT_DIR = Path(
-    "/home/jlee153232/PycharmProjects/optimal_trader/data/pipeline_artifacts"
-)
 OPTIONS_NOTEBOOK_SCORED = Path(
     "/home/jlee153232/PycharmProjects/optimal_trader/artifacts/moe_paper_trading/latest_scored.pkl"
 )
-TRAINED_ARTIFACT_DIR = Path("artifacts/trading_app_equity")
 FEATURE_COLUMNS = (
     "ret_1d",
     "ret_5d",
@@ -50,7 +47,7 @@ def train_price_model_artifact(
     max_symbols: int | None = None,
     horizon_days: int = 21,
     symbols: Sequence[str] | None = None,
-) -> Path:
+) -> ArtifactRecord:
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.impute import SimpleImputer
     from sklearn.pipeline import make_pipeline
@@ -107,12 +104,6 @@ def train_price_model_artifact(
     predictions["side"] = "long"
     predictions = predictions.sort_values(["date", "prob_buy"], ascending=[True, False])
 
-    TRAINED_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    output = TRAINED_ARTIFACT_DIR / (
-        f"trained_price_model_train_{train_start_ts.date()}_{train_end_ts.date()}"
-        f"_score_{backtest_start_ts.date()}.csv"
-    )
-    predictions.to_csv(output, index=False)
     meta = {
         "universe_source": str(OPTIONS_NOTEBOOK_SCORED),
         "universe_symbols": len(training_symbols),
@@ -127,8 +118,49 @@ def train_price_model_artifact(
         "feature_columns": list(FEATURE_COLUMNS),
         "horizon_days": int(horizon_days),
     }
-    output.with_suffix(".json").write_text(pd.Series(meta).to_json(indent=2), encoding="utf-8")
-    return output
+    metrics = {
+        "loaded_symbols": int(panel["symbol"].nunique()),
+        "missing_symbols": float(len(missing)),
+        "train_rows": float(len(train)),
+        "score_rows": float(len(predictions)),
+    }
+    store = get_artifact_store()
+    run = store.create_run(
+        run_type="ml_training",
+        name="trading_app_equity_price_model",
+        params=meta,
+        tags={
+            "strategy": "trading_app_equity",
+            "framework": "sklearn",
+            "data_source": f"quant-warehouse:{provider}",
+        },
+    )
+    try:
+        store.save_pickle(
+            run_id=run.id,
+            kind="ml_model",
+            name="trading_app_equity_price_model",
+            value=model,
+            metadata=meta,
+        )
+        store.save_json(
+            run_id=run.id,
+            kind="ml_training_metadata",
+            name="trading_app_equity_price_model",
+            payload={**meta, "metrics": metrics},
+        )
+        predictions_artifact = store.save_dataframe(
+            run_id=run.id,
+            kind="ml_predictions",
+            name="trading_app_equity_predictions",
+            frame=predictions,
+            metadata=meta,
+        )
+    except Exception as exc:
+        store.fail_run(run.id, exc)
+        raise
+    store.complete_run(run.id, metrics=metrics)
+    return predictions_artifact
 
 
 def _price_feature_frame(
@@ -168,24 +200,17 @@ def _price_feature_frame(
 
 def find_prediction_artifact(path: str | None = None) -> Path:
     if path:
+        if str(path).startswith("artifact:"):
+            return get_artifact_store().get_artifact(path).path
         candidate = Path(path).expanduser().resolve()
         if not candidate.exists():
             raise FileNotFoundError(candidate)
         return candidate
 
-    if OPTIONS_NOTEBOOK_SCORED.exists():
-        return OPTIONS_NOTEBOOK_SCORED
-
-    candidates = []
-    for candidate in DEFAULT_ARTIFACT_DIR.glob("ml_predictions_*.csv"):
-        try:
-            probe = pd.read_csv(candidate, usecols=["date", "symbol"])
-        except Exception:
-            continue
-        candidates.append((probe["symbol"].nunique(), len(probe), probe["date"].nunique(), candidate))
-    if not candidates:
-        raise FileNotFoundError(f"No ml_predictions_*.csv files found in {DEFAULT_ARTIFACT_DIR}")
-    return sorted(candidates, reverse=True)[0][-1]
+    return get_artifact_store().latest_artifact(
+        kind="ml_predictions",
+        name="trading_app_equity_predictions",
+    ).path
 
 
 def load_predictions(path: Path) -> pd.DataFrame:

@@ -87,6 +87,34 @@ log_backtest_run(
 By default, tracking uses `sqlite:///artifacts/mlflow/mlflow.db`. Override it
 with `tracking_uri=...`, `QUANT_ORCHESTRATOR_MLFLOW_TRACKING_URI`, or `MLFLOW_TRACKING_URI`.
 
+## Artifact Registry
+
+`quant-orchestrator` owns ML training, backtest, model, prediction, and strategy artifacts. Apps such as `optimal_trader` should ask the orchestrator to train or backtest, then load the returned artifact URI or path instead of maintaining separate research storage.
+
+The registry is intentionally schema-light: sklearn, PyTorch, Flair NLP, Zipline, NautilusTrader, and other frameworks can save their native files, directories, dataframes, JSON, text reports, or pickled objects without forcing every output into one common report shape.
+
+```python
+from quant_orchestrator.artifacts import get_artifact_store
+
+store = get_artifact_store()
+run = store.create_run(
+    run_type="ml_training",
+    name="flair-news-classifier",
+    params={"dataset": "warehouse:event_labels"},
+)
+report = store.register_file(
+    run_id=run.id,
+    kind="ml_report",
+    name="flair-output",
+    path="outputs/flair-training-run",
+)
+store.complete_run(run.id, metrics={"validation_accuracy": 0.73})
+
+print(report.uri, report.path)
+```
+
+By default artifacts are written under `artifacts/orchestrator`. Override this with `QUANT_ORCHESTRATOR_ARTIFACT_ROOT`.
+
 ## Notebook Boundary
 
 Use `notebooks/` for one-off research workflows that consume prepared datasets from `quant-warehouse`: model training, backtesting, walk-forward analysis, Monte Carlo analysis, and equity-curve analysis. Do not build feature families, labels, warehouse refreshes, or vendor data pulls in this repo; implement those in `quant-warehouse` first and consume the resulting dataset here.
@@ -121,13 +149,13 @@ The printed table separates normalized strategy performance from framework runti
 
 ## Trading App Equity
 
-The `trading-app-equity` strategy ports the equity-only variant of the `optimal_trader` trading app signal into Zipline Reloaded and NautilusTrader. By default it uses the synthetic-options notebook's saved MoE scored universe at `../optimal_trader/artifacts/moe_paper_trading/latest_scored.pkl`, selects top `prob_buy` long candidates, and runs equal-weight equity targets.
+The `trading-app-equity` strategy ports the equity-only variant of the `optimal_trader` trading app signal into Zipline Reloaded and NautilusTrader. It loads orchestrator-registered ML prediction artifacts, selects top `prob_buy` long candidates, and runs equal-weight equity targets.
 
 ```bash
 quant-orchestrator --strategy trading-app-equity --framework all --top-k 40 --gross-exposure 0.95
 ```
 
-Use `--prediction-artifact /path/to/ml_predictions.csv` to pin a historical prediction artifact. The saved options-notebook scored artifact is a latest-score cross-section, so the replay holds those targets forward through locally available Quant Warehouse prices.
+Use `--prediction-artifact /path/to/ml_predictions.csv` or `--prediction-artifact artifact:<id>` to pin a historical prediction artifact. If no artifact is provided, the latest registered `trading_app_equity_predictions` artifact is used.
 
 To train the simple equity variant on 2020 Quant Warehouse price features and backtest from 2021 onward over the same options-notebook universe:
 

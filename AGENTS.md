@@ -13,9 +13,11 @@
 ## Orchestrator Responsibility
 
 - `quant-orchestrator` is responsible for research workflows: training ML models and backtesting those models.
+- `quant-orchestrator` owns CRUD/storage for ML training runs, backtest runs, ML artifacts, backtest artifacts, and strategy artifacts. Downstream apps should request work here and load returned artifact URIs/paths instead of keeping their own research storage.
 - The repo is opinionated toward Dagster for orchestration and MLflow for experiment tracking.
 - Do not add live trading, broker order submission, or broker account mutation code here.
 - If a workflow needs market data, features, labels, or warehouse refreshes, call `quant-warehouse` rather than OpenBB or vendor APIs directly.
+- Artifact storage should be schema-light. Different ML frameworks and backtesting frameworks may emit incompatible reports, models, plots, directories, or binary objects; store the native outputs with minimal metadata rather than forcing one universal report shape.
 
 ## Compatibility Policy
 

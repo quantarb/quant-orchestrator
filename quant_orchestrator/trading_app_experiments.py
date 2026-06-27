@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from quant_orchestrator.artifacts import get_artifact_store
 from quant_orchestrator.experiments import (
     TradingAppExperimentSpec,
     WalkForwardWindow,
@@ -66,7 +67,9 @@ def _run_one_window(
     if prediction_artifact is None:
         prediction_artifact_text = None
     else:
-        prediction_artifact_text = str(Path(prediction_artifact))
+        prediction_artifact_text = str(
+            prediction_artifact.path if hasattr(prediction_artifact, "path") else Path(prediction_artifact)
+        )
 
     frames = []
     if spec.framework in {"zipline", "all"}:
@@ -116,11 +119,6 @@ def _track_result(
     result: pd.DataFrame,
     tracking_uri: str | None,
 ) -> None:
-    artifact_dir = Path("artifacts/trading_app_experiments") / spec.name / window.label
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = artifact_dir / "summary.csv"
-    result.to_csv(summary_path, index=False)
-
     metrics = {
         "final_equity": float(result["final_equity"].mean()),
         "total_return": float(result["total_return"].mean()),
@@ -141,6 +139,37 @@ def _track_result(
         "test_start": window.test_start.date().isoformat(),
         "test_end": window.test_end.date().isoformat(),
     }
+    store = get_artifact_store()
+    run = store.create_run(
+        run_type="backtest",
+        name=f"{spec.name}-{window.label}",
+        params=params,
+        tags={
+            "strategy": "trading_app_equity",
+            "framework": spec.framework,
+            "data_source": f"quant-warehouse:{spec.provider}",
+        },
+    )
+    try:
+        summary_artifact = store.save_dataframe(
+            run_id=run.id,
+            kind="backtest_result",
+            name="trading_app_equity_summary",
+            frame=result,
+            metadata=params,
+        )
+        store.save_json(
+            run_id=run.id,
+            kind="strategy_artifact",
+            name="trading_app_equity_strategy",
+            payload=params,
+            metadata={"backtest_result_uri": summary_artifact.uri},
+        )
+    except Exception as exc:
+        store.fail_run(run.id, exc)
+        raise
+    store.complete_run(run.id, metrics=metrics)
+
     tracker_kwargs = {"tracking_uri": tracking_uri} if tracking_uri else {}
     log_backtest_run(
         run_name=f"{spec.name}-{window.label}",
@@ -149,7 +178,7 @@ def _track_result(
         data_source=f"quant-warehouse:{spec.provider}",
         params=params,
         metrics=metrics,
-        artifacts={"summary": summary_path},
+        artifacts={"summary": summary_artifact.path},
         experiment=spec.name,
         **tracker_kwargs,
     )

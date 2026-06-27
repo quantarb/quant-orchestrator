@@ -78,17 +78,16 @@ def main() -> None:
     if args.strategy == "trading-app-equity":
         prediction_artifact = args.prediction_artifact
         if args.train_model:
-            prediction_artifact = str(
-                train_price_model_artifact(
-                    provider=args.provider,
-                    train_start=args.train_start,
-                    train_end=args.train_end,
-                    backtest_start=args.backtest_start,
-                    end=args.end,
-                    max_symbols=args.max_symbols,
-                    symbols=args.train_symbols,
-                ),
+            trained_predictions = train_price_model_artifact(
+                provider=args.provider,
+                train_start=args.train_start,
+                train_end=args.train_end,
+                backtest_start=args.backtest_start,
+                end=args.end,
+                max_symbols=args.max_symbols,
+                symbols=args.train_symbols,
             )
+            prediction_artifact = str(trained_predictions.path)
         if args.framework in {"all", "zipline"}:
             results.append(
                 run_trading_app_zipline(
