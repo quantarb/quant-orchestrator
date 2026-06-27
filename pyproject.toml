@@ -12,8 +12,8 @@ license = { text = "MIT" }
 authors = [{ name = "Quant Orchestrator" }]
 keywords = ["quant", "trading", "backtesting", "orchestration", "dagster"]
 dependencies = [
-    "numpy>=1.26",
-    "pandas>=2.1",
+    "numpy>=1.26,<2.5",
+    "pandas>=2.1,<3",
     "quant-warehouse @ git+https://github.com/quantarb/quant-warehouse.git@main",
 ]
 
