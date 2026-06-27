@@ -1,4 +1,4 @@
-"""Compatibility import for the PyTorch ML framework provider."""
+"""PyTorch ML framework provider."""
 
 from quant_orchestrator.platforms.ml_frameworks.torch.provider import TorchFramework, torch_provider
 

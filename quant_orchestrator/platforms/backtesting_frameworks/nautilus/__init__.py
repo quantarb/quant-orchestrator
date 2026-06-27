@@ -1,4 +1,4 @@
-"""Compatibility import for the Nautilus backtesting framework provider."""
+"""NautilusTrader backtest engine provider."""
 
 from quant_orchestrator.platforms.backtesting_frameworks.nautilus.provider import (
     NautilusBacktestEngine,

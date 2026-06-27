@@ -2,8 +2,7 @@
 
 from quant_orchestrator.platform.contracts import (
     BacktestEngine,
-    BrokerAdapter,
-    ExperimentTracker,
+    BacktestingFramework,
     MLFramework,
     ProviderManifest,
 )
@@ -11,8 +10,7 @@ from quant_orchestrator.platform.registry import ProviderRegistry, registry
 
 __all__ = [
     "BacktestEngine",
-    "BrokerAdapter",
-    "ExperimentTracker",
+    "BacktestingFramework",
     "MLFramework",
     "ProviderManifest",
     "ProviderRegistry",

@@ -1,5 +1,8 @@
-"""Zipline backtest engine provider."""
+"""Compatibility import for the Zipline backtesting framework provider."""
 
-from quant_orchestrator.backtest_engines.zipline.provider import ZiplineBacktestEngine, zipline_provider
+from quant_orchestrator.platforms.backtesting_frameworks.zipline import (
+    ZiplineBacktestEngine,
+    zipline_provider,
+)
 
 __all__ = ["ZiplineBacktestEngine", "zipline_provider"]

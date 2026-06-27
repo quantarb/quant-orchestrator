@@ -1,7 +1,9 @@
-"""Built-in ML framework providers."""
+"""Compatibility imports for built-in ML framework providers."""
 
-from quant_orchestrator.ml_frameworks.sklearn.provider import sklearn_provider
-from quant_orchestrator.ml_frameworks.torch.provider import torch_provider
-from quant_orchestrator.ml_frameworks.transformers.provider import transformers_provider
+from quant_orchestrator.platforms.ml_frameworks import (
+    sklearn_provider,
+    torch_provider,
+    transformers_provider,
+)
 
 __all__ = ["sklearn_provider", "torch_provider", "transformers_provider"]

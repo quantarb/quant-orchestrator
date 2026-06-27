@@ -1,28 +1,8 @@
-from __future__ import annotations
+"""Compatibility import for the Optopsy backtesting framework provider."""
 
-from typing import Any
-
-from quant_orchestrator.options_backtesting import OptopsyBacktestSpec, run_optopsy_backtest
-from quant_orchestrator.platform.contracts import ProviderManifest
-
-
-class OptopsyBacktestEngine:
-    name = "optopsy"
-
-    def run(self, strategy: Any, data: Any, **kwargs: Any) -> Any:
-        if isinstance(data, OptopsyBacktestSpec):
-            return run_optopsy_backtest(data)
-        if "spec" in kwargs:
-            return run_optopsy_backtest(kwargs["spec"])
-        raise ValueError("OptopsyBacktestEngine.run requires data=<OptopsyBacktestSpec> or spec=...")
-
-
-optopsy_provider = ProviderManifest(
-    name="optopsy",
-    category="backtest_engine",
-    display_name="Optopsy",
-    description="ThetaData options backtests through Optopsy and quant-warehouse.",
-    website="https://github.com/goldspanlabs/optopsy",
-    capabilities=("run", "options"),
-    adapters={"default": OptopsyBacktestEngine},
+from quant_orchestrator.platforms.backtesting_frameworks.optopsy.provider import (
+    OptopsyBacktestEngine,
+    optopsy_provider,
 )
+
+__all__ = ["OptopsyBacktestEngine", "optopsy_provider"]

@@ -1,5 +1,8 @@
-"""Pandas backtest engine provider."""
+"""Compatibility import for the Pandas backtesting framework provider."""
 
-from quant_orchestrator.backtest_engines.pandas.provider import PandasBacktestEngine, pandas_provider
+from quant_orchestrator.platforms.backtesting_frameworks.pandas import (
+    PandasBacktestEngine,
+    pandas_provider,
+)
 
 __all__ = ["PandasBacktestEngine", "pandas_provider"]

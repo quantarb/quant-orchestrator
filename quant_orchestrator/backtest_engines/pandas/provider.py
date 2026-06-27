@@ -1,24 +1,8 @@
-from __future__ import annotations
+"""Compatibility import for the Pandas backtesting framework provider."""
 
-from typing import Any
-
-from quant_orchestrator.platform.contracts import ProviderManifest
-
-
-class PandasBacktestEngine:
-    name = "pandas"
-
-    def run(self, strategy: Any, data: Any, **kwargs: Any) -> Any:
-        if not callable(strategy):
-            raise TypeError("PandasBacktestEngine.run requires a callable strategy")
-        return strategy(data, **kwargs)
-
-
-pandas_provider = ProviderManifest(
-    name="pandas",
-    category="backtest_engine",
-    display_name="Pandas",
-    description="Lightweight DataFrame-native backtest adapter.",
-    capabilities=("run",),
-    adapters={"default": PandasBacktestEngine},
+from quant_orchestrator.platforms.backtesting_frameworks.pandas.provider import (
+    PandasBacktestEngine,
+    pandas_provider,
 )
+
+__all__ = ["PandasBacktestEngine", "pandas_provider"]

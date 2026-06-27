@@ -1,6 +1,6 @@
 # Quant Orchestrator
 
-Small backtesting adapters around data stored in the sibling `quant-warehouse` repo.
+Opinionated Dagster and MLflow research orchestration around data stored in `quant-warehouse`.
 
 ## Environment
 
@@ -9,11 +9,11 @@ conda env create -f environment.yml
 conda activate quant-orchestrator
 ```
 
-The environment installs `quant-warehouse` from `../quant-warehouse`, plus Zipline Reloaded and NautilusTrader.
+The environment installs `quant-warehouse` from GitHub, Dagster, MLflow, plus Zipline Reloaded and NautilusTrader.
 
 ## Install
 
-For a lightweight package install:
+For a package install:
 
 ```bash
 pip install "git+https://github.com/quantarb/quant-orchestrator.git"
@@ -33,12 +33,10 @@ pip install -e ".[options]"
 
 ## Provider Platform
 
-`quant-orchestrator` follows an OpenBB-style provider layout for extension categories:
+`quant-orchestrator` follows an OpenBB-style provider layout for model and backtesting extension categories:
 
-- `quant_orchestrator.ml_frameworks`
-- `quant_orchestrator.backtest_engines`
-- `quant_orchestrator.brokers`
-- `quant_orchestrator.experiment_trackers`
+- `quant_orchestrator.platforms.ml_frameworks`
+- `quant_orchestrator.platforms.backtesting_frameworks`
 
 Installed packages can register providers through entry points:
 
@@ -46,14 +44,8 @@ Installed packages can register providers through entry points:
 [project.entry-points."quant_orchestrator.ml_framework"]
 my_framework = "my_package.ml_framework:provider"
 
-[project.entry-points."quant_orchestrator.backtest_engine"]
-my_engine = "my_package.backtest_engine:provider"
-
-[project.entry-points."quant_orchestrator.broker"]
-my_broker = "my_package.broker:provider"
-
-[project.entry-points."quant_orchestrator.experiment_tracker"]
-my_tracker = "my_package.tracking:provider"
+[project.entry-points."quant_orchestrator.backtesting_framework"]
+my_engine = "my_package.backtesting_framework:provider"
 ```
 
 At runtime, providers are resolved from the registry:
@@ -61,21 +53,16 @@ At runtime, providers are resolved from the registry:
 ```python
 from quant_orchestrator.platform import registry
 
-registry.list("backtest_engine")
-engine_cls = registry.adapter("backtest_engine", "optopsy")
+registry.list("backtesting_framework")
+engine_cls = registry.adapter("backtesting_framework", "optopsy")
 engine = engine_cls()
 ```
 
+Legacy `backtest_engine` registry lookups are accepted as aliases for `backtesting_framework`.
+
 ## Experiment Tracking
 
-MLflow is available as the built-in experiment tracker provider:
-
-```bash
-pip install -e ".[tracking]"
-```
-
-Use it through the orchestrator tracking interface so Dagster jobs, backtests, and model
-training code do not depend directly on MLflow:
+MLflow is the built-in experiment tracker. Use it through the orchestrator tracking interface so Dagster jobs, backtests, and model training code have one consistent tracking API:
 
 ```python
 from quant_orchestrator.tracking import log_backtest_run
@@ -91,10 +78,7 @@ log_backtest_run(
 )
 ```
 
-The default tracker provider is `mlflow`; external packages can register other trackers
-through the `quant_orchestrator.experiment_tracker` entry point.
-
-By default, the MLflow provider uses `sqlite:///artifacts/mlflow/mlflow.db`. Override it
+By default, tracking uses `sqlite:///artifacts/mlflow/mlflow.db`. Override it
 with `tracking_uri=...`, `QUANT_ORCHESTRATOR_MLFLOW_TRACKING_URI`, or `MLFLOW_TRACKING_URI`.
 
 ## Load data
@@ -164,7 +148,7 @@ dagster dev -m quant_orchestrator.dagster_defs
 
 The module exposes `trading_app_experiment_job` plus daily and weekday schedules. The job
 uses `TradingAppExperimentSpec`, can train on one symbol universe and backtest on another,
-and logs summaries through the configured experiment tracker.
+and logs summaries through MLflow.
 
 ## Walk-Forward and Monte Carlo
 

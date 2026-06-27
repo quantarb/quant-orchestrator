@@ -32,8 +32,8 @@ class MLFramework(Protocol):
 
 
 @runtime_checkable
-class BacktestEngine(Protocol):
-    """Contract implemented by backtest engine adapters."""
+class BacktestingFramework(Protocol):
+    """Contract implemented by backtesting framework adapters."""
 
     name: str
 
@@ -41,46 +41,7 @@ class BacktestEngine(Protocol):
         """Run a strategy against data and return an engine-specific result."""
 
 
-@runtime_checkable
-class BrokerAdapter(Protocol):
-    """Contract implemented by broker adapters."""
-
-    name: str
-
-    def get_account(self, **kwargs: Any) -> Any:
-        """Return account metadata and balances."""
-
-    def get_positions(self, **kwargs: Any) -> Any:
-        """Return current broker positions."""
-
-    def submit_order(self, order: Any, **kwargs: Any) -> Any:
-        """Submit an order to the broker."""
+# Backward-compatible name for older research code.
+BacktestEngine = BacktestingFramework
 
 
-@runtime_checkable
-class ExperimentTracker(Protocol):
-    """Contract implemented by experiment and model registry trackers."""
-
-    name: str
-
-    def start_run(
-        self,
-        *,
-        name: str | None = None,
-        experiment: str | None = None,
-        tags: dict[str, str] | None = None,
-        nested: bool = False,
-    ) -> Any:
-        """Start a tracker run and return the provider-specific run context."""
-
-    def log_params(self, params: dict[str, Any]) -> None:
-        """Log run parameters."""
-
-    def log_metrics(self, metrics: dict[str, float], *, step: int | None = None) -> None:
-        """Log numeric run metrics."""
-
-    def log_artifact(self, path: str, *, artifact_path: str | None = None) -> None:
-        """Log a local artifact file or directory."""
-
-    def register_model(self, model_uri: str, name: str, **kwargs: Any) -> Any:
-        """Register a model artifact in the provider-specific model registry."""

@@ -1,4 +1,4 @@
-"""Compatibility import for the Transformers ML framework provider."""
+"""Transformers ML framework provider."""
 
 from quant_orchestrator.platforms.ml_frameworks.transformers.provider import (
     TransformersFramework,
