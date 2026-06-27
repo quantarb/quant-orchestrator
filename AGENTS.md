@@ -25,6 +25,12 @@
 - When package structure changes, update imports and notebooks directly.
 - Do not preserve old provider categories, old entry-point groups, or old module paths.
 
+## Build Vs Buy Policy
+
+- Prefer widely used, actively maintained third-party packages or small forks of proven projects over custom implementations.
+- For ML frameworks, backtesting frameworks, experiment tracking, orchestration, model serialization, metrics, reports, and simulations, use battle-tested libraries when they fit the repo boundary.
+- Build from scratch only when no reliable package fits the requirement or this repo needs a thin opinionated wrapper around a proven dependency; document that reason in the change.
+
 ## Platform Policy
 
 - Keep provider-style extension points only for `platforms/ml_frameworks` and `platforms/backtesting_frameworks`.
