@@ -149,15 +149,17 @@ The printed table separates normalized strategy performance from framework runti
 
 ## Trading App Equity
 
-The `trading-app-equity` strategy ports the equity-only variant of the `optimal_trader` trading app signal into Zipline Reloaded and NautilusTrader. It loads orchestrator-registered ML prediction artifacts, selects top `prob_buy` long candidates, and runs equal-weight equity targets.
+The `trading-app-equity` strategy ports the equity-only variant of the `optimal_trader` trading app signal into Zipline Reloaded and NautilusTrader. It loads an ML prediction artifact with `date`, `symbol`, and score columns, selects top `prob_buy` long candidates, and runs equal-weight equity targets.
 
 ```bash
-quant-orchestrator --strategy trading-app-equity --framework all --top-k 40 --gross-exposure 0.95
+quant-orchestrator --strategy trading-app-equity --framework all \
+  --prediction-artifact artifact:<id> \
+  --top-k 40 --gross-exposure 0.95
 ```
 
 Use `--prediction-artifact /path/to/ml_predictions.csv` or `--prediction-artifact artifact:<id>` to pin a historical prediction artifact. If no artifact is provided, the latest registered `trading_app_equity_predictions` artifact is used.
 
-To train the simple equity variant on 2020 Quant Warehouse price features and backtest from 2021 onward over the same options-notebook universe:
+To train the simple equity variant on 2020 Quant Warehouse price features, register its model/prediction artifacts, and backtest from 2021 onward:
 
 ```bash
 quant-orchestrator --strategy trading-app-equity --framework all --train-model \
@@ -167,7 +169,7 @@ quant-orchestrator --strategy trading-app-equity --framework all --train-model \
 
 Add `--end 2021-12-31` to run only the 2021 calendar year.
 
-Train and backtest universes can be separated:
+Train and backtest universes can be separated. If `--train-model` is used without `--train-symbols`, the current code falls back to the local `optimal_trader` MoE scored universe file configured in `quant_orchestrator.trading_app_equity`.
 
 ```bash
 quant-orchestrator --strategy trading-app-equity --framework zipline --train-model \
