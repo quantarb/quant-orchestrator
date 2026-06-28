@@ -42,6 +42,8 @@
 ## Notebook Policy
 
 - Use `notebooks/` for one-off research workflows: model training experiments, backtest experiments, walk-forward experiments, Monte Carlo experiments, and equity-curve analysis.
+- `notebooks/` should contain notebook files only. Do not add standalone `.py` scripts in that directory.
+- Keep exploratory, one-off, and notebook-only code inside the notebook itself so people can edit and rerun it interactively.
 - If a notebook workflow becomes a repeated capability, move the reusable API into package code and leave the notebook as an example.
 - Notebooks in this repo must not implement feature engineering, target engineering, or warehouse refresh logic. Pull prepared datasets from `quant-warehouse`.
 - If a notebook needs a new feature family or label, implement it in `quant-warehouse` first, then consume it here.

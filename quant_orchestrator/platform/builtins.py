@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from quant_orchestrator.platforms.backtesting_frameworks import (
+    backtesting_py_provider,
     nautilus_provider,
     optopsy_provider,
     pandas_provider,
@@ -20,6 +21,7 @@ def register_builtin_providers() -> None:
         torch_provider,
         transformers_provider,
         pandas_provider,
+        backtesting_py_provider,
         zipline_provider,
         nautilus_provider,
         optopsy_provider,
