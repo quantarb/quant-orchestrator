@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import vectorbt as vbt
 
 from quant_orchestrator.experiments import WindowSpec, build_walk_forward_windows
 from quant_orchestrator.monte_carlo import simulate_return_paths
@@ -121,7 +122,6 @@ def run_backtesting_py(frame: pd.DataFrame, *, symbol: str, capital_base: float)
         commission=0.0,
         trade_on_close=False,
         exclusive_orders=True,
-        finalize_trades=True,
     ).run()
     elapsed = perf_counter() - started
     equity = stats["_equity_curve"]["Equity"].rename("portfolio_value")
