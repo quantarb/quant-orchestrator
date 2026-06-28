@@ -38,7 +38,7 @@ def load_signal_frame(
     frame = frame.sort_index()
 
     features = compute_features_worldclass(frame.copy())
-    required = ["DistSMA50", "DistSMA200"]
+    required = ["SMA50", "SMA200"]
     missing = [column for column in required if column not in features.columns]
     if missing:
         raise ValueError(
@@ -46,9 +46,9 @@ def load_signal_frame(
         )
 
     frame = features.loc[:, list(OHLCV_COLUMNS) + required].copy()
-    frame["signal"] = (frame["DistSMA50"] > frame["DistSMA200"]).astype(float)
-    frame["sma_50"] = frame["close"] / (1.0 + frame["DistSMA50"])
-    frame["sma_200"] = frame["close"] / (1.0 + frame["DistSMA200"])
+    frame["signal"] = (frame["SMA50"] > frame["SMA200"]).astype(float)
+    frame["sma_50"] = frame["SMA50"]
+    frame["sma_200"] = frame["SMA200"]
     frame = frame.dropna(subset=["sma_50", "sma_200"]).copy()
     frame["signal"] = frame["signal"].fillna(0.0).astype(int)
     if frame.empty:

@@ -26,6 +26,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.zipline.data_adapter im
     build_zipline_in_memory_data,
 )
 from quant_orchestrator.strategy import summarize_backtest, summarize_equity
+from quant_warehouse.feature_engineering import compute_features_worldclass
 
 
 FAST_WINDOWS = (5, 10, 15, 20, 25, 30, 35, 40, 45, 50)
@@ -58,9 +59,17 @@ def build_sma_frame(prices: pd.DataFrame, *, fast_window: int, slow_window: int)
     if fast_window >= slow_window:
         raise ValueError("fast_window must be less than slow_window")
 
-    frame = prices.copy()
-    fast = frame["close"].rolling(fast_window).mean()
-    slow = frame["close"].rolling(slow_window).mean()
+    frame = compute_features_worldclass(prices.copy())
+    fast_col = f"SMA{fast_window}"
+    slow_col = f"SMA{slow_window}"
+    missing = [column for column in (fast_col, slow_col) if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            "Quant Warehouse feature output is missing required SMA columns: "
+            f"{missing}. Update quant-warehouse feature engineering first."
+        )
+    fast = frame[fast_col]
+    slow = frame[slow_col]
     frame["fast_sma"] = fast
     frame["slow_sma"] = slow
     frame["signal"] = (fast > slow).astype(int).fillna(0)
