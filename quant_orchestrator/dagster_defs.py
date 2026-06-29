@@ -5,6 +5,7 @@ from typing import Any
 
 from dagster import Definitions, ScheduleDefinition, get_dagster_logger, job, op
 
+from quant_orchestrator.backtests import run_framework_comparison
 from quant_orchestrator.experiments import (
     TradingAppExperimentSpec,
     UniverseSplit,
@@ -37,6 +38,18 @@ TRADING_APP_CONFIG_SCHEMA = {
     "track": bool,
 }
 
+BACKTEST_FRAMEWORK_COMPARISON_CONFIG_SCHEMA = {
+    "name": str,
+    "symbol": str,
+    "providers": str,
+    "frameworks": str,
+    "start": str,
+    "end": str,
+    "fast_window": int,
+    "slow_window": int,
+    "capital_base": float,
+}
+
 DEFAULT_TRADING_APP_RUN_CONFIG = {
     "ops": {
         "run_trading_app_scheduled": {
@@ -67,6 +80,24 @@ DEFAULT_TRADING_APP_RUN_CONFIG = {
     }
 }
 
+DEFAULT_BACKTEST_FRAMEWORK_COMPARISON_RUN_CONFIG = {
+    "ops": {
+        "run_backtest_framework_comparison_scheduled": {
+            "config": {
+                "name": "backtest-framework-comparison",
+                "symbol": "AAPL",
+                "providers": "yfinance,fmp",
+                "frameworks": "backtesting.py,zipline,nautilus",
+                "start": "2020-01-01",
+                "end": "",
+                "fast_window": 50,
+                "slow_window": 200,
+                "capital_base": 100_000.0,
+            }
+        }
+    }
+}
+
 
 @op(config_schema=TRADING_APP_CONFIG_SCHEMA)
 def run_trading_app_scheduled(context) -> str:
@@ -86,9 +117,38 @@ def run_trading_app_scheduled(context) -> str:
     return str(output_path)
 
 
+@op(config_schema=BACKTEST_FRAMEWORK_COMPARISON_CONFIG_SCHEMA)
+def run_backtest_framework_comparison_scheduled(context) -> str:
+    config = context.op_config
+    logger = get_dagster_logger()
+    result = run_framework_comparison(
+        symbol=config["symbol"],
+        providers=_csv_items(config["providers"]),
+        frameworks=_csv_items(config["frameworks"]),
+        start=config["start"],
+        end=_optional(config["end"]),
+        fast_window=int(config["fast_window"]),
+        slow_window=int(config["slow_window"]),
+        capital_base=float(config["capital_base"]),
+    )
+    output_dir = Path("artifacts/dagster/backtest_framework_comparison") / config["name"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result.comparison.to_csv(output_dir / "comparison.csv", index=False)
+    result.factor_report.to_csv(output_dir / "factor_report.csv", index=False)
+    result.framework_summary.to_csv(output_dir / "framework_summary.csv")
+    result.provider_summary.to_csv(output_dir / "provider_summary.csv")
+    logger.info("Wrote framework comparison outputs to %s", output_dir)
+    return str(output_dir)
+
+
 @job
 def trading_app_experiment_job() -> None:
     run_trading_app_scheduled()
+
+
+@job
+def backtest_framework_comparison_job() -> None:
+    run_backtest_framework_comparison_scheduled()
 
 
 daily_trading_app_schedule = ScheduleDefinition(
@@ -107,7 +167,7 @@ weekday_trading_app_schedule = ScheduleDefinition(
 
 
 defs = Definitions(
-    jobs=[trading_app_experiment_job],
+    jobs=[trading_app_experiment_job, backtest_framework_comparison_job],
     schedules=[daily_trading_app_schedule, weekday_trading_app_schedule],
 )
 
@@ -153,3 +213,7 @@ def _optional(value: str) -> str | None:
 
 def _symbols(value: str) -> tuple[str, ...]:
     return tuple(symbol.strip().upper() for symbol in value.split(",") if symbol.strip())
+
+
+def _csv_items(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in value.split(",") if item.strip())

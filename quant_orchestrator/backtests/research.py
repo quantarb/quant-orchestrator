@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from dataclasses import dataclass
 from itertools import product
+from io import StringIO
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -43,6 +48,15 @@ class FrameworkRun:
     equity: pd.Series
 
 
+@dataclass(frozen=True)
+class FrameworkComparisonResult:
+    comparison: pd.DataFrame
+    factor_report: pd.DataFrame
+    framework_summary: pd.DataFrame
+    provider_summary: pd.DataFrame
+    runs: dict[str, dict[str, FrameworkRun]]
+
+
 def build_sma_frame(prices: pd.DataFrame, *, fast_window: int, slow_window: int) -> pd.DataFrame:
     return build_shared_sma_crossover_frame(prices, fast_window=fast_window, slow_window=slow_window)
 
@@ -70,6 +84,237 @@ def _load_symbol_price_frames(
     for symbol in symbols:
         frames[symbol] = load_price_frame(symbol, provider=provider, start=start, end=end)
     return frames
+
+
+def _framework_comparison_rows(table: pd.DataFrame, *, metric: str) -> pd.DataFrame:
+    pivot = table.pivot(index="framework", columns="provider", values=metric)
+    grand_mean = float(pivot.to_numpy(dtype=float).mean())
+    framework_means = pivot.mean(axis=1)
+    provider_means = pivot.mean(axis=0)
+    framework_ss = float(len(provider_means) * ((framework_means - grand_mean) ** 2).sum())
+    provider_ss = float(len(framework_means) * ((provider_means - grand_mean) ** 2).sum())
+    total_ss = float(((pivot - grand_mean) ** 2).to_numpy().sum())
+    residual_ss = max(0.0, total_ss - framework_ss - provider_ss)
+    total = framework_ss + provider_ss + residual_ss
+    return pd.DataFrame(
+        [
+            {
+                "metric": metric,
+                "framework_ss": framework_ss,
+                "provider_ss": provider_ss,
+                "residual_ss": residual_ss,
+                "framework_share": framework_ss / total if total else 0.0,
+                "provider_share": provider_ss / total if total else 0.0,
+                "residual_share": residual_ss / total if total else 0.0,
+                "dominant_factor": "provider" if provider_ss > framework_ss else "framework",
+                "provider_to_framework_ratio": (provider_ss / framework_ss) if framework_ss else float("inf"),
+            }
+        ],
+    )
+
+
+def _serialize_json_row(row: dict[str, Any]) -> dict[str, Any]:
+    clean: dict[str, Any] = {}
+    for key, value in row.items():
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except Exception:
+                pass
+        if hasattr(value, "isoformat"):
+            try:
+                value = value.isoformat()
+            except Exception:
+                pass
+        clean[key] = value
+    return clean
+
+
+def _coerce_framework_run(result: object) -> FrameworkRun:
+    if isinstance(result, FrameworkRun):
+        return result
+    if isinstance(result, tuple) and len(result) == 3:
+        raw_result, summary, equity = result
+        return FrameworkRun(raw_result=raw_result, summary=summary, equity=equity)
+    raise TypeError(f"Unsupported framework run result: {type(result)!r}")
+
+
+def _run_nautilus_isolated(
+    frame: pd.DataFrame,
+    *,
+    symbol: str,
+    fast_window: int,
+    slow_window: int,
+    capital_base: float,
+) -> FrameworkRun:
+    payload = {
+        "frame_json": frame.to_json(orient="split", date_format="iso"),
+        "symbol": symbol,
+        "fast_window": fast_window,
+        "slow_window": slow_window,
+        "capital_base": capital_base,
+    }
+    code = """
+from __future__ import annotations
+
+import json
+import sys
+from io import StringIO
+from pathlib import Path
+
+import pandas as pd
+
+repo_root = Path.cwd().resolve()
+if not (repo_root / "quant_orchestrator").exists():
+    repo_root = repo_root.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from quant_orchestrator.platforms.backtesting_frameworks.nautilus.sma_crossover import run_sma_crossover_backtest
+
+payload = json.loads(sys.stdin.read())
+frame = pd.read_json(StringIO(payload["frame_json"]), orient="split")
+frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index))
+_, summary, equity = run_sma_crossover_backtest(
+    frame,
+    symbol=payload["symbol"],
+    fast_window=int(payload["fast_window"]),
+    slow_window=int(payload["slow_window"]),
+    capital_base=float(payload["capital_base"]),
+)
+row = summary.iloc[0].to_dict()
+row["framework"] = "nautilus"
+row["provider"] = payload.get("provider", "")
+clean = {}
+for key, value in row.items():
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if hasattr(value, "isoformat"):
+        try:
+            value = value.isoformat()
+        except Exception:
+            pass
+    clean[key] = value
+print(json.dumps(clean, default=str))
+print("__EQUITY__")
+print(equity.to_json(date_format="iso"))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[2],
+        input=json.dumps(payload),
+    )
+    stdout = completed.stdout.strip().splitlines()
+    if "__EQUITY__" not in stdout:
+        raise RuntimeError("Nautilus isolated run did not emit an equity payload")
+    marker = stdout.index("__EQUITY__")
+    row = json.loads(stdout[marker - 1])
+    equity = pd.read_json(StringIO(stdout[marker + 1]), typ="series")
+    equity.index = pd.DatetimeIndex(pd.to_datetime(equity.index))
+    return FrameworkRun(pd.DataFrame([row]), pd.DataFrame([row]), equity.rename("portfolio_value"))
+
+
+def run_framework_comparison(
+    *,
+    symbol: str,
+    providers: tuple[str, ...] = ("yfinance", "fmp"),
+    frameworks: tuple[str, ...] = ("backtesting.py", "zipline", "nautilus"),
+    start: str = "2020-01-01",
+    end: str | None = None,
+    fast_window: int = 50,
+    slow_window: int = 200,
+    capital_base: float = 100_000.0,
+) -> FrameworkComparisonResult:
+    from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.sma_crossover import (
+        run_sma_crossover_backtest as run_backtesting_py_runner,
+    )
+    from quant_orchestrator.platforms.backtesting_frameworks.zipline.sma_crossover import (
+        run_sma_crossover_backtest as run_zipline_runner,
+    )
+
+    provider_frames = {
+        provider: load_price_frame(symbol, provider=provider, start=start, end=end) for provider in providers
+    }
+
+    runs: dict[str, dict[str, FrameworkRun]] = {}
+    rows = []
+    for provider in providers:
+        provider_runs: dict[str, FrameworkRun] = {}
+        frame = provider_frames[provider]
+        for framework in frameworks:
+            started = perf_counter()
+            if framework == "nautilus":
+                run = _run_nautilus_isolated(
+                    frame,
+                    symbol=symbol,
+                    fast_window=fast_window,
+                    slow_window=slow_window,
+                    capital_base=capital_base,
+                )
+            else:
+                runners = {
+                    "backtesting.py": run_backtesting_py_runner,
+                    "zipline": run_zipline_runner,
+                }
+                runner = runners.get(framework)
+                if runner is None:
+                    raise ValueError(f"Unsupported framework for comparison: {framework}")
+                run = _coerce_framework_run(
+                    runner(
+                    frame.loc[:, ["open", "high", "low", "close", "volume"]].copy(),
+                    symbol=symbol,
+                    fast_window=fast_window,
+                    slow_window=slow_window,
+                    capital_base=capital_base,
+                    ),
+                )
+            wall_clock_seconds = perf_counter() - started
+            summary = run.summary.copy()
+            summary["framework"] = framework
+            summary["provider"] = provider
+            summary["performance_score"] = summary["total_return"] + summary["max_drawdown"]
+            summary["wall_clock_seconds"] = wall_clock_seconds
+            rows.append(summary)
+            provider_runs[framework] = FrameworkRun(run.raw_result, summary, run.equity)
+        runs[provider] = provider_runs
+
+    comparison = pd.concat(rows, ignore_index=True).sort_values(["provider", "framework"]).reset_index(drop=True)
+    factor_report = pd.concat(
+        [
+            _framework_comparison_rows(comparison, metric="performance_score"),
+            _framework_comparison_rows(comparison, metric="total_return"),
+            _framework_comparison_rows(comparison, metric="elapsed_seconds"),
+            _framework_comparison_rows(comparison, metric="wall_clock_seconds"),
+        ],
+        ignore_index=True,
+    )
+    framework_summary = comparison.groupby("framework").agg(
+        mean_total_return=("total_return", "mean"),
+        mean_max_drawdown=("max_drawdown", "mean"),
+        mean_elapsed_seconds=("elapsed_seconds", "mean"),
+        mean_wall_clock_seconds=("wall_clock_seconds", "mean"),
+        mean_bars_per_second=("bars_per_second", "mean"),
+    )
+    provider_summary = comparison.groupby("provider").agg(
+        mean_total_return=("total_return", "mean"),
+        mean_max_drawdown=("max_drawdown", "mean"),
+        mean_elapsed_seconds=("elapsed_seconds", "mean"),
+        mean_wall_clock_seconds=("wall_clock_seconds", "mean"),
+        mean_bars_per_second=("bars_per_second", "mean"),
+    )
+    return FrameworkComparisonResult(
+        comparison=comparison,
+        factor_report=factor_report,
+        framework_summary=framework_summary,
+        provider_summary=provider_summary,
+        runs=runs,
+    )
 
 
 def run_backtesting_py(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> FrameworkRun:
@@ -124,7 +369,6 @@ def run_zipline(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> Fra
     from zipline.algorithm import TradingAlgorithm
     from zipline.api import order_target, record, symbol as zipline_symbol
 
-    _patch_zipline_compatibility()
     adapter = build_zipline_in_memory_data(frame, symbol=symbol, capital_base=capital_base)
     trade_size = adapter.trade_size
 
