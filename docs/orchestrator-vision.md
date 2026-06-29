@@ -6,6 +6,12 @@ This note captures the current direction so future work can resume without recon
 
 `quant-orchestrator` should be a composable research orchestration layer, not a fixed ML-plus-backtest workflow.
 
+The practical motivation is that quant strategies can perform differently under different data vendors and different backtesting frameworks. Those differences can come from adjusted versus unadjusted prices, corporate actions, missing data, trading calendars, order simulation, fill assumptions, fees, slippage, and framework-specific accounting.
+
+The platform should make those differences visible without turning research into a brute-force matrix. It should support multi-vendor and multi-framework research, but it should not encourage testing every possible combination for its own sake. More vendors and engines increase data cost, compute cost, code complexity, and live-trading operational risk.
+
+The intended end state is stack selection based on evidence, including real PnL. A good workflow can compare candidate stacks in research, deploy a small number of them in separate live or paper accounts, and then decide from realized performance whether one stack is enough or whether maintaining multiple data/framework combinations is worth the complexity.
+
 It should coordinate:
 
 - ML training
