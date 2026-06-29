@@ -14,11 +14,8 @@ import numpy as np
 import pandas as pd
 import vectorbt as vbt
 
-from quant_orchestrator.experiments import WindowSpec, build_walk_forward_windows
 from quant_orchestrator.monte_carlo import simulate_return_paths
-from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.data_adapter import (
-    build_backtesting_frame,
-)
+from quant_orchestrator.pipeline import FunctionStage, Pipeline, PipelineContext
 from quant_orchestrator.platforms.backtesting_frameworks.nautilus.data_adapter import (
     build_nautilus_in_memory_data,
 )
@@ -29,7 +26,6 @@ from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
 from quant_orchestrator.platforms.backtesting_frameworks.shared import (
     build_sma_crossover_frame as build_shared_sma_crossover_frame,
     combine_equity_curves,
-    equal_notional_capital,
     MAG7_SYMBOLS,
     load_price_frame,
     normalize_session_label,
@@ -241,82 +237,123 @@ def run_framework_comparison(
         run_sma_crossover_backtest as run_zipline_runner,
     )
 
-    provider_frames = {
-        provider: load_price_frame(symbol, provider=provider, start=start, end=end) for provider in providers
-    }
+    def load_provider_frames(context: PipelineContext) -> dict[str, Any]:
+        return {
+            "provider_frames": {
+                provider: load_price_frame(symbol, provider=provider, start=start, end=end)
+                for provider in providers
+            }
+        }
 
-    runs: dict[str, dict[str, FrameworkRun]] = {}
-    rows = []
-    for provider in providers:
-        provider_runs: dict[str, FrameworkRun] = {}
-        frame = provider_frames[provider]
-        for framework in frameworks:
-            started = perf_counter()
-            if framework == "nautilus":
-                run = _run_nautilus_isolated(
-                    frame,
-                    symbol=symbol,
-                    fast_window=fast_window,
-                    slow_window=slow_window,
-                    capital_base=capital_base,
-                )
-            else:
-                runners = {
-                    "backtesting.py": run_backtesting_py_runner,
-                    "zipline": run_zipline_runner,
-                }
-                runner = runners.get(framework)
-                if runner is None:
-                    raise ValueError(f"Unsupported framework for comparison: {framework}")
-                run = _coerce_framework_run(
-                    runner(
-                    frame.loc[:, ["open", "high", "low", "close", "volume"]].copy(),
-                    symbol=symbol,
-                    fast_window=fast_window,
-                    slow_window=slow_window,
-                    capital_base=capital_base,
-                    ),
-                )
-            wall_clock_seconds = perf_counter() - started
-            summary = run.summary.copy()
-            summary["framework"] = framework
-            summary["provider"] = provider
-            summary["performance_score"] = summary["total_return"] + summary["max_drawdown"]
-            summary["wall_clock_seconds"] = wall_clock_seconds
-            rows.append(summary)
-            provider_runs[framework] = FrameworkRun(run.raw_result, summary, run.equity)
-        runs[provider] = provider_runs
+    def run_frameworks(context: PipelineContext) -> dict[str, Any]:
+        provider_frames = context.require("provider_frames")
+        runs: dict[str, dict[str, FrameworkRun]] = {}
+        rows = []
+        for provider in providers:
+            provider_runs: dict[str, FrameworkRun] = {}
+            frame = provider_frames[provider]
+            for framework in frameworks:
+                started = perf_counter()
+                if framework == "nautilus":
+                    run = _run_nautilus_isolated(
+                        frame,
+                        symbol=symbol,
+                        fast_window=fast_window,
+                        slow_window=slow_window,
+                        capital_base=capital_base,
+                    )
+                else:
+                    runners = {
+                        "backtesting.py": run_backtesting_py_runner,
+                        "zipline": run_zipline_runner,
+                    }
+                    runner = runners.get(framework)
+                    if runner is None:
+                        raise ValueError(f"Unsupported framework for comparison: {framework}")
+                    run = _coerce_framework_run(
+                        runner(
+                            frame.loc[:, ["open", "high", "low", "close", "volume"]].copy(),
+                            symbol=symbol,
+                            fast_window=fast_window,
+                            slow_window=slow_window,
+                            capital_base=capital_base,
+                        ),
+                    )
+                wall_clock_seconds = perf_counter() - started
+                summary = run.summary.copy()
+                summary["framework"] = framework
+                summary["provider"] = provider
+                summary["performance_score"] = summary["total_return"] + summary["max_drawdown"]
+                summary["wall_clock_seconds"] = wall_clock_seconds
+                rows.append(summary)
+                provider_runs[framework] = FrameworkRun(run.raw_result, summary, run.equity)
+            runs[provider] = provider_runs
+        return {"framework_runs": runs, "comparison_rows": rows}
 
-    comparison = pd.concat(rows, ignore_index=True).sort_values(["provider", "framework"]).reset_index(drop=True)
-    factor_report = pd.concat(
+    def build_reports(context: PipelineContext) -> dict[str, Any]:
+        comparison = (
+            pd.concat(context.require("comparison_rows"), ignore_index=True)
+            .sort_values(["provider", "framework"])
+            .reset_index(drop=True)
+        )
+        factor_report = pd.concat(
+            [
+                _framework_comparison_rows(comparison, metric="performance_score"),
+                _framework_comparison_rows(comparison, metric="total_return"),
+                _framework_comparison_rows(comparison, metric="elapsed_seconds"),
+                _framework_comparison_rows(comparison, metric="wall_clock_seconds"),
+            ],
+            ignore_index=True,
+        )
+        framework_summary = comparison.groupby("framework").agg(
+            mean_total_return=("total_return", "mean"),
+            mean_max_drawdown=("max_drawdown", "mean"),
+            mean_elapsed_seconds=("elapsed_seconds", "mean"),
+            mean_wall_clock_seconds=("wall_clock_seconds", "mean"),
+            mean_bars_per_second=("bars_per_second", "mean"),
+        )
+        provider_summary = comparison.groupby("provider").agg(
+            mean_total_return=("total_return", "mean"),
+            mean_max_drawdown=("max_drawdown", "mean"),
+            mean_elapsed_seconds=("elapsed_seconds", "mean"),
+            mean_wall_clock_seconds=("wall_clock_seconds", "mean"),
+            mean_bars_per_second=("bars_per_second", "mean"),
+        )
+        return {
+            "comparison": comparison,
+            "factor_report": factor_report,
+            "framework_summary": framework_summary,
+            "provider_summary": provider_summary,
+        }
+
+    context = Pipeline(
         [
-            _framework_comparison_rows(comparison, metric="performance_score"),
-            _framework_comparison_rows(comparison, metric="total_return"),
-            _framework_comparison_rows(comparison, metric="elapsed_seconds"),
-            _framework_comparison_rows(comparison, metric="wall_clock_seconds"),
+            FunctionStage(
+                name="load_provider_frames",
+                function=load_provider_frames,
+                produced_outputs=("provider_frames",),
+            ),
+            FunctionStage(
+                name="run_frameworks",
+                function=run_frameworks,
+                required_inputs=("provider_frames",),
+                produced_outputs=("framework_runs", "comparison_rows"),
+            ),
+            FunctionStage(
+                name="build_reports",
+                function=build_reports,
+                required_inputs=("comparison_rows",),
+                produced_outputs=("comparison", "factor_report", "framework_summary", "provider_summary"),
+            ),
         ],
-        ignore_index=True,
-    )
-    framework_summary = comparison.groupby("framework").agg(
-        mean_total_return=("total_return", "mean"),
-        mean_max_drawdown=("max_drawdown", "mean"),
-        mean_elapsed_seconds=("elapsed_seconds", "mean"),
-        mean_wall_clock_seconds=("wall_clock_seconds", "mean"),
-        mean_bars_per_second=("bars_per_second", "mean"),
-    )
-    provider_summary = comparison.groupby("provider").agg(
-        mean_total_return=("total_return", "mean"),
-        mean_max_drawdown=("max_drawdown", "mean"),
-        mean_elapsed_seconds=("elapsed_seconds", "mean"),
-        mean_wall_clock_seconds=("wall_clock_seconds", "mean"),
-        mean_bars_per_second=("bars_per_second", "mean"),
-    )
+        name="framework_comparison",
+    ).run().context
     return FrameworkComparisonResult(
-        comparison=comparison,
-        factor_report=factor_report,
-        framework_summary=framework_summary,
-        provider_summary=provider_summary,
-        runs=runs,
+        comparison=context.require("comparison"),
+        factor_report=context.require("factor_report"),
+        framework_summary=context.require("framework_summary"),
+        provider_summary=context.require("provider_summary"),
+        runs=context.require("framework_runs"),
     )
 
 
@@ -423,10 +460,7 @@ def run_nautilus(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> Fr
     from nautilus_trader.config import BacktestEngineConfig, LoggingConfig, StrategyConfig
     from nautilus_trader.model.currencies import USD
     from nautilus_trader.model.enums import AccountType, OmsType, OrderSide, TimeInForce
-    from nautilus_trader.model.identifiers import Venue
     from nautilus_trader.model.objects import Money, Quantity
-    from nautilus_trader.persistence.wranglers import BarDataWrangler
-    from nautilus_trader.test_kit.providers import TestInstrumentProvider
     from nautilus_trader.trading.strategy import Strategy
 
     adapter = build_nautilus_in_memory_data(frame, symbol=symbol, capital_base=capital_base)
@@ -672,51 +706,68 @@ def run_multi_vendor_backtesting_py_sma_comparison(
     slow_window: int = 200,
     capital_base: float = 100_000.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, FrameworkRun]]]:
-    symbol_tables = []
-    portfolio_tables = []
-    runs_by_provider: dict[str, dict[str, FrameworkRun]] = {}
+    def run_provider_backtests(context: PipelineContext) -> dict[str, Any]:
+        symbol_tables = []
+        portfolio_tables = []
+        runs_by_provider: dict[str, dict[str, FrameworkRun]] = {}
 
-    for provider in providers:
-        capital_per_symbol = capital_base / max(1, len(symbols))
-        provider_runs: dict[str, FrameworkRun] = {}
-        provider_rows = []
-        provider_sleeves = []
-        elapsed = 0.0
-        trades = 0
+        for provider in providers:
+            capital_per_symbol = capital_base / max(1, len(symbols))
+            provider_runs: dict[str, FrameworkRun] = {}
+            provider_rows = []
+            provider_sleeves = []
+            elapsed = 0.0
+            trades = 0
 
-        for symbol in symbols:
-            prices = load_price_frame(symbol, provider=provider, start=start, end=end)
-            frame = build_sma_frame(prices, fast_window=fast_window, slow_window=slow_window)
-            started = perf_counter()
-            run = run_backtesting_py(frame, symbol=symbol, capital_base=capital_per_symbol)
-            elapsed += perf_counter() - started
-            provider_rows.append(run.summary.assign(provider=provider))
-            provider_sleeves.append(run.equity.rename(symbol))
-            trades += int(run.summary["trades"].iloc[0])
-            provider_runs[symbol] = run
+            for symbol in symbols:
+                prices = load_price_frame(symbol, provider=provider, start=start, end=end)
+                frame = build_sma_frame(prices, fast_window=fast_window, slow_window=slow_window)
+                started = perf_counter()
+                run = run_backtesting_py(frame, symbol=symbol, capital_base=capital_per_symbol)
+                elapsed += perf_counter() - started
+                provider_rows.append(run.summary.assign(provider=provider))
+                provider_sleeves.append(run.equity.rename(symbol))
+                trades += int(run.summary["trades"].iloc[0])
+                provider_runs[symbol] = run
 
-        symbol_summary = pd.concat(provider_rows, ignore_index=True)
-        portfolio_equity = _combine_equity_sleeves(provider_sleeves)
-        portfolio_summary = build_common_summary(
-            framework="backtesting.py",
-            symbol="MAG7",
-            equity=portfolio_equity,
-            elapsed_seconds=elapsed,
-            bars=len(portfolio_equity),
-            trades=trades,
-        )
-        portfolio_summary["provider"] = provider
-        portfolio_summary["fast_window"] = fast_window
-        portfolio_summary["slow_window"] = slow_window
+            symbol_summary = pd.concat(provider_rows, ignore_index=True)
+            portfolio_equity = _combine_equity_sleeves(provider_sleeves)
+            portfolio_summary = build_common_summary(
+                framework="backtesting.py",
+                symbol="MAG7",
+                equity=portfolio_equity,
+                elapsed_seconds=elapsed,
+                bars=len(portfolio_equity),
+                trades=trades,
+            )
+            portfolio_summary["provider"] = provider
+            portfolio_summary["fast_window"] = fast_window
+            portfolio_summary["slow_window"] = slow_window
 
-        symbol_tables.append(symbol_summary)
-        portfolio_tables.append(portfolio_summary)
-        runs_by_provider[provider] = provider_runs
+            symbol_tables.append(symbol_summary)
+            portfolio_tables.append(portfolio_summary)
+            runs_by_provider[provider] = provider_runs
 
+        return {
+            "symbol_summary": pd.concat(symbol_tables, ignore_index=True),
+            "portfolio_summary": pd.concat(portfolio_tables, ignore_index=True),
+            "runs_by_provider": runs_by_provider,
+        }
+
+    context = Pipeline(
+        [
+            FunctionStage(
+                name="run_provider_backtests",
+                function=run_provider_backtests,
+                produced_outputs=("symbol_summary", "portfolio_summary", "runs_by_provider"),
+            )
+        ],
+        name="multi_vendor_backtesting_py_sma_comparison",
+    ).run().context
     return (
-        pd.concat(symbol_tables, ignore_index=True),
-        pd.concat(portfolio_tables, ignore_index=True),
-        runs_by_provider,
+        context.require("symbol_summary"),
+        context.require("portfolio_summary"),
+        context.require("runs_by_provider"),
     )
 
 

@@ -45,6 +45,14 @@ A job should declare:
 
 That is how we prevent leakage and keep workflows flexible.
 
+The first implementation of this idea is intentionally small:
+
+- `PipelineContext` is the shared in-memory artifact store.
+- `FunctionStage` wraps a Python callable with required input and produced output declarations.
+- `Pipeline` validates stage contracts and executes stages in order.
+
+This layer should stay lightweight. It is not a scheduler, a DAG engine, or a Dagster replacement. Dagster should still own scheduled jobs, ETL assets, dependency management, and data validation. Quant Orchestrator pipelines are for research-time composition and explicit artifact handoffs.
+
 ## Reusable Primitives
 
 The intended platform primitives are:
@@ -119,6 +127,9 @@ ML outputs should remain native unless there is a clear reason to normalize them
 Already present:
 
 - `quant_orchestrator.artifacts.ArtifactStore`
+- `quant_orchestrator.pipeline.PipelineContext`
+- `quant_orchestrator.pipeline.FunctionStage`
+- `quant_orchestrator.pipeline.Pipeline`
 - ML and backtesting provider contracts
 - MLflow tracking helpers
 - Dagster entry points
@@ -129,10 +140,10 @@ Already present:
 - sample framework-specific SMA crossover strategies for `backtesting.py`, Zipline Reloaded, and NautilusTrader
 - a temporary local FlairNLP evaluation compatibility patch used by the current multi-ML notebook
 - executed notebooks covering multi-provider, multi-backtesting-framework, WFO, Monte Carlo, cross-framework validation, and multi-ML-framework MAG7 workflows
+- notebooks as integration tests for the current research workflows
 
 Still missing:
 
-- a first-class job graph model
 - explicit input/output wiring for jobs
 - leakage-aware dataset visibility controls
 - generic strategy execution jobs
@@ -142,11 +153,11 @@ Still missing:
 
 ## Next Implementation Steps
 
-1. Add small job and artifact reference types.
-2. Split existing concrete helpers into atomic train, predict, run, optimize, combine, and simulate steps.
-3. Make Dagster compose those primitives instead of assuming one workflow shape.
+1. Split repeated concrete helpers into atomic train, predict, run, optimize, combine, and simulate stages.
+2. Add leakage-aware dataset visibility controls around context artifacts.
+3. Make Dagster jobs call these primitives where scheduled execution is needed, without moving research scheduling into Quant Orchestrator.
 4. Add one external-engine proof path, such as a QuantConnect-style adapter.
-5. Keep notebook examples as examples, not the primary contract.
+5. Keep notebook workflows as integration tests and examples of composition.
 
 ## Non-Goals
 

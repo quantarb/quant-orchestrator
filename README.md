@@ -53,6 +53,7 @@ If PyTorch needs a host-specific wheel, install the wheel that matches the local
 
 The platform contract is intentionally small:
 
+- compose in-memory research pipelines from optional stages
 - resolve prepared datasets from `quant-warehouse`
 - run ML framework adapters when a workflow needs model training or inference
 - run backtesting framework adapters when a workflow needs strategy evaluation
@@ -61,6 +62,26 @@ The platform contract is intentionally small:
 - store native model, report, prediction, backtest, and strategy artifacts in the artifact registry
 
 These capabilities are independent. A workflow does not need an ML model to run a backtest, and it does not need a backtest to train a model.
+
+The pipeline core is deliberately lightweight. `PipelineContext` is an in-memory artifact store; each `FunctionStage` declares required inputs and produced outputs; `Pipeline` validates those contracts and runs stages sequentially. This is not a replacement for Dagster. Use Dagster for scheduled asset orchestration, dependency management, and production job scheduling. Use the pipeline layer inside research workflows when you need explicit artifact handoffs between data loading, model training, inference, backtesting, filtering, ranking, portfolio construction, Monte Carlo, and reporting.
+
+```python
+from quant_orchestrator.pipeline import FunctionStage, Pipeline, PipelineContext
+
+pipeline = Pipeline(
+    [
+        FunctionStage("load_predictions", load_predictions, produced_outputs=("predictions",)),
+        FunctionStage(
+            "run_backtest",
+            run_backtest,
+            required_inputs=("predictions",),
+            produced_outputs=("backtest_report",),
+        ),
+    ],
+)
+result = pipeline.run(PipelineContext())
+report = result.context.require("backtest_report")
+```
 
 `quant-orchestrator` follows an OpenBB-style provider layout for model and backtesting extension categories:
 
@@ -155,9 +176,12 @@ By default artifacts are written under `artifacts/orchestrator`. Override this w
 
 Use `notebooks/` for one-off research workflows and demonstrations that consume prepared datasets from `quant-warehouse`. If a workflow becomes a repeated platform capability, move only the reusable part into package code and keep the notebook as an example. Do not build feature families, labels, warehouse refreshes, or vendor data pulls in this repo; implement those in `quant-warehouse` first and consume the resulting dataset here.
 
+During refactors, the notebooks are the integration tests. Internal APIs can change aggressively when the architecture improves, but the notebook research intent should keep working after the notebooks are updated and re-executed.
+
 Recent notebooks follow this pattern:
 
 - data vendors, adjusted OHLCV features, and target-engineered labels come from Quant Warehouse
+- notebooks keep major datasets, predictions, reports, and summaries in `PipelineContext`
 - strategy examples may live in package code when reused across frameworks, but notebook-only experiment glue stays in notebooks
 - framework-specific data adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/data_adapter.py`
 - framework-specific reporting adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/reporting_adapter.py`
