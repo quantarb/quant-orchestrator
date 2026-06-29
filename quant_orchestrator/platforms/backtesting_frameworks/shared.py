@@ -4,6 +4,7 @@ from typing import Any
 
 import pandas as pd
 
+from quant_orchestrator.platforms.backtesting_frameworks.reporting import normalize_equity_curve
 from quant_warehouse import Warehouse
 from quant_warehouse.feature_engineering import compute_features_worldclass
 
@@ -35,12 +36,14 @@ def combine_equity_curves(curves: list[pd.Series]) -> pd.Series:
     if not curves:
         raise ValueError("At least one equity curve is required")
 
-    combined_index = pd.Index([])
-    for curve in curves:
+    normalized_curves = [normalize_equity_curve(curve) for curve in curves]
+    combined_index = pd.DatetimeIndex([])
+    for curve in normalized_curves:
         combined_index = combined_index.union(curve.index)
 
+    combined_index = pd.DatetimeIndex(combined_index).sort_values()
     combined = pd.Series(0.0, index=combined_index, name="portfolio_value")
-    for curve in curves:
+    for curve in normalized_curves:
         aligned = curve.reindex(combined_index).ffill().fillna(curve.iloc[0])
         combined = combined.add(aligned, fill_value=0.0)
     return combined.sort_index().rename("portfolio_value")

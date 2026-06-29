@@ -5,8 +5,10 @@ from typing import Any
 
 import pandas as pd
 
+from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
+    build_normalized_report,
+)
 from quant_orchestrator.platforms.backtesting_frameworks.shared import normalize_session_label
-from quant_orchestrator.strategy import summarize_backtest
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,9 @@ def _normalize_trade_log(perf: pd.DataFrame) -> pd.DataFrame:
                     "quantity": abs(amount),
                     "price": float(tx.get("price", 0.0)),
                     "order_id": tx.get("order_id"),
-                    "commission": tx.get("commission"),
+                    "fees": tx.get("commission"),
+                    "notional": abs(amount) * float(tx.get("price", 0.0)),
+                    "native_id": tx.get("id"),
                 },
             )
     return pd.DataFrame(rows)
@@ -51,16 +55,7 @@ def build_zipline_report(
     elapsed_seconds: float,
     trade_count: int | None = None,
 ) -> ZiplineReport:
-    equity_curve = perf["portfolio_value"].rename("portfolio_value")
     trade_log = _normalize_trade_log(perf)
-    summary = summarize_backtest(
-        framework="zipline",
-        symbol=symbol,
-        equity=equity_curve,
-        elapsed_seconds=elapsed_seconds,
-        bars=len(perf),
-        trades=int(trade_count if trade_count is not None else len(trade_log)),
-    )
     last = perf.iloc[-1]
     native_metrics = {
         "algorithm_period_return": float(last["algorithm_period_return"]) if pd.notna(last.get("algorithm_period_return")) else None,
@@ -75,10 +70,21 @@ def build_zipline_report(
         "gross_leverage": float(last["gross_leverage"]) if pd.notna(last.get("gross_leverage")) else None,
         "net_leverage": float(last["net_leverage"]) if pd.notna(last.get("net_leverage")) else None,
     }
+    report = build_normalized_report(
+        framework="zipline",
+        symbol=symbol,
+        equity=perf["portfolio_value"],
+        elapsed_seconds=elapsed_seconds,
+        bars=len(perf),
+        trades=trade_log,
+        trade_count=trade_count,
+        native_report=perf,
+        native_metrics=native_metrics,
+    )
     return ZiplineReport(
-        summary=summary,
-        equity_curve=equity_curve,
-        trade_log=trade_log,
+        summary=report.summary,
+        equity_curve=report.equity_curve,
+        trade_log=report.trade_log,
         native_report=perf,
         native_metrics=native_metrics,
     )

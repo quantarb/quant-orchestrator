@@ -22,6 +22,10 @@ from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.data_ada
 from quant_orchestrator.platforms.backtesting_frameworks.nautilus.data_adapter import (
     build_nautilus_in_memory_data,
 )
+from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
+    build_common_summary,
+    normalize_equity_curve,
+)
 from quant_orchestrator.platforms.backtesting_frameworks.shared import (
     build_sma_crossover_frame as build_shared_sma_crossover_frame,
     combine_equity_curves,
@@ -33,7 +37,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.shared import (
 from quant_orchestrator.platforms.backtesting_frameworks.zipline.data_adapter import (
     build_zipline_in_memory_data,
 )
-from quant_orchestrator.strategy import summarize_backtest, summarize_equity
+from quant_orchestrator.strategy import summarize_equity
 
 
 FAST_WINDOWS = (5, 10, 15, 20, 25, 30, 35, 40, 45, 50)
@@ -216,7 +220,7 @@ print(equity.to_json(date_format="iso"))
     row = json.loads(stdout[marker - 1])
     equity = pd.read_json(StringIO(stdout[marker + 1]), typ="series")
     equity.index = pd.DatetimeIndex(pd.to_datetime(equity.index))
-    return FrameworkRun(pd.DataFrame([row]), pd.DataFrame([row]), equity.rename("portfolio_value"))
+    return FrameworkRun(pd.DataFrame([row]), pd.DataFrame([row]), normalize_equity_curve(equity))
 
 
 def run_framework_comparison(
@@ -350,7 +354,7 @@ def run_backtesting_py(frame: pd.DataFrame, *, symbol: str, capital_base: float)
     ).run()
     elapsed = perf_counter() - started
     equity = stats["_equity_curve"]["Equity"].rename("portfolio_value")
-    summary = summarize_backtest(
+    summary = build_common_summary(
         framework="backtesting.py",
         symbol=symbol,
         equity=equity,
@@ -361,7 +365,7 @@ def run_backtesting_py(frame: pd.DataFrame, *, symbol: str, capital_base: float)
     summary["native_return_pct"] = float(stats["Return [%]"])
     summary["native_sharpe"] = float(stats["Sharpe Ratio"]) if pd.notna(stats["Sharpe Ratio"]) else None
     summary["native_max_drawdown_pct"] = float(stats["Max. Drawdown [%]"])
-    return FrameworkRun(stats, summary, equity)
+    return FrameworkRun(stats, summary, normalize_equity_curve(equity))
 
 
 def run_zipline(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> FrameworkRun:
@@ -400,7 +404,7 @@ def run_zipline(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> Fra
     elapsed = perf_counter() - started
     equity = perf["portfolio_value"].rename("portfolio_value")
     transactions = perf.get("transactions", pd.Series(index=perf.index, data=[[]] * len(perf)))
-    summary = summarize_backtest(
+    summary = build_common_summary(
         framework="zipline",
         symbol=symbol,
         equity=equity,
@@ -409,7 +413,7 @@ def run_zipline(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> Fra
         trades=int(transactions.map(len).sum()),
     )
     summary["native_last_value"] = float(perf["portfolio_value"].iloc[-1])
-    return FrameworkRun(perf, summary, equity)
+    return FrameworkRun(perf, summary, normalize_equity_curve(equity))
 
 
 def run_nautilus(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> FrameworkRun:
@@ -487,7 +491,7 @@ def run_nautilus(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> Fr
     engine.dispose()
 
     equity = _equity_from_fills(prices=frame, fills=fills_report, capital_base=capital_base)
-    summary = summarize_backtest(
+    summary = build_common_summary(
         framework="nautilus",
         symbol=symbol,
         equity=equity,
@@ -497,7 +501,7 @@ def run_nautilus(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> Fr
     )
     summary["native_fills"] = int(len(fills_report))
     summary["native_last_value"] = float(equity.iloc[-1])
-    return FrameworkRun(fills_report, summary, equity)
+    return FrameworkRun(fills_report, summary, normalize_equity_curve(equity))
 
 
 def _equity_from_fills(*, prices: pd.DataFrame, fills: pd.DataFrame, capital_base: float) -> pd.Series:
@@ -523,7 +527,7 @@ def _equity_from_fills(*, prices: pd.DataFrame, fills: pd.DataFrame, capital_bas
                 position -= quantity
         values.append(cash + position * float(row["close"]))
 
-    return pd.Series(values, index=prices.index, name="portfolio_value")
+    return normalize_equity_curve(pd.Series(values, index=prices.index, name="portfolio_value"))
 
 
 def build_combo_signal_matrices(close: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -631,7 +635,7 @@ def run_framework_portfolio(
 
     summary = pd.concat(summaries, ignore_index=True)
     portfolio_equity = _combine_equity_sleeves(sleeves)
-    portfolio_summary = summarize_backtest(
+    portfolio_summary = build_common_summary(
         framework=framework,
         symbol="PORTFOLIO",
         equity=portfolio_equity,
@@ -693,7 +697,7 @@ def run_multi_vendor_backtesting_py_sma_comparison(
 
         symbol_summary = pd.concat(provider_rows, ignore_index=True)
         portfolio_equity = _combine_equity_sleeves(provider_sleeves)
-        portfolio_summary = summarize_backtest(
+        portfolio_summary = build_common_summary(
             framework="backtesting.py",
             symbol="MAG7",
             equity=portfolio_equity,
