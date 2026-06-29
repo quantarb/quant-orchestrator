@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "quant-orchestrator"
 version = "0.1.0"
-description = "Workflow and backtesting adapters around Quant Warehouse data."
+description = "Research orchestration over Quant Warehouse data, ML frameworks, and backtesting frameworks."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

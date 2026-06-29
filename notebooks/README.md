@@ -1,6 +1,6 @@
 # Quant Orchestrator Notebook Examples
 
-These examples show the intended platform shape as small, composable workflows. They consume data, features, and labels from Quant Warehouse and then demonstrate how `quant-orchestrator` stitches ML frameworks, backtesting frameworks, reports, and artifacts together.
+These examples show the current platform shape as small, composable workflows. They consume data, features, and labels from Quant Warehouse and then demonstrate how `quant-orchestrator` stitches ML frameworks, backtesting frameworks, reports, and artifacts together.
 
 The comparison notebooks are meant to show how sensitive strategies can be to data vendor and backtesting framework choices, while also making it easy to start from existing native examples in popular frameworks. They are not a recommendation to test every vendor/framework combination by default. Use them to understand sensitivity, reuse proven examples, narrow the candidate stack, and decide what is worth validating with real or paper PnL.
 
@@ -17,7 +17,8 @@ Current reusable code placement:
 
 - Framework-specific data adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/data_adapter.py`.
 - Framework-specific reporting adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/reporting_adapter.py`.
+- Framework-specific reusable signal runners live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/runner.py` when they exist. Current runners exist for Zipline Reloaded and NautilusTrader.
 - Framework-specific SMA crossover examples now live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/sma_crossover.py`.
-- Temporary FlairNLP evaluation compatibility code used by the current multi-ML notebook lives under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`; it should move upstream or into a fork if it remains necessary.
+- FlairNLP helper functions used by the current multi-ML notebook live under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`.
 
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.

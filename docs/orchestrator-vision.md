@@ -73,17 +73,16 @@ The package should own reusable mechanics such as grid construction, metric filt
 
 ## Artifact Model
 
-The artifact registry already exists and should remain schema-light.
+The artifact registry exists and should remain schema-light.
 
 It should store native outputs from:
 
 - sklearn
 - PyTorch
 - Flair or other NLP frameworks
+- `backtesting.py`
 - Zipline
 - NautilusTrader
-- VectorBT
-- QuantConnect or similar external engines
 - JSON, CSV, text, directories, pickles, or bytes
 
 Different frameworks should be allowed to produce different native reports or file layouts.
@@ -92,17 +91,15 @@ Common reporting should be additive, not destructive. Backtesting reporting adap
 
 ## Backtesting Model
 
-Backtesting adapters should stay thin.
+Backtesting adapters should stay thin. Current code separates three concerns:
 
-They should accept:
-
-- a strategy object or callable
-- prepared warehouse data
-- optional runner-specific parameters
-
-This allows external strategies to be replayed without rewriting the strategy itself for every engine.
+- data adapters convert prepared warehouse data into a framework-native in-memory input
+- runners own repeated framework ceremony for reusable signal-style workflows
+- reporting adapters normalize common summaries while preserving native outputs
 
 Data adapters should bridge Quant Warehouse frames into each native engine without duplicating datasets. Prefer in-memory adapters when the framework supports them, as the current Zipline Reloaded, NautilusTrader, and `backtesting.py` examples do.
+
+Current Zipline Reloaded and NautilusTrader runners execute a precomputed long/flat signal column through the native engine. That is useful for SMA examples and ML-prediction filters, but it should not become the only strategy model. Future external-engine support should be able to run native strategy implementations with prepared warehouse inputs and native artifacts.
 
 Example strategies can live in package code when they are reused across notebooks for framework comparison. Notebook-specific experiment orchestration should stay in notebooks until it becomes a repeated platform capability.
 
@@ -114,7 +111,7 @@ Current examples:
 
 - RAPIDS cuML provides a CUDA-backed sklearn-style RandomForest path.
 - PyTorch uses CUDA auto-detection for tensor models.
-- FlairNLP can be used for native multitask learning. Any local Flair compatibility patch should be treated as temporary integration code, not a long-term platform abstraction.
+- FlairNLP can be used for native multitask learning. Current helper functions for the notebook live under `quant_orchestrator.platforms.ml_frameworks.flair.shared`.
 
 ML outputs should remain native unless there is a clear reason to normalize them. A common metrics table is useful for comparison, but the platform should still store framework-specific reports and artifacts.
 
@@ -122,7 +119,7 @@ ML outputs should remain native unless there is a clear reason to normalize them
 
 - Train one model in one ML framework, then feed its predictions into a strategy.
 - Train multiple models in multiple frameworks, then compare their downstream strategy outputs.
-- Backtest a QuantConnect strategy on warehouse data, then optionally replay its equity curve in another engine.
+- Future external-engine path: backtest a QuantConnect-style strategy on warehouse data, then optionally replay its equity curve in another engine. QuantConnect support is not currently implemented.
 - Optimize parameters in a fast engine, then validate the chosen parameters in a slower or more realistic engine.
 - Run Monte Carlo on a backtest result without treating Monte Carlo as a strategy.
 
@@ -141,24 +138,21 @@ Already present:
 - walk-forward window utilities
 - Monte Carlo utilities
 - in-memory data adapters for the current backtesting examples
+- reusable signal runners for Zipline Reloaded and NautilusTrader
 - normalized backtesting reports for common summaries, equity curves, returns, and trade logs
 - sample framework-specific SMA crossover strategies for `backtesting.py`, Zipline Reloaded, and NautilusTrader
-- a temporary local FlairNLP evaluation compatibility patch used by the current multi-ML notebook
 - executed notebooks covering multi-provider, multi-backtesting-framework, WFO, Monte Carlo, cross-framework validation, and multi-ML-framework MAG7 workflows
 - notebooks as integration tests for the current research workflows
 
 Still missing:
 
-- explicit input/output wiring for jobs
 - leakage-aware dataset visibility controls
-- generic strategy execution jobs
-- generic parameter optimization jobs
-- portfolio combination jobs
+- generic job wrappers for strategy execution, parameter optimization, portfolio combination, and simulation
 - a generic external-engine adapter example
 
 ## Next Implementation Steps
 
-1. Split repeated concrete helpers into atomic train, predict, run, optimize, combine, and simulate stages when multiple notebooks share the same artifact handoff.
+1. Promote repeated concrete helpers into atomic train, predict, run, optimize, combine, and simulate stages only after multiple notebooks share the same artifact handoff.
 2. Add leakage-aware dataset visibility controls around context artifacts.
 3. Make Dagster jobs call these primitives where scheduled execution is needed, without moving research scheduling into Quant Orchestrator.
 4. Add one external-engine proof path, such as a QuantConnect-style adapter.

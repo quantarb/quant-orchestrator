@@ -55,8 +55,8 @@ The platform contract is intentionally small:
 
 - compose in-memory research pipelines from optional stages
 - resolve prepared datasets from `quant-warehouse`
-- run ML framework adapters when a workflow needs model training or inference
-- run backtesting framework adapters when a workflow needs strategy evaluation
+- run ML framework providers when a workflow needs model training or inference
+- run backtesting framework providers, data adapters, reporting adapters, and reusable runners when a workflow needs strategy evaluation
 - run reusable optimization primitives such as parameter grids, metric filters, result ranking, and portfolio weighting
 - normalize common backtest summaries, equity curves, returns, and trade logs while keeping each framework's native report
 - track runs in MLflow
@@ -124,7 +124,18 @@ engine_cls = registry.adapter("backtesting_framework", "optopsy")
 engine = engine_cls()
 ```
 
-Backtesting framework providers are adapters around native engines, not strategy assumptions. Data adapters should move prepared Quant Warehouse frames into each engine in memory whenever the engine allows it. For example, the current Zipline Reloaded path uses an in-memory daily bar reader instead of writing a bundle file for notebook workflows. A QuantConnect strategy should be exposed through a backtesting framework adapter or runner that receives prepared `quant-warehouse` data, runs the native QuantConnect strategy, and registers whatever files/reports that engine emits.
+Backtesting framework providers are adapters around native engines, not strategy assumptions. Data adapters should move prepared Quant Warehouse frames into each engine in memory whenever the engine allows it. Reporting adapters should expose comparable summaries, equity curves, returns, and trade logs while preserving native reports and metrics.
+
+Current reusable backtesting code is intentionally concrete:
+
+- `backtesting_py/data_adapter.py` converts warehouse OHLCV plus precomputed features into `backtesting.py`'s expected dataframe shape.
+- `zipline/data_adapter.py` builds an in-memory Zipline daily bar reader.
+- `nautilus/data_adapter.py` converts warehouse OHLCV into Nautilus bar objects.
+- `zipline/runner.py` and `nautilus/runner.py` run a precomputed long/flat signal strategy through the native engines.
+- `<framework>/reporting_adapter.py` normalizes common backtest outputs while keeping each framework's native report.
+- `<framework>/sma_crossover.py` contains the reusable SMA example strategy wrappers used by the CLI and notebooks.
+
+A QuantConnect strategy should be exposed through a backtesting framework provider or runner that receives prepared `quant-warehouse` data, runs the native QuantConnect strategy, and registers whatever files or reports that engine emits. QuantConnect support is not currently implemented in this repo.
 
 ## Experiment Tracking
 
@@ -151,7 +162,7 @@ with `tracking_uri=...`, `QUANT_ORCHESTRATOR_MLFLOW_TRACKING_URI`, or `MLFLOW_TR
 
 `quant-orchestrator` owns ML training, backtest, model, prediction, and strategy artifacts. Downstream apps should ask the orchestrator to train, infer, backtest, or run external strategy evaluations, then load the returned artifact URI or path instead of maintaining separate research storage.
 
-The registry is intentionally schema-light: sklearn, PyTorch, Flair NLP, Zipline, NautilusTrader, and other frameworks can save their native files, directories, dataframes, JSON, text reports, or pickled objects without forcing every output into one common report shape.
+The registry is intentionally schema-light: sklearn, PyTorch, Flair NLP, Zipline Reloaded, NautilusTrader, `backtesting.py`, and other frameworks can save their native files, directories, dataframes, JSON, text reports, or pickled objects without forcing every output into one common report shape.
 
 ```python
 from quant_orchestrator.artifacts import get_artifact_store
@@ -188,6 +199,7 @@ Recent notebooks follow this pattern:
 - strategy examples may live in package code when reused across frameworks, but notebook-only experiment glue stays in notebooks
 - framework-specific data adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/data_adapter.py`
 - framework-specific reporting adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/reporting_adapter.py`
+- framework-specific reusable signal runners live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/runner.py` when they exist
 
 ## Load Data
 
@@ -214,7 +226,7 @@ quant-orchestrator --strategy sma --framework nautilus --symbols AAPL --start 20
 
 The CLI is a smoke-test/demo surface. The SMA CLI currently runs Zipline Reloaded and NautilusTrader for the first symbol passed to `--symbols`. The richer framework-comparison notebooks cover `backtesting.py`, Zipline Reloaded, and NautilusTrader across multiple symbols and providers.
 
-Zipline Reloaded uses `run_algorithm()` with in-memory daily bars. NautilusTrader uses `BacktestEngine` and `BarDataWrangler` to convert the same OHLCV frame into Nautilus bar objects. The examples use a simple SMA strategy so framework runtime and output shape can be compared without implying that every workflow is equity-only or ML-driven.
+Zipline Reloaded uses `TradingAlgorithm` with in-memory daily bars. NautilusTrader uses `BacktestEngine` and `BarDataWrangler` to convert the same OHLCV frame into Nautilus bar objects. The reusable Zipline and Nautilus signal runners execute a precomputed long/flat signal column, so notebooks can inject warehouse features or ML predictions without duplicating engine ceremony. The examples use a simple SMA strategy so framework runtime and output shape can be compared without implying that every workflow is equity-only or ML-driven.
 
 ## Scheduled Orchestration
 

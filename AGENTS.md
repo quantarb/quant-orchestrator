@@ -47,7 +47,7 @@
 - If a notebook workflow becomes a repeated capability, move the reusable API into package code and leave the notebook as an example.
 - Notebooks in this repo must not implement feature engineering, target engineering, or warehouse refresh logic. Pull prepared datasets from `quant-warehouse`.
 - If a notebook needs a new feature family or label, implement it in `quant-warehouse` first, then consume it here.
-- Data adapters and reporting adapters are reusable platform code and should live under the relevant framework module, not inside notebooks.
+- Data adapters, reporting adapters, and repeated framework runners are reusable platform code and should live under the relevant framework module, not inside notebooks.
 - Notebook documentation and saved outputs should be updated when notebook behavior materially changes.
 
 ## CUDA Policy
