@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
@@ -49,69 +48,6 @@ class OptopsyBacktestResult:
     trade_log: pd.DataFrame
     equity_curve: pd.Series
     summary: dict[str, Any]
-
-
-def selected_symbols_from_scores(
-    scores: pd.DataFrame,
-    *,
-    symbol_col: str | None = None,
-    score_col: str | None = None,
-    date_col: str | None = None,
-    top_k: int = 10,
-    threshold: float | None = None,
-) -> pd.DataFrame:
-    """Normalize an optimal-trader score artifact into selected symbols."""
-
-    frame = scores.copy()
-    if symbol_col is None:
-        symbol_col = _first_present(frame, ("Symbol", "symbol", "ticker", "underlying_symbol"))
-    if symbol_col is None:
-        frame = frame.reset_index()
-        symbol_col = _first_present(frame, ("symbol", "Symbol", "index"))
-    if symbol_col is None:
-        raise ValueError("Could not resolve a symbol column from score artifact")
-
-    if score_col is None:
-        score_col = _first_present(
-            frame,
-            (
-                "Combined Score",
-                "buy_score_mean_raw_pct6",
-                "buy_score",
-                "prob_buy",
-                "Classifier Score",
-                "clf__prob_1",
-                "clf",
-            ),
-        )
-    if score_col is None:
-        raise ValueError("Could not resolve a score column from score artifact")
-
-    if date_col is None:
-        date_col = _first_present(frame, ("Scored Date", "date", "feature_as_of_date"))
-
-    out = pd.DataFrame(
-        {
-            "symbol": frame[symbol_col].astype(str).str.strip().str.upper(),
-            "score": pd.to_numeric(frame[score_col], errors="coerce"),
-        },
-    )
-    if date_col is not None:
-        out["score_date"] = pd.to_datetime(frame[date_col], errors="coerce").dt.normalize()
-    out = out.loc[out["symbol"].ne("") & out["score"].notna()].copy()
-    if threshold is not None:
-        out = out.loc[out["score"].ge(float(threshold))].copy()
-    out = out.sort_values("score", ascending=False, kind="stable").head(max(int(top_k), 0))
-    out["rank"] = np.arange(1, len(out) + 1)
-    return out.reset_index(drop=True)
-
-
-def load_score_artifact(path: str | Path, **selection_kwargs: Any) -> pd.DataFrame:
-    path = Path(path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(path)
-    scores = pd.read_pickle(path) if path.suffix.lower() in {".pkl", ".pickle"} else pd.read_csv(path)
-    return selected_symbols_from_scores(scores, **selection_kwargs)
 
 
 def load_thetadata_options_for_optopsy(
@@ -320,14 +256,6 @@ def _resolve_optopsy_strategy(optopsy_module: Any, name: str) -> Callable[..., p
     if not callable(strategy):
         raise ValueError(f"Optopsy attribute is not callable: {strategy_name}")
     return strategy
-
-
-def _first_present(frame: pd.DataFrame, candidates: Iterable[str]) -> str | None:
-    columns = set(frame.columns)
-    for candidate in candidates:
-        if candidate in columns:
-            return candidate
-    return None
 
 
 def _normalize_symbols(symbols: Sequence[str]) -> tuple[str, ...]:

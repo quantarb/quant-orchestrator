@@ -210,7 +210,6 @@ quant-warehouse refresh AAPL --sections prices --providers yfinance
 quant-orchestrator --strategy sma --framework all --symbols AAPL --start 2023-01-01 --fast-window 5 --slow-window 10
 quant-orchestrator --strategy sma --framework zipline --symbols AAPL --start 2020-01-01
 quant-orchestrator --strategy sma --framework nautilus --symbols AAPL --start 2020-01-01
-quant-orchestrator --strategy trading-app-equity --framework all --provider yfinance --train-model --train-start 2020-01-01 --train-end 2024-12-31 --backtest-start 2025-01-01
 ```
 
 The CLI is a smoke-test/demo surface. The SMA CLI currently runs Zipline Reloaded and NautilusTrader for the first symbol passed to `--symbols`. The richer framework-comparison notebooks cover `backtesting.py`, Zipline Reloaded, and NautilusTrader across multiple symbols and providers.
@@ -225,7 +224,7 @@ Dagster definitions live in `quant_orchestrator.dagster_defs`:
 dagster dev -m quant_orchestrator.dagster_defs
 ```
 
-The current module exposes a trading-app migration experiment job and a backtest-framework-comparison job. Production research jobs should compose the same platform capabilities: load warehouse data, run the selected ML framework or backtesting framework only when needed, and register native artifacts.
+The current module exposes a backtest-framework-comparison job. Production research jobs should compose the same platform capabilities: load warehouse data, run the selected ML framework or backtesting framework only when needed, and register native artifacts.
 
 ## Optional Experiment Primitives
 

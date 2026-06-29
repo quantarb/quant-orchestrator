@@ -4,17 +4,13 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass
-from itertools import product
 from io import StringIO
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-import numpy as np
 import pandas as pd
-import vectorbt as vbt
 
-from quant_orchestrator.monte_carlo import simulate_return_paths
 from quant_orchestrator.pipeline import FunctionStage, Pipeline, PipelineContext
 from quant_orchestrator.platforms.backtesting_frameworks.nautilus.data_adapter import (
     build_nautilus_in_memory_data,
@@ -33,14 +29,10 @@ from quant_orchestrator.platforms.backtesting_frameworks.shared import (
 from quant_orchestrator.platforms.backtesting_frameworks.zipline.data_adapter import (
     build_zipline_in_memory_data,
 )
-from quant_orchestrator.strategy import summarize_equity
 
 
 FAST_WINDOWS = (5, 10, 15, 20, 25, 30, 35, 40, 45, 50)
 SLOW_WINDOWS = (60, 70, 80, 90, 100, 120, 140, 160, 180, 200)
-SYMBOL_COUNT = len(MAG7_SYMBOLS)
-WINDOW_GRID = tuple(product(FAST_WINDOWS, SLOW_WINDOWS))
-WINDOW_COLUMNS = pd.MultiIndex.from_tuples(WINDOW_GRID, names=["fast_window", "slow_window"])
 
 
 @dataclass(frozen=True)
@@ -65,19 +57,6 @@ def build_sma_frame(prices: pd.DataFrame, *, fast_window: int, slow_window: int)
 
 def _combine_equity_sleeves(sleeves: list[pd.Series]) -> pd.Series:
     return combine_equity_curves(sleeves)
-
-
-def _load_symbol_price_frames(
-    *,
-    provider: str,
-    start: str,
-    end: str | None,
-    symbols: tuple[str, ...] = MAG7_SYMBOLS,
-) -> dict[str, pd.DataFrame]:
-    frames = {}
-    for symbol in symbols:
-        frames[symbol] = load_price_frame(symbol, provider=provider, start=start, end=end)
-    return frames
 
 
 def _framework_comparison_rows(table: pd.DataFrame, *, metric: str) -> pd.DataFrame:
@@ -105,23 +84,6 @@ def _framework_comparison_rows(table: pd.DataFrame, *, metric: str) -> pd.DataFr
             }
         ],
     )
-
-
-def _serialize_json_row(row: dict[str, Any]) -> dict[str, Any]:
-    clean: dict[str, Any] = {}
-    for key, value in row.items():
-        if hasattr(value, "item"):
-            try:
-                value = value.item()
-            except Exception:
-                pass
-        if hasattr(value, "isoformat"):
-            try:
-                value = value.isoformat()
-            except Exception:
-                pass
-        clean[key] = value
-    return clean
 
 
 def _coerce_framework_run(result: object) -> FrameworkRun:
@@ -425,7 +387,7 @@ def run_zipline(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> Fra
         elif not bullish and context.is_long:
             order_target(context.asset, 0)
             context.is_long = False
-        record(price=data.current(context.asset, "price"), signal=float(bullish))
+        record(signal=float(bullish))
 
     started = perf_counter()
     algo = TradingAlgorithm(
@@ -564,83 +526,6 @@ def _equity_from_fills(*, prices: pd.DataFrame, fills: pd.DataFrame, capital_bas
     return normalize_equity_curve(pd.Series(values, index=prices.index, name="portfolio_value"))
 
 
-def build_combo_signal_matrices(close: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
-    fast_ma = vbt.MA.run(close, window=list(FAST_WINDOWS)).ma
-    slow_ma = vbt.MA.run(close, window=list(SLOW_WINDOWS)).ma
-    fast_values = fast_ma.to_numpy()
-    slow_values = slow_ma.to_numpy()
-    bullish = fast_values[:, :, None] > slow_values[:, None, :]
-    prev_bullish = np.zeros_like(bullish, dtype=bool)
-    prev_bullish[1:] = bullish[:-1]
-    entries = bullish & ~prev_bullish
-    exits = (~bullish) & prev_bullish
-    entries_frame = pd.DataFrame(entries.reshape(len(close), -1), index=close.index, columns=WINDOW_COLUMNS)
-    exits_frame = pd.DataFrame(exits.reshape(len(close), -1), index=close.index, columns=WINDOW_COLUMNS)
-    return entries_frame, exits_frame
-
-
-def run_vectorbt_portfolio_search(*, provider: str, start: str, end: str | None, capital_base: float) -> tuple[pd.DataFrame, pd.Series, float]:
-    started = perf_counter()
-    capital_per_symbol = capital_base / SYMBOL_COUNT
-    combined_values: pd.DataFrame | None = None
-    combined_trades: pd.Series | None = None
-
-    for symbol in MAG7_SYMBOLS:
-        prices = load_price_frame(symbol, provider=provider, start=start, end=end)
-        entries, exits = build_combo_signal_matrices(prices["close"])
-        pf = vbt.Portfolio.from_signals(
-            prices["close"],
-            entries=entries,
-            exits=exits,
-            init_cash=capital_per_symbol,
-            freq="1D",
-            upon_opposite_entry="close",
-        )
-        values = pf.value()
-        trades = pf.trades.count()
-        if combined_values is None:
-            combined_values = values.copy()
-            combined_trades = trades.copy()
-        else:
-            combined_index = combined_values.index.union(values.index)
-            combined_values = combined_values.reindex(combined_index).ffill().bfill()
-            values = values.reindex(combined_index).ffill().bfill()
-            combined_values = combined_values.add(values, fill_value=0.0)
-            combined_trades = combined_trades.add(trades, fill_value=0.0)
-
-    elapsed = perf_counter() - started
-    if combined_values is None or combined_trades is None:
-        raise ValueError("vectorbt search produced no output")
-    return combined_values.sort_index(), combined_trades.sort_index(), elapsed
-
-
-def build_search_grid(values: pd.DataFrame, trades: pd.Series, *, provider: str, elapsed_seconds: float) -> pd.DataFrame:
-    rows = []
-    for combo in values.columns:
-        equity = values.loc[:, combo].rename("portfolio_value")
-        summary = summarize_equity(equity)
-        rows.append(
-            {
-                "provider": provider,
-                "fast_window": int(combo[0]),
-                "slow_window": int(combo[1]),
-                "bars": len(equity),
-                "trades": int(round(float(trades.loc[combo]))),
-                "final_equity": summary["final_equity"],
-                "total_return": summary["total_return"],
-                "max_drawdown": summary["max_drawdown"],
-                "daily_vol": summary["daily_vol"],
-                "elapsed_seconds": round(elapsed_seconds, 4),
-            }
-        )
-    grid = pd.DataFrame(rows).sort_values(
-        by=["total_return", "max_drawdown", "final_equity"],
-        ascending=[False, True, False],
-    ).reset_index(drop=True)
-    grid["train_rank"] = grid.index + 1
-    return grid
-
-
 def run_framework_portfolio(
     framework: str,
     *,
@@ -694,299 +579,3 @@ def build_symbol_frames(
         prices = load_price_frame(symbol, provider=provider, start=start, end=end)
         frames[symbol] = build_sma_frame(prices, fast_window=fast_window, slow_window=slow_window)
     return frames
-
-
-def run_multi_vendor_backtesting_py_sma_comparison(
-    *,
-    providers: tuple[str, ...] = ("fmp", "yfinance"),
-    symbols: tuple[str, ...] = MAG7_SYMBOLS,
-    start: str = "2020-01-01",
-    end: str | None = None,
-    fast_window: int = 50,
-    slow_window: int = 200,
-    capital_base: float = 100_000.0,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, FrameworkRun]]]:
-    def run_provider_backtests(context: PipelineContext) -> dict[str, Any]:
-        symbol_tables = []
-        portfolio_tables = []
-        runs_by_provider: dict[str, dict[str, FrameworkRun]] = {}
-
-        for provider in providers:
-            capital_per_symbol = capital_base / max(1, len(symbols))
-            provider_runs: dict[str, FrameworkRun] = {}
-            provider_rows = []
-            provider_sleeves = []
-            elapsed = 0.0
-            trades = 0
-
-            for symbol in symbols:
-                prices = load_price_frame(symbol, provider=provider, start=start, end=end)
-                frame = build_sma_frame(prices, fast_window=fast_window, slow_window=slow_window)
-                started = perf_counter()
-                run = run_backtesting_py(frame, symbol=symbol, capital_base=capital_per_symbol)
-                elapsed += perf_counter() - started
-                provider_rows.append(run.summary.assign(provider=provider))
-                provider_sleeves.append(run.equity.rename(symbol))
-                trades += int(run.summary["trades"].iloc[0])
-                provider_runs[symbol] = run
-
-            symbol_summary = pd.concat(provider_rows, ignore_index=True)
-            portfolio_equity = _combine_equity_sleeves(provider_sleeves)
-            portfolio_summary = build_common_summary(
-                framework="backtesting.py",
-                symbol="MAG7",
-                equity=portfolio_equity,
-                elapsed_seconds=elapsed,
-                bars=len(portfolio_equity),
-                trades=trades,
-            )
-            portfolio_summary["provider"] = provider
-            portfolio_summary["fast_window"] = fast_window
-            portfolio_summary["slow_window"] = slow_window
-
-            symbol_tables.append(symbol_summary)
-            portfolio_tables.append(portfolio_summary)
-            runs_by_provider[provider] = provider_runs
-
-        return {
-            "symbol_summary": pd.concat(symbol_tables, ignore_index=True),
-            "portfolio_summary": pd.concat(portfolio_tables, ignore_index=True),
-            "runs_by_provider": runs_by_provider,
-        }
-
-    context = Pipeline(
-        [
-            FunctionStage(
-                name="run_provider_backtests",
-                function=run_provider_backtests,
-                produced_outputs=("symbol_summary", "portfolio_summary", "runs_by_provider"),
-            )
-        ],
-        name="multi_vendor_backtesting_py_sma_comparison",
-    ).run().context
-    return (
-        context.require("symbol_summary"),
-        context.require("portfolio_summary"),
-        context.require("runs_by_provider"),
-    )
-
-
-def run_cross_framework_sma_search_monte_carlo(
-    *,
-    providers: tuple[str, ...] = ("fmp", "yfinance"),
-    forward_symbols: tuple[str, ...] = ("QQQ", "SPY"),
-    capital_base: float = 100_000.0,
-    top_mc_count: int = 10,
-    mc_iterations: int = 1_000,
-    mc_block_size: int = 5,
-    start: str = "2020-01-01",
-    train_end: str = "2025-12-31",
-    test_start: str = "2026-01-01",
-    test_end: str = "2026-12-31",
-) -> dict[str, Any]:
-    train_values_by_provider = {}
-    train_grid_by_provider = {}
-    search_elapsed_rows = []
-    search_tables = []
-
-    for provider in providers:
-        provider_started = perf_counter()
-        train_values, train_trades, vectorbt_elapsed = run_vectorbt_portfolio_search(
-            provider=provider,
-            start=start,
-            end=train_end,
-            capital_base=capital_base,
-        )
-        train_grid = build_search_grid(train_values, train_trades, provider=provider, elapsed_seconds=vectorbt_elapsed)
-        train_values_by_provider[provider] = train_values
-        train_grid_by_provider[provider] = train_grid
-        search_elapsed_rows.append(
-            {
-                "provider": provider,
-                "vectorized_search_seconds": round(vectorbt_elapsed, 4),
-                "wall_seconds": round(perf_counter() - provider_started, 4),
-            }
-        )
-        search_tables.append(train_grid.head(top_mc_count))
-
-    train_search_report = pd.concat(search_tables, ignore_index=True)
-    search_elapsed = pd.DataFrame(search_elapsed_rows)
-
-    mc_rows = []
-    mc_elapsed_rows = []
-    for provider in providers:
-        provider_grid = train_grid_by_provider[provider]
-        provider_values = train_values_by_provider[provider]
-        top10 = provider_grid.head(top_mc_count).copy()
-
-        mc_started = perf_counter()
-        for _, row in top10.iterrows():
-            fast_window = int(row["fast_window"])
-            slow_window = int(row["slow_window"])
-            key = (fast_window, slow_window)
-            equity = provider_values.loc[:, key].rename("portfolio_value")
-            returns = equity.pct_change().dropna()
-            mc = simulate_return_paths(
-                returns,
-                iterations=mc_iterations,
-                block_size=mc_block_size,
-                horizon=len(returns),
-            )
-            mc_rows.append(
-                {
-                    "provider": provider,
-                    "fast_window": fast_window,
-                    "slow_window": slow_window,
-                    "train_total_return": float(row["total_return"]),
-                    "train_max_drawdown": float(row["max_drawdown"]),
-                    "terminal_return_mean": float(mc.summary.loc[0, "terminal_return_mean"]),
-                    "terminal_return_p05": float(mc.summary.loc[0, "terminal_return_p05"]),
-                    "terminal_return_p50": float(mc.summary.loc[0, "terminal_return_p50"]),
-                    "terminal_return_p95": float(mc.summary.loc[0, "terminal_return_p95"]),
-                    "max_drawdown_mean": float(mc.summary.loc[0, "max_drawdown_mean"]),
-                    "max_drawdown_p05": float(mc.summary.loc[0, "max_drawdown_p05"]),
-                }
-            )
-        mc_elapsed_rows.append(
-            {
-                "provider": provider,
-                "mc_seconds": round(perf_counter() - mc_started, 4),
-            }
-        )
-
-    mc_report = pd.DataFrame(mc_rows)
-    mc_report["mc_robustness_score"] = mc_report["terminal_return_p50"] + mc_report["max_drawdown_mean"]
-    mc_report = mc_report.sort_values(
-        by=["provider", "mc_robustness_score", "terminal_return_p50"],
-        ascending=[True, False, False],
-    ).reset_index(drop=True)
-    mc_report["mc_rank"] = mc_report.groupby("provider").cumcount() + 1
-    mc_elapsed = pd.DataFrame(mc_elapsed_rows)
-
-    selection_rows = []
-    for provider in providers:
-        provider_grid = train_grid_by_provider[provider]
-        provider_mc = mc_report[mc_report["provider"] == provider].copy()
-        train_best = provider_grid.iloc[0]
-        mc_best = provider_mc.iloc[0]
-        merged = provider_grid.loc[:, ["fast_window", "slow_window", "total_return", "train_rank"]].merge(
-            provider_mc.loc[:, ["fast_window", "slow_window", "mc_robustness_score", "mc_rank"]],
-            on=["fast_window", "slow_window"],
-            how="inner",
-        )
-        merged["hybrid_rank"] = merged["train_rank"] + merged["mc_rank"]
-        merged = merged.sort_values(
-            by=["hybrid_rank", "mc_robustness_score", "total_return"],
-            ascending=[True, False, False],
-        ).reset_index(drop=True)
-        hybrid_best = merged.iloc[0]
-
-        selection_rows.extend(
-            [
-                {
-                    "provider": provider,
-                    "selection": "best_train",
-                    "fast_window": int(train_best["fast_window"]),
-                    "slow_window": int(train_best["slow_window"]),
-                    "train_total_return": float(train_best["total_return"]),
-                    "mc_robustness_score": float(
-                        provider_mc.loc[
-                            (provider_mc["fast_window"] == int(train_best["fast_window"]))
-                            & (provider_mc["slow_window"] == int(train_best["slow_window"])),
-                            "mc_robustness_score",
-                        ].iloc[0]
-                    ),
-                },
-                {
-                    "provider": provider,
-                    "selection": "best_mc",
-                    "fast_window": int(mc_best["fast_window"]),
-                    "slow_window": int(mc_best["slow_window"]),
-                    "train_total_return": float(mc_best["train_total_return"]),
-                    "mc_robustness_score": float(mc_best["mc_robustness_score"]),
-                },
-                {
-                    "provider": provider,
-                    "selection": "best_hybrid",
-                    "fast_window": int(hybrid_best["fast_window"]),
-                    "slow_window": int(hybrid_best["slow_window"]),
-                    "train_total_return": float(hybrid_best["total_return"]),
-                    "mc_robustness_score": float(hybrid_best["mc_robustness_score"]),
-                },
-            ]
-        )
-
-    selections = pd.DataFrame(selection_rows)
-
-    forward_rows = []
-    forward_runs = {}
-    for provider in providers:
-        provider_selections = selections[selections["provider"] == provider]
-        for selection_name, fast_window, slow_window in provider_selections[["selection", "fast_window", "slow_window"]].itertuples(index=False):
-            for framework_name in ("backtesting.py", "zipline", "nautilus"):
-                symbol_frames = build_symbol_frames(
-                    provider=provider,
-                    fast_window=fast_window,
-                    slow_window=slow_window,
-                    start=start,
-                    end=test_end,
-                    symbols=forward_symbols,
-                )
-                symbol_frames = {
-                    symbol: frame.loc[test_start:test_end].copy()
-                    for symbol, frame in symbol_frames.items()
-                }
-                _, portfolio_summary, runs = run_framework_portfolio(
-                    framework_name,
-                    symbol_frames=symbol_frames,
-                    capital_base=capital_base,
-                )
-                row = portfolio_summary.iloc[0].to_dict()
-                row.update(
-                    {
-                        "provider": provider,
-                        "selection": selection_name,
-                        "fast_window": int(fast_window),
-                        "slow_window": int(slow_window),
-                        "framework": framework_name,
-                        "symbols": ",".join(forward_symbols),
-                    }
-                )
-                forward_rows.append(row)
-                forward_runs[(provider, selection_name, framework_name)] = runs
-
-    forward_report = pd.DataFrame(forward_rows)
-    summary = pd.DataFrame(
-        [
-            {
-                "stage": "vectorized_search",
-                "engine": "vectorbt",
-                "rows": len(train_search_report),
-                "elapsed_seconds": round(float(search_elapsed["vectorized_search_seconds"].sum()), 4),
-            },
-            {
-                "stage": "monte_carlo",
-                "engine": "quant_orchestrator.monte_carlo",
-                "rows": len(mc_report),
-                "elapsed_seconds": round(float(mc_elapsed["mc_seconds"].sum()), 4),
-            },
-            {
-                "stage": "forward_test",
-                "engine": "backtesting.py/zipline/nautilus",
-                "rows": len(forward_report),
-                "symbols": ",".join(forward_symbols),
-                "elapsed_seconds": round(float(forward_report["elapsed_seconds"].sum()), 4),
-            },
-        ]
-    )
-
-    return {
-        "train_search_report": train_search_report,
-        "search_elapsed": search_elapsed,
-        "mc_report": mc_report,
-        "mc_elapsed": mc_elapsed,
-        "selections": selections,
-        "forward_report": forward_report,
-        "summary": summary,
-        "runs": forward_runs,
-    }

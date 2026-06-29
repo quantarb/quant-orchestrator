@@ -44,16 +44,18 @@ def build_zipline_in_memory_data(
     if naive_index.tz is not None:
         naive_index = naive_index.tz_convert(None)
     calendar = get_calendar("XNYS")
-    sessions = calendar.sessions_in_range(naive_index.min(), naive_index.max())
+    sim_sessions = calendar.sessions_in_range(naive_index.min(), naive_index.max())
+    data_start = naive_index.min() - pd.Timedelta(days=10)
+    data_sessions = calendar.sessions_in_range(data_start, sim_sessions[-1])
 
     equities = pd.DataFrame(
         {
             "symbol": [symbol.upper()],
             "asset_name": [symbol.upper()],
-            "start_date": [sessions[0]],
-            "end_date": [sessions[-1]],
-            "first_traded": [sessions[0]],
-            "auto_close_date": [sessions[-1]],
+            "start_date": [sim_sessions[0]],
+            "end_date": [sim_sessions[-1]],
+            "first_traded": [sim_sessions[0]],
+            "auto_close_date": [sim_sessions[-1]],
             "exchange": ["TEST"],
         },
         index=[1],
@@ -67,8 +69,8 @@ def build_zipline_in_memory_data(
             "symbol": [symbol.upper()],
             "company_symbol": [symbol.upper()],
             "share_class_symbol": [""],
-            "start_date": [sessions[0]],
-            "end_date": [sessions[-1]],
+            "start_date": [sim_sessions[0]],
+            "end_date": [sim_sessions[-1]],
         },
     )
     writer.write_direct(
@@ -79,23 +81,26 @@ def build_zipline_in_memory_data(
     asset_finder = AssetFinder(engine)
     asset = asset_finder.retrieve_asset(1)
 
-    sessions_naive = pd.DatetimeIndex(sessions)
-    if sessions_naive.tz is not None:
-        sessions_naive = sessions_naive.tz_convert(None)
-    aligned = frame.reindex(sessions).ffill()
+    data_sessions_naive = pd.DatetimeIndex(data_sessions)
+    sim_sessions_naive = pd.DatetimeIndex(sim_sessions)
+    if data_sessions_naive.tz is not None:
+        data_sessions_naive = data_sessions_naive.tz_convert(None)
+    if sim_sessions_naive.tz is not None:
+        sim_sessions_naive = sim_sessions_naive.tz_convert(None)
+    aligned = frame.reindex(data_sessions).ffill().bfill()
     aligned["volume"] = aligned["volume"].fillna(0.0)
     currency_codes = pd.Series({asset: "USD"})
     bar_frames = {
-        column: pd.DataFrame({asset: aligned[column].to_numpy()}, index=sessions)
+        column: pd.DataFrame({asset: aligned[column].to_numpy()}, index=data_sessions)
         for column in OHLCV_COLUMNS
     }
     reader = InMemoryDailyBarReader.from_dfs(bar_frames, calendar, currency_codes)
     reader.frames = bar_frames
 
-    benchmark_returns = pd.Series(0.0, index=sessions_naive)
+    benchmark_returns = pd.Series(0.0, index=sim_sessions_naive)
     sim_params = SimulationParameters(
-        start_session=sessions_naive[0],
-        end_session=sessions_naive[-1],
+        start_session=sim_sessions_naive[0],
+        end_session=sim_sessions_naive[-1],
         trading_calendar=calendar,
         capital_base=capital_base,
     )
@@ -109,9 +114,9 @@ def build_zipline_in_memory_data(
         data_portal=DataPortal(
             asset_finder,
             calendar,
-            sessions_naive[0],
+            sim_sessions_naive[0],
             equity_daily_reader=reader,
-            last_available_session=sessions_naive[-1],
+            last_available_session=sim_sessions_naive[-1],
         ),
         sim_params=sim_params,
         benchmark_returns=benchmark_returns,

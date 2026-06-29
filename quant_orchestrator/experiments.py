@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Literal
 
 import pandas as pd
@@ -67,26 +66,6 @@ class MonteCarloSpec:
     horizon: int | None = None
     seed: int = 1337
     block_size: int = 1
-
-
-@dataclass(frozen=True)
-class TradingAppExperimentSpec:
-    name: str = "trading-app-equity"
-    provider: str = "yfinance"
-    framework: Literal["zipline", "nautilus", "all"] = "zipline"
-    top_k: int = 40
-    gross_exposure: float = 0.75
-    capital_base: float = 100_000
-    prediction_artifact: Path | None = None
-    train_model: bool = False
-    train_start: str = "2020-01-01"
-    train_end: str = "2020-12-31"
-    backtest_start: str = "2021-01-01"
-    end: str | None = None
-    max_symbols: int | None = None
-    universe: UniverseSplit = field(default_factory=UniverseSplit)
-    window: WindowSpec = field(default_factory=WindowSpec)
-    monte_carlo: MonteCarloSpec = field(default_factory=MonteCarloSpec)
 
 
 def build_walk_forward_windows(spec: WindowSpec) -> list[WalkForwardWindow]:

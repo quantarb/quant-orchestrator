@@ -52,7 +52,7 @@ class ArtifactRecord:
 class ArtifactStore:
     """Filesystem artifact store with a SQLite registry.
 
-    The orchestrator owns this registry so callers such as `optimal_trader` can request work,
+    The orchestrator owns this registry so downstream applications can request work,
     receive artifact URIs or paths, and load outputs without maintaining separate ML storage.
     """
 

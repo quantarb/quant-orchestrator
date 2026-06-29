@@ -31,7 +31,6 @@ cuda = [
 ]
 backtesting = [
     "backtesting>=0.3.3",
-    "vectorbt>=1.0.0",
     "zipline-reloaded==3.1.1",
     "nautilus-trader==1.228.0",
 ]
@@ -44,7 +43,6 @@ dev = [
 ]
 all = [
     "backtesting>=0.3.3",
-    "vectorbt>=1.0.0",
     "scikit-learn>=1.4",
     "flair>=0.15,<0.16",
     "torch>=2.5",

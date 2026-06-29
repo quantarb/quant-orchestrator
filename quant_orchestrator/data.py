@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pandas as pd
 from quant_warehouse import Warehouse
 
@@ -40,27 +38,3 @@ def load_ohlcv(
     df["high"] = ohlc.max(axis=1)
     df["low"] = ohlc.min(axis=1)
     return df
-
-
-def write_zipline_csv(symbol: str, prices: pd.DataFrame, root: Path, *, calendar_name: str = "XNYS") -> Path:
-    from zipline.utils.calendar_utils import get_calendar
-
-    daily_dir = root / "daily"
-    daily_dir.mkdir(parents=True, exist_ok=True)
-    out = prices.copy()
-    if out.index.tz is None:
-        out.index = out.index.tz_localize("UTC")
-    else:
-        out.index = out.index.tz_convert("UTC")
-    out.index = out.index.tz_convert(None).normalize()
-    calendar = get_calendar(calendar_name)
-    sessions = calendar.sessions_in_range(out.index.min(), out.index.max()).tz_localize(None)
-    out = out.reindex(sessions)
-    out.loc[:, ["open", "high", "low", "close"]] = out.loc[:, ["open", "high", "low", "close"]].ffill()
-    out["volume"] = out["volume"].fillna(0.0)
-    out.index.name = "date"
-    out["dividend"] = 0.0
-    out["split"] = 1.0
-    path = daily_dir / f"{symbol.upper()}.csv"
-    out.to_csv(path)
-    return path
