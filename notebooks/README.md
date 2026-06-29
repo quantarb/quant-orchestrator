@@ -2,9 +2,7 @@
 
 These examples show the intended platform shape as small, composable workflows. They consume data, features, and labels from Quant Warehouse and then demonstrate how `quant-orchestrator` stitches ML frameworks, backtesting frameworks, reports, and artifacts together.
 
-The comparison notebooks are meant to show how sensitive a strategy can be to data vendor and backtesting framework choices. They are not a recommendation to test every vendor/framework combination by default. Use them to understand sensitivity, narrow the candidate stack, and decide what is worth validating with real or paper PnL.
-
-The framework-specific notebooks should also make it easy to start from existing native examples in popular backtesting frameworks. Those examples are useful starting points and references when the same strategy is later ported to another engine.
+The comparison notebooks are meant to show how sensitive a strategy can be to data vendor and backtesting framework choices, while also making it easy to start from existing native examples in popular frameworks. They are not a recommendation to test every vendor/framework combination by default. Use them to understand sensitivity, reuse proven examples, narrow the candidate stack, and decide what is worth validating with real or paper PnL.
 
 They are examples, not required paths:
 
