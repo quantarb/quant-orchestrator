@@ -47,12 +47,21 @@
 - If a notebook workflow becomes a repeated capability, move the reusable API into package code and leave the notebook as an example.
 - Notebooks in this repo must not implement feature engineering, target engineering, or warehouse refresh logic. Pull prepared datasets from `quant-warehouse`.
 - If a notebook needs a new feature family or label, implement it in `quant-warehouse` first, then consume it here.
+- Data adapters and reporting adapters are reusable platform code and should live under the relevant framework module, not inside notebooks.
+- Notebook documentation and saved outputs should be updated when notebook behavior materially changes.
 
 ## CUDA Policy
 
 - Optimize model training and simulation code for CUDA-first execution when the selected ML framework supports it.
 - Prefer GPU-native libraries such as PyTorch CUDA and RAPIDS/CuPy where they fit the workflow.
+- For sklearn-style GPU training, prefer RAPIDS cuML instead of CPU scikit-learn when the environment supports it.
 - Do not keep slow CPU compatibility paths unless they are the only practical path for a required dependency.
+
+## Documentation Policy
+
+- Keep `README.md`, `notebooks/README.md`, and `docs/orchestrator-vision.md` aligned with current code.
+- Code and executed notebooks are the source of truth. Remove stale claims instead of documenting intended future behavior as if it exists.
+- When adding a new repeated platform helper, document where it lives and which notebook or workflow uses it.
 
 ## Resume Point
 

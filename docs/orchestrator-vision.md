@@ -16,6 +16,7 @@ It should coordinate:
 - portfolio construction
 - Monte Carlo and equity-curve simulations
 - artifact storage and retrieval
+- normalized comparison views over native reports
 
 ## What The Platform Should Not Assume
 
@@ -69,6 +70,8 @@ It should store native outputs from:
 
 Different frameworks should be allowed to produce different native reports or file layouts.
 
+Common reporting should be additive, not destructive. Backtesting reporting adapters should expose comparable summaries, equity curves, returns, and trade logs where possible, while preserving each framework's unique native metrics and artifacts.
+
 ## Backtesting Model
 
 Backtesting adapters should stay thin.
@@ -80,6 +83,22 @@ They should accept:
 - optional runner-specific parameters
 
 This allows external strategies to be replayed without rewriting the strategy itself for every engine.
+
+Data adapters should bridge Quant Warehouse frames into each native engine without duplicating datasets. Prefer in-memory adapters when the framework supports them, as the current Zipline Reloaded, NautilusTrader, and `backtesting.py` examples do.
+
+Example strategies can live in package code when they are reused across notebooks for framework comparison. Notebook-specific experiment orchestration should stay in notebooks until it becomes a repeated platform capability.
+
+## ML Framework Model
+
+ML framework helpers should stay close to the native framework while removing repeated integration friction.
+
+Current examples:
+
+- RAPIDS cuML provides a CUDA-backed sklearn-style RandomForest path.
+- PyTorch uses CUDA auto-detection for tensor models.
+- FlairNLP has a shared helper for mixed classification/regression multitask training because Flair 0.15.x needs a small evaluation patch for `TextClassifier` plus `TextRegressor` jobs.
+
+ML outputs should remain native unless there is a clear reason to normalize them. A common metrics table is useful for comparison, but the platform should still store framework-specific reports and artifacts.
 
 ## Intended Workflow Examples
 
@@ -99,6 +118,11 @@ Already present:
 - Dagster entry points
 - walk-forward window utilities
 - Monte Carlo utilities
+- in-memory data adapters for the current backtesting examples
+- normalized backtesting reports for common summaries, equity curves, returns, and trade logs
+- sample framework-specific SMA crossover strategies for `backtesting.py`, Zipline Reloaded, and NautilusTrader
+- FlairNLP shared helper for mixed classification/regression MTL
+- executed notebooks covering multi-provider, multi-backtesting-framework, WFO, Monte Carlo, cross-framework validation, and multi-ML-framework MAG7 workflows
 
 Still missing:
 
