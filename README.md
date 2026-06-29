@@ -10,6 +10,8 @@ Quant strategies can behave differently depending on the market data vendor, fea
 
 The goal of this framework is to make multi-data-vendor and multi-backtesting-framework research practical. The goal is not to crown one universal best data vendor or one universal best backtesting engine. Different strategies may work better with different combinations, and those combinations should be tested explicitly.
 
+Another motivation is to leverage existing work from widely used backtesting frameworks. Popular frameworks already have documented examples, community strategies, and battle-tested implementation patterns. Starting from those native strategies is faster and less error-prone than rewriting every idea from scratch. Those existing implementations also serve as grounding references when the same strategy is later ported to another framework for comparison or additional validation.
+
 The goal is also not to backtest every possible combination just because the platform can. Every additional vendor and framework adds data cost, compute cost, operational complexity, and live-trading migration risk. The useful workflow is to test enough combinations to understand sensitivity, choose a small number of promising stacks, then validate those stacks against real PnL. For example, you might run the same strategy in two live accounts using two different data vendors, track the realized performance over time, and decide whether the added complexity of keeping both stacks is justified.
 
 ## Environment

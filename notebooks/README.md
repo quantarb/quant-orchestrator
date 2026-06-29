@@ -4,6 +4,8 @@ These examples show the intended platform shape as small, composable workflows. 
 
 The comparison notebooks are meant to show how sensitive a strategy can be to data vendor and backtesting framework choices. They are not a recommendation to test every vendor/framework combination by default. Use them to understand sensitivity, narrow the candidate stack, and decide what is worth validating with real or paper PnL.
 
+The framework-specific notebooks should also make it easy to start from existing native examples in popular backtesting frameworks. Those examples are useful starting points and references when the same strategy is later ported to another engine.
+
 They are examples, not required paths:
 
 - `workflow_train_only.ipynb` demonstrates an ML-only job that trains and registers artifacts.
