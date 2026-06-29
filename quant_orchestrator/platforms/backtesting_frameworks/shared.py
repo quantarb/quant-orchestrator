@@ -18,6 +18,34 @@ def normalize_session_label(value: Any) -> pd.Timestamp:
     return ts.normalize()
 
 
+def build_signal_map(frame: pd.DataFrame, *, signal_column: str = "signal") -> dict[pd.Timestamp, bool]:
+    return {
+        normalize_session_label(date): bool(signal)
+        for date, signal in frame[signal_column].items()
+    }
+
+
+def equal_notional_capital(capital_base: float, item_count: int) -> float:
+    if item_count <= 0:
+        raise ValueError("item_count must be positive")
+    return float(capital_base) / item_count
+
+
+def combine_equity_curves(curves: list[pd.Series]) -> pd.Series:
+    if not curves:
+        raise ValueError("At least one equity curve is required")
+
+    combined_index = pd.Index([])
+    for curve in curves:
+        combined_index = combined_index.union(curve.index)
+
+    combined = pd.Series(0.0, index=combined_index, name="portfolio_value")
+    for curve in curves:
+        aligned = curve.reindex(combined_index).ffill().fillna(curve.iloc[0])
+        combined = combined.add(aligned, fill_value=0.0)
+    return combined.sort_index().rename("portfolio_value")
+
+
 def load_signal_frame(
     symbol: str,
     *,

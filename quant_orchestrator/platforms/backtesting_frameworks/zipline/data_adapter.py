@@ -90,6 +90,7 @@ def build_zipline_in_memory_data(
         for column in OHLCV_COLUMNS
     }
     reader = InMemoryDailyBarReader.from_dfs(bar_frames, calendar, currency_codes)
+    reader.frames = bar_frames
 
     benchmark_returns = pd.Series(0.0, index=sessions_naive)
     sim_params = SimulationParameters(

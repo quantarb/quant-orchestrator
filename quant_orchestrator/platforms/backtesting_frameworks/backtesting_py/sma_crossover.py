@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from time import perf_counter
 
+import pandas as pd
+
 from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.data_adapter import build_backtesting_frame
 from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.reporting_adapter import (
     build_backtesting_py_report,

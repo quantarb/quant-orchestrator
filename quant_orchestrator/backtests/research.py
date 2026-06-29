@@ -24,6 +24,8 @@ from quant_orchestrator.platforms.backtesting_frameworks.nautilus.data_adapter i
 )
 from quant_orchestrator.platforms.backtesting_frameworks.shared import (
     build_sma_crossover_frame as build_shared_sma_crossover_frame,
+    combine_equity_curves,
+    equal_notional_capital,
     MAG7_SYMBOLS,
     load_price_frame,
     normalize_session_label,
@@ -62,15 +64,7 @@ def build_sma_frame(prices: pd.DataFrame, *, fast_window: int, slow_window: int)
 
 
 def _combine_equity_sleeves(sleeves: list[pd.Series]) -> pd.Series:
-    combined_index = pd.Index([])
-    for sleeve in sleeves:
-        combined_index = combined_index.union(sleeve.index)
-    combined = pd.Series(0.0, index=combined_index)
-    for sleeve in sleeves:
-        reindexed = sleeve.reindex(combined_index)
-        reindexed = reindexed.ffill().fillna(sleeve.iloc[0])
-        combined = combined.add(reindexed, fill_value=0.0)
-    return combined.sort_index()
+    return combine_equity_curves(sleeves)
 
 
 def _load_symbol_price_frames(
@@ -170,18 +164,23 @@ if not (repo_root / "quant_orchestrator").exists():
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-from quant_orchestrator.platforms.backtesting_frameworks.nautilus.sma_crossover import run_sma_crossover_backtest
+from quant_orchestrator.backtests.research import build_sma_frame, run_nautilus
 
 payload = json.loads(sys.stdin.read())
 frame = pd.read_json(StringIO(payload["frame_json"]), orient="split")
 frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index))
-_, summary, equity = run_sma_crossover_backtest(
+signal_frame = build_sma_frame(
     frame,
-    symbol=payload["symbol"],
     fast_window=int(payload["fast_window"]),
     slow_window=int(payload["slow_window"]),
+)
+result = run_nautilus(
+    signal_frame,
+    symbol=payload["symbol"],
     capital_base=float(payload["capital_base"]),
 )
+summary = result.summary
+equity = result.equity
 row = summary.iloc[0].to_dict()
 row["framework"] = "nautilus"
 row["provider"] = payload.get("provider", "")
