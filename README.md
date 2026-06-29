@@ -72,7 +72,6 @@ Current built-in ML framework modules are:
 - `sklearn`
 - `torch`
 - `transformers`
-- `flair` shared helpers for FlairNLP mixed classification/regression multitask training
 
 Current built-in backtesting framework modules are:
 
@@ -162,7 +161,6 @@ Recent notebooks follow this pattern:
 - strategy examples may live in package code when reused across frameworks, but notebook-only experiment glue stays in notebooks
 - framework-specific data adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/data_adapter.py`
 - framework-specific reporting adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/reporting_adapter.py`
-- shared FlairNLP MTL patch/helper code lives under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`
 
 ## Load Data
 

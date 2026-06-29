@@ -102,7 +102,7 @@ Current examples:
 
 - RAPIDS cuML provides a CUDA-backed sklearn-style RandomForest path.
 - PyTorch uses CUDA auto-detection for tensor models.
-- FlairNLP has a shared helper for mixed classification/regression multitask training because Flair 0.15.x needs a small evaluation patch for `TextClassifier` plus `TextRegressor` jobs.
+- FlairNLP can be used for native multitask learning. Any local Flair compatibility patch should be treated as temporary integration code, not a long-term platform abstraction.
 
 ML outputs should remain native unless there is a clear reason to normalize them. A common metrics table is useful for comparison, but the platform should still store framework-specific reports and artifacts.
 
@@ -127,7 +127,7 @@ Already present:
 - in-memory data adapters for the current backtesting examples
 - normalized backtesting reports for common summaries, equity curves, returns, and trade logs
 - sample framework-specific SMA crossover strategies for `backtesting.py`, Zipline Reloaded, and NautilusTrader
-- FlairNLP shared helper for mixed classification/regression MTL
+- a temporary local FlairNLP evaluation compatibility patch used by the current multi-ML notebook
 - executed notebooks covering multi-provider, multi-backtesting-framework, WFO, Monte Carlo, cross-framework validation, and multi-ML-framework MAG7 workflows
 
 Still missing:

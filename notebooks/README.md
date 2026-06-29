@@ -15,7 +15,7 @@ They are examples, not required paths:
 - `multi_vendor_backtesting_py_sma_crossover.ipynb` calls the `quant-orchestrator` backtest job that compares `fmp` and `yfinance` with a fixed `backtesting.py` SMA crossover.
 - `cross_framework_sma_search_monte_carlo.ipynb` calls the `quant-orchestrator` search job that runs vectorbt parameter search, Monte Carlo, and forward testing across `fmp` and `yfinance`.
 - `wfo_mag7_sma_optimization.ipynb` demonstrates a fixed-window walk-forward optimization over SMA parameters with a 2020-2025 train window and 2026 test window.
-- `mult-ml-frameworks/sample_model_training.ipynb` demonstrates CUDA-first toy model training across MAG7, `yfinance`, and `fmp` using Quant Warehouse adjusted OHLCV features and optimal-trading labels: RAPIDS cuML RandomForest, PyTorch autoencoder, and FlairNLP multitask text classification/regression with a tiny pretrained transformer.
+- `mult-ml-frameworks/sample_model_training.ipynb` demonstrates CUDA-first toy model training across MAG7, `yfinance`, and `fmp` using Quant Warehouse adjusted OHLCV features and optimal-trading labels: RAPIDS cuML RandomForest, PyTorch autoencoder, and FlairNLP's native multitask model with a tiny pretrained transformer.
 - `multi_backtest_frameworks/sample_strategy_validation.ipynb` demonstrates provider-specific SMA parameter optimization with `backtesting.py`, then independently forward-tests the selected parameters on Zipline Reloaded and NautilusTrader.
 - `tutorial_backtesting_py.ipynb` is a framework-specific tutorial for `backtesting.py` covering multi-vendor single-symbol backtests, multi-symbol backtests, Monte Carlo, walk-forward optimization, equity-curve analysis, and portfolio optimization.
 - `tutorial_zipline.ipynb` is the same tutorial shape for Zipline Reloaded.
@@ -28,6 +28,6 @@ Current reusable code placement:
 - Framework-specific data adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/data_adapter.py`.
 - Framework-specific reporting adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/reporting_adapter.py`.
 - Framework-specific SMA crossover examples now live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/sma_crossover.py`.
-- Shared FlairNLP classification/regression multitask helpers live under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`.
+- Temporary FlairNLP evaluation compatibility code used by the current multi-ML notebook lives under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`; it should move upstream or into a fork if it remains necessary.
 
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.
