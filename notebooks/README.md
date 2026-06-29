@@ -13,6 +13,7 @@ They are examples, not required paths:
 - `multi_vendor_backtesting_py_sma_crossover.ipynb` calls the `quant-orchestrator` backtest job that compares `fmp` and `yfinance` with a fixed `backtesting.py` SMA crossover.
 - `cross_framework_sma_search_monte_carlo.ipynb` calls the `quant-orchestrator` search job that runs vectorbt parameter search, Monte Carlo, and forward testing across `fmp` and `yfinance`.
 - `wfo_mag7_sma_optimization.ipynb` demonstrates a fixed-window walk-forward optimization over SMA parameters with a 2020-2025 train window and 2026 test window.
+- `wfo_multi_vendor_framework_forward_test.ipynb` demonstrates provider-specific SMA parameter optimization with `backtesting.py`, then independently forward-tests the selected parameters on Zipline Reloaded and NautilusTrader.
 - `tutorial_backtesting_py.ipynb` is a framework-specific tutorial for `backtesting.py` covering multi-vendor single-symbol backtests, multi-symbol backtests, Monte Carlo, walk-forward optimization, equity-curve analysis, and portfolio optimization.
 - `tutorial_zipline.ipynb` is the same tutorial shape for Zipline Reloaded.
 - `tutorial_nautilus.ipynb` is the same tutorial shape for NautilusTrader.
