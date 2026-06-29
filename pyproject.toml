@@ -25,7 +25,8 @@ ml = [
 ]
 cuda = [
     "torch>=2.5",
-    "cupy-cuda12x>=13",
+    "cupy-cuda13x>=14",
+    "cuml-cu13>=26.6,<27",
 ]
 backtesting = [
     "backtesting>=0.3.3",
@@ -45,7 +46,8 @@ all = [
     "vectorbt>=1.0.0",
     "scikit-learn>=1.4",
     "torch>=2.5",
-    "cupy-cuda12x>=13",
+    "cupy-cuda13x>=14",
+    "cuml-cu13>=26.6,<27",
     "zipline-reloaded==3.1.1",
     "nautilus-trader==1.228.0",
     "optopsy>=2.3,<3",
