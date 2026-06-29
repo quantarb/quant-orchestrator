@@ -12,8 +12,8 @@ from typing import Any
 import pandas as pd
 
 from quant_orchestrator.pipeline import FunctionStage, Pipeline, PipelineContext
-from quant_orchestrator.platforms.backtesting_frameworks.nautilus.data_adapter import (
-    build_nautilus_in_memory_data,
+from quant_orchestrator.platforms.backtesting_frameworks.nautilus.runner import (
+    run_nautilus_signal_strategy,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
     build_common_summary,
@@ -26,8 +26,8 @@ from quant_orchestrator.platforms.backtesting_frameworks.shared import (
     load_price_frame,
     normalize_session_label,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.zipline.data_adapter import (
-    build_zipline_in_memory_data,
+from quant_orchestrator.platforms.backtesting_frameworks.zipline.runner import (
+    run_zipline_signal_strategy,
 )
 
 
@@ -368,162 +368,24 @@ def run_backtesting_py(frame: pd.DataFrame, *, symbol: str, capital_base: float)
 
 
 def run_zipline(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> FrameworkRun:
-    from zipline.algorithm import TradingAlgorithm
-    from zipline.api import order_target, record, symbol as zipline_symbol
-
-    adapter = build_zipline_in_memory_data(frame, symbol=symbol, capital_base=capital_base)
-    trade_size = adapter.trade_size
-
-    def initialize(context, **kwargs):
-        context.asset = zipline_symbol(symbol.upper())
-        context.is_long = False
-
-    def handle_data(context, data):
-        dt = normalize_session_label(context.get_datetime())
-        bullish = adapter.signal_map.get(dt, False)
-        if bullish and not context.is_long:
-            order_target(context.asset, trade_size)
-            context.is_long = True
-        elif not bullish and context.is_long:
-            order_target(context.asset, 0)
-            context.is_long = False
-        record(signal=float(bullish))
-
-    started = perf_counter()
-    algo = TradingAlgorithm(
-        sim_params=adapter.sim_params,
-        data_portal=adapter.data_portal,
-        asset_finder=adapter.asset_finder,
-        initialize=initialize,
-        handle_data=handle_data,
-        capital_base=capital_base,
-        benchmark_returns=adapter.benchmark_returns,
-    )
-    perf = algo.run()
-    elapsed = perf_counter() - started
-    equity = perf["portfolio_value"].rename("portfolio_value")
-    transactions = perf.get("transactions", pd.Series(index=perf.index, data=[[]] * len(perf)))
-    summary = build_common_summary(
-        framework="zipline",
+    perf, summary, equity = run_zipline_signal_strategy(
+        frame,
         symbol=symbol,
-        equity=equity,
-        elapsed_seconds=elapsed,
-        bars=len(perf),
-        trades=int(transactions.map(len).sum()),
+        capital_base=capital_base,
     )
     summary["native_last_value"] = float(perf["portfolio_value"].iloc[-1])
     return FrameworkRun(perf, summary, normalize_equity_curve(equity))
 
 
 def run_nautilus(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> FrameworkRun:
-    from decimal import Decimal
-
-    from nautilus_trader.backtest.engine import BacktestEngine
-    from nautilus_trader.config import BacktestEngineConfig, LoggingConfig, StrategyConfig
-    from nautilus_trader.model.currencies import USD
-    from nautilus_trader.model.enums import AccountType, OmsType, OrderSide, TimeInForce
-    from nautilus_trader.model.objects import Money, Quantity
-    from nautilus_trader.trading.strategy import Strategy
-
-    adapter = build_nautilus_in_memory_data(frame, symbol=symbol, capital_base=capital_base)
-
-    class SignalStrategyConfig(StrategyConfig, frozen=True):
-        instrument_id: object
-        bar_type: object
-        trade_size: Decimal
-        signal_map: dict
-
-    class SignalStrategy(Strategy):
-        def __init__(self, config: SignalStrategyConfig):
-            super().__init__(config)
-            self.is_long = False
-
-        def on_start(self) -> None:
-            self.subscribe_bars(self.config.bar_type)
-
-        def on_bar(self, bar) -> None:
-            bullish = self.config.signal_map.get(normalize_session_label(bar.ts_event), False)
-            if bullish == self.is_long:
-                return
-            side = OrderSide.BUY if bullish else OrderSide.SELL
-            order = self.order_factory.market(
-                instrument_id=self.config.instrument_id,
-                order_side=side,
-                quantity=Quantity.from_int(int(self.config.trade_size)),
-                time_in_force=TimeInForce.IOC,
-            )
-            self.submit_order(order)
-            self.is_long = bullish
-
-    engine = BacktestEngine(
-        config=BacktestEngineConfig(
-            logging=LoggingConfig(log_level="OFF", bypass_logging=True),
-        ),
-    )
-    engine.add_venue(
-        venue=adapter.venue,
-        oms_type=OmsType.NETTING,
-        account_type=AccountType.CASH,
-        starting_balances=[Money(capital_base, USD)],
-        base_currency=USD,
-    )
-    engine.add_instrument(adapter.instrument)
-    engine.add_data(adapter.bars)
-    engine.add_strategy(
-        SignalStrategy(
-            SignalStrategyConfig(
-                instrument_id=adapter.instrument.id,
-                bar_type=adapter.bar_type,
-                trade_size=Decimal(adapter.trade_size),
-                signal_map=adapter.signal_map,
-            ),
-        ),
-    )
-
-    started = perf_counter()
-    engine.run()
-    fills_report = engine.trader.generate_order_fills_report()
-    elapsed = perf_counter() - started
-    engine.dispose()
-
-    equity = _equity_from_fills(prices=frame, fills=fills_report, capital_base=capital_base)
-    summary = build_common_summary(
-        framework="nautilus",
+    fills_report, summary, equity = run_nautilus_signal_strategy(
+        frame,
         symbol=symbol,
-        equity=equity,
-        elapsed_seconds=elapsed,
-        bars=len(frame),
-        trades=len(fills_report),
+        capital_base=capital_base,
     )
     summary["native_fills"] = int(len(fills_report))
     summary["native_last_value"] = float(equity.iloc[-1])
     return FrameworkRun(fills_report, summary, normalize_equity_curve(equity))
-
-
-def _equity_from_fills(*, prices: pd.DataFrame, fills: pd.DataFrame, capital_base: float) -> pd.Series:
-    cash = float(capital_base)
-    position = 0.0
-    values = []
-    fills_by_date: dict[pd.Timestamp, list[pd.Series]] = {}
-
-    for _, fill in fills.iterrows():
-        fill_date = normalize_session_label(fill["ts_last"])
-        fills_by_date.setdefault(fill_date, []).append(fill)
-
-    for date, row in prices.iterrows():
-        normalized = normalize_session_label(date)
-        for fill in fills_by_date.get(normalized, []):
-            quantity = float(fill["filled_qty"])
-            price = float(fill["avg_px"])
-            if str(fill["side"]) == "BUY":
-                cash -= quantity * price
-                position += quantity
-            else:
-                cash += quantity * price
-                position -= quantity
-        values.append(cash + position * float(row["close"]))
-
-    return normalize_equity_curve(pd.Series(values, index=prices.index, name="portfolio_value"))
 
 
 def run_framework_portfolio(

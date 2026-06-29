@@ -8,6 +8,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.nautilus.reporting_adap
     NautilusReport,
     build_nautilus_report,
 )
+from quant_orchestrator.platforms.backtesting_frameworks.nautilus.runner import run_nautilus_signal_strategy
 from quant_orchestrator.platforms.backtesting_frameworks.nautilus.sma_crossover import run_sma_crossover_backtest
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "nautilus_provider",
     "NautilusReport",
     "build_nautilus_report",
+    "run_nautilus_signal_strategy",
     "run_sma_crossover_backtest",
 ]
