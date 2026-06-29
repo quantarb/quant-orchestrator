@@ -60,12 +60,16 @@ The intended platform primitives are:
 - train a model
 - generate predictions
 - run a strategy
-- optimize parameters
-- construct a portfolio from strategy outputs
+- build parameter grids
+- filter and rank result tables
+- optimize parameters through a supplied runner
+- construct portfolio weights from strategy return streams
 - simulate returns or trade sequences
 - compare runs
 
 Monte Carlo and walk-forward optimization are primitives or workflow patterns, not hardcoded assumptions about every run.
+
+The package should own reusable mechanics such as grid construction, metric filtering, ranking, returns-matrix construction, and generic portfolio weighting. Notebooks should continue to own research choices such as the exact strategy, thresholds, universe, train/test dates, framework handoff, and analysis text until those choices repeat enough to become stable platform stages.
 
 ## Artifact Model
 
@@ -130,6 +134,7 @@ Already present:
 - `quant_orchestrator.pipeline.PipelineContext`
 - `quant_orchestrator.pipeline.FunctionStage`
 - `quant_orchestrator.pipeline.Pipeline`
+- `quant_orchestrator.optimization` primitives for grids, filters, ranking, returns matrices, and portfolio weights
 - ML and backtesting provider contracts
 - MLflow tracking helpers
 - Dagster entry points
@@ -153,7 +158,7 @@ Still missing:
 
 ## Next Implementation Steps
 
-1. Split repeated concrete helpers into atomic train, predict, run, optimize, combine, and simulate stages.
+1. Split repeated concrete helpers into atomic train, predict, run, optimize, combine, and simulate stages when multiple notebooks share the same artifact handoff.
 2. Add leakage-aware dataset visibility controls around context artifacts.
 3. Make Dagster jobs call these primitives where scheduled execution is needed, without moving research scheduling into Quant Orchestrator.
 4. Add one external-engine proof path, such as a QuantConnect-style adapter.

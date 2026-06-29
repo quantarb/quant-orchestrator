@@ -57,6 +57,7 @@ The platform contract is intentionally small:
 - resolve prepared datasets from `quant-warehouse`
 - run ML framework adapters when a workflow needs model training or inference
 - run backtesting framework adapters when a workflow needs strategy evaluation
+- run reusable optimization primitives such as parameter grids, metric filters, result ranking, and portfolio weighting
 - normalize common backtest summaries, equity curves, returns, and trade logs while keeping each framework's native report
 - track runs in MLflow
 - store native model, report, prediction, backtest, and strategy artifacts in the artifact registry
@@ -64,6 +65,8 @@ The platform contract is intentionally small:
 These capabilities are independent. A workflow does not need an ML model to run a backtest, and it does not need a backtest to train a model.
 
 The pipeline core is deliberately lightweight. `PipelineContext` is an in-memory artifact store; each `FunctionStage` declares required inputs and produced outputs; `Pipeline` validates those contracts and runs stages sequentially. This is not a replacement for Dagster. Use Dagster for scheduled asset orchestration, dependency management, and production job scheduling. Use the pipeline layer inside research workflows when you need explicit artifact handoffs between data loading, model training, inference, backtesting, filtering, ranking, portfolio construction, Monte Carlo, and reporting.
+
+Optimization helpers are reusable mechanics, not fixed workflows. `quant_orchestrator.optimization` includes parameter-grid construction, metric filtering, result ranking, returns-matrix construction, long-only Sharpe weighting, and random-search mean-variance weighting. Notebooks still choose the strategy, thresholds, train/test windows, framework handoff, and portfolio constraints.
 
 ```python
 from quant_orchestrator.pipeline import FunctionStage, Pipeline, PipelineContext
