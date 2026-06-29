@@ -57,3 +57,8 @@
 ## Resume Point
 
 - Before extending the platform shape, read `docs/orchestrator-vision.md` and keep the current repository code as the source of truth for any claims.
+
+## Git Hygiene
+
+- This workspace is maintained by a single author. Push completed changes directly to the remote branch; do not create or wait on pull requests unless the user explicitly asks for one.
+- Use normal branch pushes for published work. Use `--force-with-lease` only when intentionally rewriting the current branch history.
