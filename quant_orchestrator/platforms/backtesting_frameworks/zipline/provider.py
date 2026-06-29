@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from quant_orchestrator.platform.contracts import ProviderManifest
+from quant_orchestrator.platforms.contracts import ProviderManifest
 
 
 class ZiplineBacktestEngine:

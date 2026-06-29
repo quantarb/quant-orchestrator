@@ -61,7 +61,6 @@ transformers = "quant_orchestrator.platforms.ml_frameworks.transformers:transfor
 
 [project.entry-points."quant_orchestrator.backtesting_framework"]
 backtesting_py = "quant_orchestrator.platforms.backtesting_frameworks.backtesting_py:backtesting_py_provider"
-pandas = "quant_orchestrator.platforms.backtesting_frameworks.pandas:pandas_provider"
 zipline = "quant_orchestrator.platforms.backtesting_frameworks.zipline:zipline_provider"
 nautilus = "quant_orchestrator.platforms.backtesting_frameworks.nautilus:nautilus_provider"
 optopsy = "quant_orchestrator.platforms.backtesting_frameworks.optopsy:optopsy_provider"

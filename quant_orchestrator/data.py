@@ -48,6 +48,10 @@ def write_zipline_csv(symbol: str, prices: pd.DataFrame, root: Path, *, calendar
     daily_dir = root / "daily"
     daily_dir.mkdir(parents=True, exist_ok=True)
     out = prices.copy()
+    if out.index.tz is None:
+        out.index = out.index.tz_localize("UTC")
+    else:
+        out.index = out.index.tz_convert("UTC")
     out.index = out.index.tz_convert(None).normalize()
     calendar = get_calendar(calendar_name)
     sessions = calendar.sessions_in_range(out.index.min(), out.index.max()).tz_localize(None)

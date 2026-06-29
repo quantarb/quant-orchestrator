@@ -18,6 +18,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.nautilus.data_adapter i
     build_nautilus_in_memory_data,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.shared import (
+    build_sma_crossover_frame as build_shared_sma_crossover_frame,
     MAG7_SYMBOLS,
     load_price_frame,
     normalize_session_label,
@@ -26,7 +27,6 @@ from quant_orchestrator.platforms.backtesting_frameworks.zipline.data_adapter im
     build_zipline_in_memory_data,
 )
 from quant_orchestrator.strategy import summarize_backtest, summarize_equity
-from quant_warehouse.feature_engineering import compute_features_worldclass
 
 
 FAST_WINDOWS = (5, 10, 15, 20, 25, 30, 35, 40, 45, 50)
@@ -43,38 +43,8 @@ class FrameworkRun:
     equity: pd.Series
 
 
-def _patch_zipline_compatibility() -> None:
-    if getattr(_patch_zipline_compatibility, "_patched", False):
-        return
-
-    import zipline.finance.ledger as ledger_mod
-    from zipline.data.in_memory_daily_bars import InMemoryDailyBarReader
-
-    InMemoryDailyBarReader.frames = property(lambda self: self._frames)
-    ledger_mod.PositionTracker.stats = property(lambda self: self._stats)
-    _patch_zipline_compatibility._patched = True  # type: ignore[attr-defined]
-
-
 def build_sma_frame(prices: pd.DataFrame, *, fast_window: int, slow_window: int) -> pd.DataFrame:
-    if fast_window >= slow_window:
-        raise ValueError("fast_window must be less than slow_window")
-
-    frame = compute_features_worldclass(prices.copy())
-    fast_col = f"SMA{fast_window}"
-    slow_col = f"SMA{slow_window}"
-    missing = [column for column in (fast_col, slow_col) if column not in frame.columns]
-    if missing:
-        raise ValueError(
-            "Quant Warehouse feature output is missing required SMA columns: "
-            f"{missing}. Update quant-warehouse feature engineering first."
-        )
-    fast = frame[fast_col]
-    slow = frame[slow_col]
-    frame["fast_sma"] = fast
-    frame["slow_sma"] = slow
-    frame["signal"] = (fast > slow).astype(int).fillna(0)
-    frame = frame.dropna(subset=["open", "high", "low", "close", "volume"]).copy()
-    return frame
+    return build_shared_sma_crossover_frame(prices, fast_window=fast_window, slow_window=slow_window)
 
 
 def _combine_equity_sleeves(sleeves: list[pd.Series]) -> pd.Series:
@@ -106,7 +76,9 @@ def run_backtesting_py(frame: pd.DataFrame, *, symbol: str, capital_base: float)
     from backtesting import Backtest, Strategy
 
     trade_size = max(1, int((capital_base * 0.25) / float(frame["close"].iloc[0])))
-    bt_frame = build_backtesting_frame(frame).drop(columns=["Signal"])
+    bt_frame = frame.rename(
+        columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume", "signal": "Signal"}
+    ).copy()
     signal_map = {
         normalize_session_label(date): bool(signal)
         for date, signal in frame["signal"].items()
@@ -204,7 +176,10 @@ def run_nautilus(frame: pd.DataFrame, *, symbol: str, capital_base: float) -> Fr
     from nautilus_trader.config import BacktestEngineConfig, LoggingConfig, StrategyConfig
     from nautilus_trader.model.currencies import USD
     from nautilus_trader.model.enums import AccountType, OmsType, OrderSide, TimeInForce
+    from nautilus_trader.model.identifiers import Venue
     from nautilus_trader.model.objects import Money, Quantity
+    from nautilus_trader.persistence.wranglers import BarDataWrangler
+    from nautilus_trader.test_kit.providers import TestInstrumentProvider
     from nautilus_trader.trading.strategy import Strategy
 
     adapter = build_nautilus_in_memory_data(frame, symbol=symbol, capital_base=capital_base)

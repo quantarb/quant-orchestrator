@@ -4,7 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-from quant_orchestrator.platform.contracts import ProviderManifest
+from quant_orchestrator.platforms.contracts import ProviderManifest
 
 
 class BacktestingPyBacktestEngine:

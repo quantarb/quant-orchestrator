@@ -58,6 +58,31 @@ def load_signal_frame(
     return frame
 
 
+def build_sma_crossover_frame(
+    prices: pd.DataFrame,
+    *,
+    fast_window: int,
+    slow_window: int,
+) -> pd.DataFrame:
+    if fast_window >= slow_window:
+        raise ValueError("fast_window must be less than slow_window")
+
+    frame = compute_features_worldclass(prices.copy())
+    fast_col = f"SMA{fast_window}"
+    slow_col = f"SMA{slow_window}"
+    missing = [column for column in (fast_col, slow_col) if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            "Quant Warehouse feature output is missing required SMA columns: "
+            f"{missing}. Update quant-warehouse feature engineering first.",
+        )
+
+    frame["fast_sma"] = frame[fast_col]
+    frame["slow_sma"] = frame[slow_col]
+    frame["signal"] = (frame["fast_sma"] > frame["slow_sma"]).astype(int).fillna(0)
+    return frame.dropna(subset=list(OHLCV_COLUMNS)).copy()
+
+
 def load_price_frame(
     symbol: str,
     *,

@@ -71,7 +71,7 @@ my_engine = "my_package.backtesting_framework:provider"
 At runtime, providers are resolved from the registry:
 
 ```python
-from quant_orchestrator.platform import registry
+from quant_orchestrator.platforms.registry import registry
 
 registry.list("backtesting_framework")
 engine_cls = registry.adapter("backtesting_framework", "optopsy")
@@ -152,7 +152,6 @@ quant-warehouse refresh AAPL --sections prices --providers yfinance
 
 ```bash
 quant-orchestrator --framework all --symbols AAPL --start 2023-01-01 --fast-window 5 --slow-window 10
-quant-orchestrator --framework pandas --symbols AAPL MSFT --start 2020-01-01
 quant-orchestrator --framework zipline --symbols AAPL --start 2020-01-01
 quant-orchestrator --framework nautilus --symbols AAPL --start 2020-01-01
 ```

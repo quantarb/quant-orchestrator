@@ -4,5 +4,16 @@ from quant_orchestrator.platforms.backtesting_frameworks.nautilus.provider impor
     NautilusBacktestEngine,
     nautilus_provider,
 )
+from quant_orchestrator.platforms.backtesting_frameworks.nautilus.reporting_adapter import (
+    NautilusReport,
+    build_nautilus_report,
+)
+from quant_orchestrator.platforms.backtesting_frameworks.nautilus.sma_crossover import run_sma_crossover_backtest
 
-__all__ = ["NautilusBacktestEngine", "nautilus_provider"]
+__all__ = [
+    "NautilusBacktestEngine",
+    "nautilus_provider",
+    "NautilusReport",
+    "build_nautilus_report",
+    "run_sma_crossover_backtest",
+]

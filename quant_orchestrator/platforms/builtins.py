@@ -4,7 +4,6 @@ from quant_orchestrator.platforms.backtesting_frameworks import (
     backtesting_py_provider,
     nautilus_provider,
     optopsy_provider,
-    pandas_provider,
     zipline_provider,
 )
 from quant_orchestrator.platforms.ml_frameworks import (
@@ -12,7 +11,7 @@ from quant_orchestrator.platforms.ml_frameworks import (
     torch_provider,
     transformers_provider,
 )
-from quant_orchestrator.platform.registry import registry
+from quant_orchestrator.platforms.registry import registry
 
 
 def register_builtin_providers() -> None:
@@ -20,7 +19,6 @@ def register_builtin_providers() -> None:
         sklearn_provider,
         torch_provider,
         transformers_provider,
-        pandas_provider,
         backtesting_py_provider,
         zipline_provider,
         nautilus_provider,

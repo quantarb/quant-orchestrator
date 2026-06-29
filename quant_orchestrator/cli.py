@@ -5,7 +5,6 @@ import argparse
 import pandas as pd
 
 from quant_orchestrator.backtests.nautilus_sma import run_nautilus_backtest
-from quant_orchestrator.backtests.pandas_sma import run_pandas_backtest
 from quant_orchestrator.backtests.zipline_sma import run_zipline_backtest
 from quant_orchestrator.trading_app_equity import (
     run_trading_app_nautilus,
@@ -18,8 +17,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Quant Warehouse strategy examples.")
     parser.add_argument(
         "--framework",
-        choices=["all", "pandas", "zipline", "nautilus"],
-        default="pandas",
+        choices=["all", "zipline", "nautilus"],
+        default="all",
         help="Backtesting adapter to run.",
     )
     parser.add_argument(
@@ -117,18 +116,6 @@ def main() -> None:
         print(pd.concat(results, ignore_index=True))
         return
 
-    if args.framework in {"all", "pandas"}:
-        results.append(
-            run_pandas_backtest(
-                symbols=args.symbols,
-                provider=args.provider,
-                start=args.start,
-                end=args.end,
-                fast_window=args.fast_window,
-                slow_window=args.slow_window,
-                capital_base=args.capital_base,
-            ),
-        )
     if args.framework in {"all", "zipline"}:
         results.append(
             run_zipline_backtest(
