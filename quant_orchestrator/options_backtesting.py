@@ -6,7 +6,7 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-from quant_warehouse.target_engineering.thetadata_loader import (
+from quant_warehouse.platforms.data_providers.thetadata.options import (
     ThetaDataDownloadSpec,
     load_thetadata_option_snapshots,
 )
