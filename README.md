@@ -190,6 +190,8 @@ By default artifacts are written under `artifacts/orchestrator`. Override this w
 
 Use `notebooks/` for one-off research workflows and demonstrations that consume prepared datasets from `quant-warehouse`. If a workflow becomes a repeated platform capability, move only the reusable part into package code and keep the notebook as an example. Do not build feature families, labels, warehouse refreshes, or vendor data pulls in this repo; implement those in `quant-warehouse` first and consume the resulting dataset here.
 
+FMP event-pair labels consumed from `quant-warehouse` are exact event-date labels only. Notebooks must not create future-window event-pair tasks for congress, insider, analyst, guidance, or earnings labels. Future return horizons and oracle-trade labels are separate target families.
+
 During refactors, the notebooks are the integration tests. Internal APIs can change aggressively when the architecture improves, but the notebook research intent should keep working after the notebooks are updated and re-executed.
 
 Recent notebooks follow this pattern:
