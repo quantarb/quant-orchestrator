@@ -6,7 +6,7 @@ import pandas as pd
 
 from quant_orchestrator.platforms.backtesting_frameworks.reporting import normalize_equity_curve
 from quant_warehouse import Warehouse
-from quant_warehouse.feature_engineering import compute_features_worldclass
+from quant_warehouse.platforms.data_providers.fmp.feature_engineering import compute_features_worldclass
 
 MAG7_SYMBOLS: tuple[str, ...] = ("AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA")
 OHLCV_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
