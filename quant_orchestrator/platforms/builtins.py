@@ -7,6 +7,7 @@ from quant_orchestrator.platforms.backtesting_frameworks import (
     zipline_provider,
 )
 from quant_orchestrator.platforms.ml_frameworks import (
+    sentence_transformers_provider,
     sklearn_provider,
     torch_provider,
     transformers_provider,
@@ -17,6 +18,7 @@ from quant_orchestrator.platforms.registry import registry
 def register_builtin_providers() -> None:
     for provider in (
         sklearn_provider,
+        sentence_transformers_provider,
         torch_provider,
         transformers_provider,
         backtesting_py_provider,

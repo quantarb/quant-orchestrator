@@ -62,6 +62,7 @@ quant-orchestrator = "quant_orchestrator.cli:main"
 sklearn = "quant_orchestrator.platforms.ml_frameworks.sklearn:sklearn_provider"
 torch = "quant_orchestrator.platforms.ml_frameworks.torch:torch_provider"
 transformers = "quant_orchestrator.platforms.ml_frameworks.transformers:transformers_provider"
+sentence_transformers = "quant_orchestrator.platforms.ml_frameworks.sentence_transformers:sentence_transformers_provider"
 
 [project.entry-points."quant_orchestrator.backtesting_framework"]
 backtesting_py = "quant_orchestrator.platforms.backtesting_frameworks.backtesting_py:backtesting_py_provider"
