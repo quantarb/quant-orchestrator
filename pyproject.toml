@@ -23,6 +23,7 @@ dependencies = [
 ml = [
     "scikit-learn>=1.4",
     "flair>=0.15,<0.16",
+    "sentence-transformers>=3",
 ]
 cuda = [
     "torch>=2.5",
@@ -45,6 +46,7 @@ all = [
     "backtesting>=0.3.3",
     "scikit-learn>=1.4",
     "flair>=0.15,<0.16",
+    "sentence-transformers>=3",
     "torch>=2.5",
     "cupy-cuda13x>=14",
     "cuml-cu13>=26.6,<27",

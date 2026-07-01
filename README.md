@@ -190,7 +190,9 @@ By default artifacts are written under `artifacts/orchestrator`. Override this w
 
 Use `notebooks/` for one-off research workflows and demonstrations that consume prepared datasets from `quant-warehouse`. If a workflow becomes a repeated platform capability, move only the reusable part into package code and keep the notebook as an example. Do not build feature families, labels, warehouse refreshes, or vendor data pulls in this repo; implement those in `quant-warehouse` first and consume the resulting dataset here.
 
-FMP event-pair labels consumed from `quant-warehouse` are exact event-date labels only. Notebooks must not create future-window event-pair tasks for congress, insider, analyst, guidance, or earnings labels. Future return horizons and oracle-trade labels are separate target families.
+FMP event-pair labels consumed from `quant-warehouse` are exact event-date labels only. Notebooks must not create future-window event-pair tasks for congress, insider, analyst, or earnings labels. They must also not treat no-event dates as negative examples. Mirrored event-pair tasks should use only actual event dates, e.g. congress buy vs congress sell, insider buy vs insider sell, analyst upgrade vs analyst downgrade, price target raise vs price target cut, and earnings beat vs earnings miss. Future return horizons and oracle-trade labels are separate target families. Company guidance raise/cut labels are not currently supported because the warehouse does not store true company-issued guidance revision history.
+
+FMP oracle-trade side tasks follow the same event-only rule. Train one oracle buy/sell task across all configured `k` values; do not create separate oracle tasks or models per `k`. Use oracle buy entry dates versus oracle sell entry dates only. Do not use non-entry dates as negative examples, and do not train binary tasks from the oracle `any` union target.
 
 During refactors, the notebooks are the integration tests. Internal APIs can change aggressively when the architecture improves, but the notebook research intent should keep working after the notebooks are updated and re-executed.
 
