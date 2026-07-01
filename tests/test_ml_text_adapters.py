@@ -79,14 +79,32 @@ def test_build_label_maps_sorts_string_labels() -> None:
     assert id_to_label == {0: "buy", 1: "sell"}
 
 
+def test_ml_runtime_adapters_configure_cpu_device() -> None:
+    from quant_orchestrator.platforms.ml_frameworks.sentence_transformers.runtime import (
+        configure_sentence_transformers_runtime,
+    )
+    from quant_orchestrator.platforms.ml_frameworks.torch.runtime import configure_torch_runtime
+    from quant_orchestrator.platforms.ml_frameworks.transformers.runtime import (
+        configure_transformers_runtime,
+    )
+
+    assert configure_torch_runtime(device="cpu").torch_device == "cpu"
+    assert configure_transformers_runtime(device="cpu").torch_device == "cpu"
+    assert configure_sentence_transformers_runtime(device="cpu").torch_device == "cpu"
+
+
 @pytest.mark.skipif(importlib.util.find_spec("flair") is None, reason="flair is an optional ML dependency")
 def test_flair_lazy_text_classification_dataset_creates_sentence() -> None:
     from quant_orchestrator.platforms.ml_frameworks.flair.data_adapter import (
+        FlairMultitaskColumns,
         FlairTextClassificationColumns,
+        LazyMultitaskDataset,
         LazyTextClassificationDataset,
         build_label_dictionary,
+        build_multitask_corpus,
         frame_to_text_classification_sentences,
     )
+    from quant_orchestrator.platforms.ml_frameworks.flair.runtime import configure_flair_runtime
 
     frame = pd.DataFrame({"body": ["symbol=AAPL"], "side": ["buy"]})
     columns = FlairTextClassificationColumns(text="body", label="side", label_type="trade_side")
@@ -99,3 +117,23 @@ def test_flair_lazy_text_classification_dataset_creates_sentence() -> None:
     assert sentence.get_labels("trade_side")[0].value == "buy"
     assert build_label_dictionary(frame, label_column="side").get_items() == ["buy"]
     assert frame_to_text_classification_sentences(frame, columns=columns)[0].get_labels("trade_side")[0].value == "buy"
+
+    multitask_frame = pd.DataFrame(
+        {
+            "body": ["symbol=AAPL"],
+            "side": ["buy"],
+            "label_type": ["task_event"],
+            "task_id": ["task_event"],
+        }
+    )
+    multitask_columns = FlairMultitaskColumns(text="body", label="side")
+    multitask_dataset = LazyMultitaskDataset(multitask_frame, columns=multitask_columns)
+    multitask_sentence = multitask_dataset[0]
+
+    assert multitask_sentence.get_labels("task_event")[0].value == "buy"
+    assert multitask_sentence.get_labels("multitask_id")[0].value == "task_event"
+    assert build_multitask_corpus(
+        {"train": multitask_frame, "dev": multitask_frame, "test": multitask_frame},
+        columns=multitask_columns,
+    ).train[0].get_labels("task_event")[0].value == "buy"
+    assert configure_flair_runtime(device="cpu").torch_device == "cpu"

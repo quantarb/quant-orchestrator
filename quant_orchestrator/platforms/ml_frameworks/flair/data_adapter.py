@@ -18,6 +18,15 @@ class FlairTextClassificationColumns:
     label_type: str = "class"
 
 
+@dataclass(frozen=True)
+class FlairMultitaskColumns:
+    text: str = "text"
+    label: str = "label"
+    label_type: str = "label_type"
+    task_id: str = "task_id"
+    multitask_label_type: str = "multitask_id"
+
+
 class LazyTextClassificationDataset(_FlairDataset):
     """Create Flair Sentence objects on demand for dataframe-backed text classification."""
 
@@ -39,6 +48,40 @@ class LazyTextClassificationDataset(_FlairDataset):
 
         sentence = Sentence(self.texts[index])
         sentence.add_label(self.columns.label_type, self.labels[index])
+        return sentence
+
+    def is_in_memory(self) -> bool:
+        return False
+
+
+class LazyMultitaskDataset(_FlairDataset):
+    """Create Flair Sentence objects on demand for dataframe-backed multitask training."""
+
+    def __init__(
+        self,
+        frame: pd.DataFrame,
+        *,
+        columns: FlairMultitaskColumns | None = None,
+    ) -> None:
+        self.columns = columns or FlairMultitaskColumns()
+        required = [self.columns.text, self.columns.label, self.columns.label_type, self.columns.task_id]
+        missing = [column for column in required if column not in frame.columns]
+        if missing:
+            raise ValueError(f"Missing lazy multitask dataset columns: {missing}")
+        self.texts = frame[self.columns.text].astype(str).tolist()
+        self.label_types = frame[self.columns.label_type].astype(str).tolist()
+        self.labels = frame[self.columns.label].astype(str).tolist()
+        self.task_ids = frame[self.columns.task_id].astype(str).tolist()
+
+    def __len__(self) -> int:
+        return len(self.texts)
+
+    def __getitem__(self, index: int):
+        from flair.data import Sentence
+
+        sentence = Sentence(self.texts[index])
+        sentence.add_label(self.label_types[index], self.labels[index])
+        sentence.add_label(self.columns.multitask_label_type, self.task_ids[index])
         return sentence
 
     def is_in_memory(self) -> bool:
@@ -88,6 +131,22 @@ def build_text_classification_corpus(
         dev = frame_to_text_classification_sentences(splits["dev"], columns=cols)
         test = frame_to_text_classification_sentences(splits["test"], columns=cols)
     return Corpus(train=train, dev=dev, test=test, sample_missing_splits=False)
+
+
+def build_multitask_corpus(
+    splits: Mapping[str, pd.DataFrame],
+    *,
+    columns: FlairMultitaskColumns | None = None,
+):
+    from flair.data import Corpus
+
+    cols = columns or FlairMultitaskColumns()
+    return Corpus(
+        train=LazyMultitaskDataset(splits["train"], columns=cols),
+        dev=LazyMultitaskDataset(splits["dev"], columns=cols),
+        test=LazyMultitaskDataset(splits["test"], columns=cols),
+        sample_missing_splits=False,
+    )
 
 
 def build_label_dictionary(frame: pd.DataFrame, *, label_column: str = "label"):
