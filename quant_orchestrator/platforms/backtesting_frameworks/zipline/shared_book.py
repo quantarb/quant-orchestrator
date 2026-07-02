@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any
+from typing import Any, Iterable
 
 import pandas as pd
 from sqlalchemy import create_engine
@@ -17,6 +18,16 @@ class ZiplineSharedBookResult:
     summary: pd.DataFrame
     equity_curve: pd.Series
     orders: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class ZiplineSharedBookSummaryJob:
+    price_frames: dict[str, pd.DataFrame]
+    target_weights: pd.DataFrame
+    metadata: dict[str, Any]
+    capital_base: float = 1_000_000.0
+    commission_per_share: float = 0.005
+    slippage_bps: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -89,6 +100,44 @@ def run_zipline_shared_book(
     )
     orders = _extract_transactions(perf)
     return ZiplineSharedBookResult(perf=perf, summary=summary, equity_curve=equity, orders=orders)
+
+
+def run_zipline_shared_book_summary_jobs(
+    jobs: Iterable[ZiplineSharedBookSummaryJob],
+    *,
+    max_workers: int | None = None,
+) -> pd.DataFrame:
+    """Run independent native Zipline shared-book jobs and return summary rows.
+
+    The worker returns only the compact summary row, not the full Zipline perf
+    frame. This keeps multiprocessing IPC small enough for notebook workflows.
+    """
+
+    job_list = list(jobs)
+    if not job_list:
+        return pd.DataFrame()
+    if max_workers == 1:
+        return pd.DataFrame([_run_zipline_shared_book_summary_job(job) for job in job_list])
+
+    rows: list[dict[str, Any]] = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_run_zipline_shared_book_summary_job, job) for job in job_list]
+        for future in as_completed(futures):
+            rows.append(future.result())
+    return pd.DataFrame(rows)
+
+
+def _run_zipline_shared_book_summary_job(job: ZiplineSharedBookSummaryJob) -> dict[str, Any]:
+    result = run_zipline_shared_book(
+        job.price_frames,
+        job.target_weights,
+        capital_base=job.capital_base,
+        commission_per_share=job.commission_per_share,
+        slippage_bps=job.slippage_bps,
+    )
+    row = result.summary.iloc[0].to_dict()
+    row.update(job.metadata)
+    return row
 
 
 def _build_zipline_shared_book_data(

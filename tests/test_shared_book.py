@@ -6,7 +6,11 @@ from quant_orchestrator.platforms.backtesting_frameworks.shared_book import (
     build_shared_book_weights,
     run_shared_book_backtest,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.zipline.shared_book import run_zipline_shared_book
+from quant_orchestrator.platforms.backtesting_frameworks.zipline.shared_book import (
+    ZiplineSharedBookSummaryJob,
+    run_zipline_shared_book,
+    run_zipline_shared_book_summary_jobs,
+)
 
 
 def test_shared_book_uses_one_capacity_for_long_short() -> None:
@@ -114,3 +118,35 @@ def test_zipline_shared_book_runs_native_multi_asset_orders() -> None:
     assert result.summary.loc[0, "trades"] > 0
     assert result.equity_curve.iloc[-1] > result.equity_curve.iloc[0]
     assert not result.orders.empty
+
+
+def test_zipline_shared_book_summary_jobs_return_metadata() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=20)
+    close = pd.Series(range(100, 120), index=dates, dtype=float)
+    prices = pd.DataFrame(
+        {
+            "open": close,
+            "high": close * 1.01,
+            "low": close * 0.99,
+            "close": close,
+            "volume": 1_000_000,
+        },
+        index=dates,
+    )
+    target_weights = pd.DataFrame({"AAA": [1.0] * len(dates)}, index=dates)
+
+    rows = run_zipline_shared_book_summary_jobs(
+        [
+            ZiplineSharedBookSummaryJob(
+                price_frames={"AAA": prices},
+                target_weights=target_weights,
+                metadata={"strategy_source": "test_model", "variant": "long_only", "top_k": 1},
+                capital_base=100_000.0,
+            )
+        ],
+        max_workers=1,
+    )
+
+    assert rows.loc[0, "framework"] == "zipline_shared_book_native"
+    assert rows.loc[0, "strategy_source"] == "test_model"
+    assert rows.loc[0, "variant"] == "long_only"
