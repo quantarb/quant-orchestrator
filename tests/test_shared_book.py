@@ -6,6 +6,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.shared_book import (
     build_shared_book_weights,
     run_shared_book_backtest,
 )
+from quant_orchestrator.platforms.backtesting_frameworks.zipline.shared_book import run_zipline_shared_book
 
 
 def test_shared_book_uses_one_capacity_for_long_short() -> None:
@@ -75,3 +76,41 @@ def test_shared_book_costs_apply_to_turnover() -> None:
     assert round(float(net_returns.iloc[0]), 4) == 0.09
     assert round(float(net_returns.iloc[1]), 4) == -0.01
     assert round(float(equity.iloc[-1]), 2) == 107.91
+
+
+def test_zipline_shared_book_runs_native_multi_asset_orders() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=20)
+
+    def prices(base: float) -> pd.DataFrame:
+        close = pd.Series([base + offset for offset in range(len(dates))], index=dates, dtype=float)
+        return pd.DataFrame(
+            {
+                "open": close,
+                "high": close * 1.01,
+                "low": close * 0.99,
+                "close": close,
+                "volume": 1_000_000,
+            },
+            index=dates,
+        )
+
+    target_weights = pd.DataFrame(
+        {
+            "AAA": [0.5] * 10 + [0.0] * 10,
+            "BBB": [0.0] * 10 + [0.5] * 10,
+        },
+        index=dates,
+    )
+
+    result = run_zipline_shared_book(
+        {"AAA": prices(100.0), "BBB": prices(50.0)},
+        target_weights,
+        capital_base=100_000.0,
+        commission_per_share=0.005,
+        slippage_bps=5.0,
+    )
+
+    assert result.summary.loc[0, "framework"] == "zipline_shared_book_native"
+    assert result.summary.loc[0, "trades"] > 0
+    assert result.equity_curve.iloc[-1] > result.equity_curve.iloc[0]
+    assert not result.orders.empty
