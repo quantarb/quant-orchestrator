@@ -36,6 +36,10 @@ def build_shared_book_weights(
     variant: StrategyVariant,
     entry_threshold: float = 0.5,
     exit_threshold: float = 0.5,
+    long_score_col: str = "long_score",
+    short_score_col: str = "short_score",
+    long_exit_score_col: str | None = None,
+    short_exit_score_col: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Create one shared multi-asset target-weight book from daily ML scores.
 
@@ -49,7 +53,9 @@ def build_shared_book_weights(
         raise ValueError("top_k must be positive")
     if variant not in {"long_only", "short_only", "long_short"}:
         raise ValueError(f"unknown variant {variant!r}")
-    required = {"symbol", "date", "long_score", "short_score"}
+    long_exit_col = long_exit_score_col or long_score_col
+    short_exit_col = short_exit_score_col or short_score_col
+    required = {"symbol", "date", long_score_col, short_score_col, long_exit_col, short_exit_col}
     missing = required - set(scores.columns)
     if missing:
         raise KeyError(f"scores missing required columns: {sorted(missing)}")
@@ -75,14 +81,14 @@ def build_shared_book_weights(
         for symbol, side in list(positions.items()):
             if symbol not in day.index:
                 continue
-            long_score = float(day.at[symbol, "long_score"])
-            short_score = float(day.at[symbol, "short_score"])
-            if side == 1 and short_score > exit_threshold:
+            long_exit_score = float(day.at[symbol, long_exit_col])
+            short_exit_score = float(day.at[symbol, short_exit_col])
+            if side == 1 and short_exit_score > exit_threshold:
                 del positions[symbol]
-                events.append({"date": date, "symbol": symbol, "action": "exit_long", "score": short_score})
-            elif side == -1 and long_score > exit_threshold:
+                events.append({"date": date, "symbol": symbol, "action": "exit_long", "score": short_exit_score})
+            elif side == -1 and long_exit_score > exit_threshold:
                 del positions[symbol]
-                events.append({"date": date, "symbol": symbol, "action": "exit_short", "score": long_score})
+                events.append({"date": date, "symbol": symbol, "action": "exit_short", "score": long_exit_score})
 
         open_slots = max(0, top_k_int - len(positions))
         if open_slots > 0:
@@ -91,6 +97,8 @@ def build_shared_book_weights(
                 held_symbols=set(positions),
                 variant=variant,
                 entry_threshold=float(entry_threshold),
+                long_score_col=long_score_col,
+                short_score_col=short_score_col,
             )
             for score, symbol, side, action in candidates[:open_slots]:
                 positions[symbol] = side
@@ -233,14 +241,16 @@ def _entry_candidates(
     held_symbols: set[str],
     variant: StrategyVariant,
     entry_threshold: float,
+    long_score_col: str = "long_score",
+    short_score_col: str = "short_score",
 ) -> list[tuple[float, str, int, str]]:
     candidates: list[tuple[float, str, int, str]] = []
     for symbol, row in day.iterrows():
         symbol = str(symbol).upper()
         if symbol in held_symbols:
             continue
-        long_score = float(row["long_score"])
-        short_score = float(row["short_score"])
+        long_score = float(row[long_score_col])
+        short_score = float(row[short_score_col])
         if variant == "long_only":
             if long_score > entry_threshold:
                 candidates.append((long_score, symbol, 1, "enter_long"))

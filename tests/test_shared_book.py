@@ -64,6 +64,36 @@ def test_shared_book_exits_then_refills_open_slots() -> None:
     assert trades["action"].tolist() == ["enter_long", "exit_long", "enter_long"]
 
 
+def test_shared_book_can_use_separate_entry_and_exit_scores() -> None:
+    scores = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+            "symbol": ["A", "A", "A"],
+            "long_score": [0.80, 0.10, 0.10],
+            "short_score": [0.10, 0.10, 0.10],
+            "classifier_long_score": [0.80, 0.80, 0.10],
+            "classifier_short_score": [0.10, 0.10, 0.80],
+        }
+    )
+
+    weights, trades = build_shared_book_weights(
+        scores,
+        symbols=["A"],
+        dates=pd.DatetimeIndex(["2024-01-02", "2024-01-03", "2024-01-04"]),
+        top_k=1,
+        variant="long_only",
+        entry_threshold=0.5,
+        exit_threshold=0.5,
+        long_exit_score_col="classifier_long_score",
+        short_exit_score_col="classifier_short_score",
+    )
+
+    assert weights.loc[pd.Timestamp("2024-01-02"), "A"] == 1.0
+    assert weights.loc[pd.Timestamp("2024-01-03"), "A"] == 1.0
+    assert weights.loc[pd.Timestamp("2024-01-04"), "A"] == 0.0
+    assert trades["action"].tolist() == ["enter_long", "exit_long"]
+
+
 def test_shared_book_costs_apply_to_turnover() -> None:
     weights = pd.DataFrame(
         {"A": [1.0, 0.0]},
