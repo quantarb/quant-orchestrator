@@ -158,6 +158,52 @@ log_backtest_run(
 By default, tracking uses `sqlite:///artifacts/mlflow/mlflow.db`. Override it
 with `tracking_uri=...`, `QUANT_ORCHESTRATOR_MLFLOW_TRACKING_URI`, or `MLFLOW_TRACKING_URI`.
 
+### ML Trading Experiments
+
+Repeated ML trading experiments should be run by Dagster, not by notebooks. The reusable runner is `quant_orchestrator.research_tools.run_ml_trading_experiment`; the Dagster job is `ml_trading_experiment_job`. The runner:
+
+- screens the Quant Warehouse FMP universe
+- builds feature and target panels from Quant Warehouse
+- trains per-feature-family RAPIDS random forest classifiers
+- optionally trains per-feature-family Torch latent autoencoder indexes
+- generates shared-book score frames
+- runs native Zipline shared-book backtests
+- writes local `ArtifactStore` artifacts
+- logs params, summary metrics, and artifact files to MLflow
+
+The default config is a fast 1T+ smoke path so the pipeline can be verified before scaling to 100B+.
+
+Classifier-only smoke run:
+
+```python
+from quant_orchestrator.dagster_defs import defs
+
+job = defs.get_job_def("ml_trading_experiment_job")
+result = job.execute_in_process(
+    run_config={
+        "ops": {
+            "run_ml_trading_experiment_scheduled": {
+                "config": {
+                    "experiment_name": "gpu_rf_shared_book_1t_dagster_smoke",
+                    "mode": "classifier",
+                    "min_market_cap": 1_000_000_000_000,
+                    "start_date": "1900-01-01",
+                    "end_date": "",
+                    "train_end": "2019-12-31",
+                    "oos_start": "2020-01-01",
+                    "top_k_values": "5,10,20,40",
+                    "zipline_max_workers": 4,
+                    "log_mlflow": True,
+                    "mlflow_experiment": "ml_trading",
+                }
+            }
+        }
+    }
+)
+```
+
+Use `mode="classifier_ae"` for the classifier plus latent autoencoder version. Review completed runs in `notebooks/ml_trading/mlflow_experiment_review.ipynb`; that notebook reads MLflow and `ArtifactStore` outputs only and does not execute training or backtests.
+
 ## Artifact Registry
 
 `quant-orchestrator` owns ML training, backtest, model, prediction, and strategy artifacts. Downstream apps should ask the orchestrator to train, infer, backtest, or run external strategy evaluations, then load the returned artifact URI or path instead of maintaining separate research storage.

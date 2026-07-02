@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -63,7 +64,7 @@ class MLflowTracker:
         cleaned = {
             key: float(value)
             for key, value in metrics.items()
-            if value is not None
+            if value is not None and math.isfinite(float(value))
         }
         if cleaned:
             self._mlflow.log_metrics(cleaned, step=step)
