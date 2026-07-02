@@ -1046,40 +1046,63 @@ def _train_option_ranker(
 
     eval_scored = eval_panel.copy()
     eval_scored["pred_return"] = np.nan
+    eval_scored["pred_rank_score"] = np.nan
     if len(train_panel) < 50 or eval_panel.empty:
         return None, {}, eval_scored
     features_num = option_ranker_feature_columns(train_panel)
     features_cat = ["symbol", "side", "option_type", *config.categorical_trade_context_columns]
     numeric = [col for col in features_num if col in train_panel.columns and train_panel[col].notna().any()]
     categorical = [col for col in features_cat if col in train_panel.columns and train_panel[col].notna().any()]
-    model = Pipeline(
-        [
-            (
-                "prep",
-                ColumnTransformer(
-                    [
-                        ("num", SimpleImputer(strategy="median"), numeric),
-                        (
-                            "cat",
-                            Pipeline(
-                                [
-                                    ("impute", SimpleImputer(strategy="most_frequent")),
-                                    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-                                ]
+    def make_model(seed: int) -> Pipeline:
+        return Pipeline(
+            [
+                (
+                    "prep",
+                    ColumnTransformer(
+                        [
+                            ("num", SimpleImputer(strategy="median"), numeric),
+                            (
+                                "cat",
+                                Pipeline(
+                                    [
+                                        ("impute", SimpleImputer(strategy="most_frequent")),
+                                        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+                                    ]
+                                ),
+                                categorical,
                             ),
-                            categorical,
-                        ),
-                    ],
-                    remainder="drop",
+                        ],
+                        remainder="drop",
+                    ),
                 ),
-            ),
-            ("rf", RandomForestRegressor(n_estimators=300, max_depth=8, min_samples_leaf=5, random_state=config.random_seed, n_jobs=-1)),
-        ]
-    )
+                (
+                    "rf",
+                    RandomForestRegressor(
+                        n_estimators=300,
+                        max_depth=8,
+                        min_samples_leaf=5,
+                        random_state=seed,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
+
     target = "option_return"
-    model.fit(train_panel[numeric + categorical], train_panel[target])
-    train_pred = model.predict(train_panel[numeric + categorical])
-    eval_scored["pred_return"] = model.predict(eval_scored[numeric + categorical])
+    model = make_model(config.random_seed)
+    x_train = train_panel[numeric + categorical]
+    x_eval = eval_scored[numeric + categorical]
+    model.fit(x_train, train_panel[target])
+    train_pred = model.predict(x_train)
+    eval_scored["pred_return"] = model.predict(x_eval)
+    rank_model = None
+    rank_train_pred = np.full(len(train_panel), np.nan)
+    if "rank_y" in train_panel.columns and pd.to_numeric(train_panel["rank_y"], errors="coerce").notna().any():
+        rank_model = make_model(config.random_seed + 31)
+        rank_target = pd.to_numeric(train_panel["rank_y"], errors="coerce")
+        rank_model.fit(x_train, rank_target)
+        rank_train_pred = rank_model.predict(x_train)
+        eval_scored["pred_rank_score"] = np.clip(rank_model.predict(x_eval), 0.0, 1.0)
     metrics = {
         "train_rows": float(len(train_panel)),
         "eval_rows": float(len(eval_scored)),
@@ -1091,11 +1114,21 @@ def _train_option_ranker(
         "eval_r2": float(r2_score(eval_scored[target], eval_scored["pred_return"])) if len(eval_scored) > 1 else np.nan,
         "numeric_feature_count": float(len(numeric)),
         "categorical_feature_count": float(len(categorical)),
-        "ranker_model_count": 1.0,
+        "ranker_model_count": 1.0 + (1.0 if rank_model is not None else 0.0),
     }
+    if rank_model is not None and "rank_y" in eval_scored.columns:
+        eval_rank_target = pd.to_numeric(eval_scored["rank_y"], errors="coerce")
+        metrics.update(
+            {
+                "rank_train_mae": float(mean_absolute_error(train_panel["rank_y"], rank_train_pred)),
+                "rank_train_r2": float(r2_score(train_panel["rank_y"], rank_train_pred)) if len(train_panel) > 1 else np.nan,
+                "rank_eval_mae": float(mean_absolute_error(eval_rank_target, eval_scored["pred_rank_score"])),
+                "rank_eval_r2": float(r2_score(eval_rank_target, eval_scored["pred_rank_score"])) if len(eval_scored) > 1 else np.nan,
+            }
+        )
     metrics["numeric_features"] = ",".join(numeric)
     metrics["categorical_features"] = ",".join(categorical)
-    return model, metrics, eval_scored
+    return {"return_ranker": model, "within_trade_ranker": rank_model}, metrics, eval_scored
 
 
 def _train_mv_basket_ranker(
@@ -1177,10 +1210,13 @@ def _selector_summaries(
     *,
     mv_basket_config: OptionMvBasketConfig | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
-    selected_model = _choose_top_per_trade(eval_panel, "pred_return")
-    selected_oracle = _choose_top_per_trade(eval_panel, "option_return")
     fixed_work = eval_panel.copy()
     if not fixed_work.empty:
+        if "pred_return" in fixed_work.columns and "pred_rank_score" in fixed_work.columns:
+            fixed_work["pred_return_pct"] = fixed_work.groupby("trade_id")["pred_return"].rank(method="average", pct=True, ascending=True)
+            fixed_work["pred_blended_rank_score"] = 0.75 * pd.to_numeric(
+                fixed_work["pred_rank_score"], errors="coerce"
+            ) + 0.25 * pd.to_numeric(fixed_work["pred_return_pct"], errors="coerce")
         fixed_work["fixed_near_atm_score"] = _rule_score(
             fixed_work,
             {"dte_gap": -1.0, "abs_moneyness": -1.0, "spread_pct": -1.0},
@@ -1193,6 +1229,10 @@ def _selector_summaries(
             fixed_work,
             {"spread_pct": -1.0, "dte_gap": -0.1, "abs_moneyness": -0.1},
         )
+    selected_model = _choose_top_per_trade(fixed_work, "pred_return")
+    selected_rank_model = _choose_top_per_trade(fixed_work, "pred_rank_score")
+    selected_blended_model = _choose_top_per_trade(fixed_work, "pred_blended_rank_score")
+    selected_oracle = _choose_top_per_trade(fixed_work, "option_return")
     selected_fixed = _choose_top_per_trade(fixed_work, "fixed_near_atm_score")
     selected_liquidity = _choose_top_per_trade(fixed_work, "highest_liquidity_score")
     selected_lowest_spread = _choose_top_per_trade(fixed_work, "lowest_spread_score")
@@ -1213,6 +1253,8 @@ def _selector_summaries(
     selector_summary = pd.DataFrame(
         [
             _summarize_selected("model_ranker", selected_model),
+            _summarize_selected("model_rank_ranker", selected_rank_model),
+            _summarize_selected("model_blended_ranker", selected_blended_model),
             _summarize_selected("oracle_best_possible", selected_oracle),
             _summarize_selected("fixed_near_atm", selected_fixed),
             _summarize_selected("highest_liquidity", selected_liquidity),
@@ -1239,6 +1281,8 @@ def _selector_summaries(
         symbol_summary,
         {
             "model_ranker": selected_model,
+            "model_rank_ranker": selected_rank_model,
+            "model_blended_ranker": selected_blended_model,
             "oracle_best_possible": selected_oracle,
             "fixed_near_atm": selected_fixed,
             "highest_liquidity": selected_liquidity,

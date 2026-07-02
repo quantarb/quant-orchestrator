@@ -131,6 +131,7 @@ def test_selector_summaries_include_global_ranker_and_rule_baselines() -> None:
             "symbol": ["AAPL", "AAPL", "MSFT", "MSFT"],
             "side": ["long", "long", "short", "short"],
             "pred_return": [0.1, 0.2, 0.4, 0.3],
+            "pred_rank_score": [0.7, 0.6, 0.2, 0.9],
             "option_return": [0.5, 0.1, 0.2, 0.8],
             "dte_gap": [1.0, 5.0, 2.0, 3.0],
             "abs_moneyness": [0.01, 0.10, 0.05, 0.04],
@@ -144,6 +145,8 @@ def test_selector_summaries_include_global_ranker_and_rule_baselines() -> None:
 
     assert set(summary["selector"]) == {
         "model_ranker",
+        "model_rank_ranker",
+        "model_blended_ranker",
         "oracle_best_possible",
         "fixed_near_atm",
         "highest_liquidity",
@@ -152,6 +155,8 @@ def test_selector_summaries_include_global_ranker_and_rule_baselines() -> None:
         "oracle_mv_basket",
     }
     assert selected["model_ranker"].set_index("trade_id").loc["t1", "pred_return"] == 0.2
+    assert selected["model_rank_ranker"].set_index("trade_id").loc["t2", "pred_rank_score"] == 0.9
+    assert selected["model_blended_ranker"].set_index("trade_id").loc["t2", "pred_rank_score"] == 0.9
 
 
 def test_selector_summaries_do_not_use_oracle_when_model_predictions_missing() -> None:
@@ -161,6 +166,7 @@ def test_selector_summaries_do_not_use_oracle_when_model_predictions_missing() -
             "symbol": ["AAPL", "AAPL"],
             "side": ["long", "long"],
             "pred_return": [float("nan"), float("nan")],
+            "pred_rank_score": [float("nan"), float("nan")],
             "option_return": [0.5, 1.0],
             "dte_gap": [1.0, 2.0],
             "abs_moneyness": [0.01, 0.02],
@@ -173,7 +179,11 @@ def test_selector_summaries_do_not_use_oracle_when_model_predictions_missing() -
     summary, _, selected = _selector_summaries(frame)
 
     assert selected["model_ranker"].empty
+    assert selected["model_rank_ranker"].empty
+    assert selected["model_blended_ranker"].empty
     assert summary.set_index("selector").loc["model_ranker", "trades"] == 0
+    assert summary.set_index("selector").loc["model_rank_ranker", "trades"] == 0
+    assert summary.set_index("selector").loc["model_blended_ranker", "trades"] == 0
     assert selected["oracle_best_possible"].loc[0, "option_return"] == 1.0
 
 
