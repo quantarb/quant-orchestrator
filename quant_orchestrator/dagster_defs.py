@@ -83,12 +83,12 @@ def run_ml_trading_experiment_scheduled(context) -> str:
     )
     result = run_ml_trading_experiment(experiment_config)
     logger.info(
-        "Completed ML trading experiment %s; artifacts=%s; metrics=%s",
+        "Completed ML trading experiment %s; mlflow_run_id=%s; metrics=%s",
         result.config.experiment_name,
-        result.artifacts.artifact_uris,
+        result.mlflow_run_id,
         result.metrics,
     )
-    return result.artifacts.run.id
+    return result.mlflow_run_id or ""
 
 
 @job

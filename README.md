@@ -165,11 +165,10 @@ Repeated ML trading experiments should be run by Dagster, not by notebooks. The 
 - screens the Quant Warehouse FMP universe
 - builds feature and target panels from Quant Warehouse
 - trains per-feature-family RAPIDS random forest classifiers
-- optionally trains per-feature-family Torch latent autoencoder indexes
+- optionally trains per-feature-family Torch latent autoencoder indexes; AE architectures are tuned per feature family with latent-neighbor label purity preferred over reconstruction error when event/oracle labels are available
 - generates shared-book score frames
 - runs native Zipline shared-book backtests
-- writes local `ArtifactStore` artifacts
-- logs params, summary metrics, and artifact files to MLflow
+- logs params, summary metrics, trained model artifacts, score tables, backtest tables, trade logs, and analysis files to MLflow
 
 The default config is a fast 1T+ smoke path so the pipeline can be verified before scaling to 100B+.
 
@@ -202,7 +201,7 @@ result = job.execute_in_process(
 )
 ```
 
-Use `mode="classifier_ae"` for the classifier plus latent autoencoder version. Review completed runs in `notebooks/ml_trading/mlflow_experiment_review.ipynb`; that notebook reads MLflow and `ArtifactStore` outputs only and does not execute training or backtests.
+Use `mode="classifier_ae"` for the classifier plus latent autoencoder version. Review completed runs in `notebooks/ml_trading/mlflow_experiment_review.ipynb`; that notebook reads MLflow runs and MLflow artifacts only and does not execute training or backtests.
 
 ## Artifact Registry
 

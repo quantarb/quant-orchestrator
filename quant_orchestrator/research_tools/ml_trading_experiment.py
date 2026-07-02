@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import json
 from pathlib import Path
+import pickle
+import re
 import sys
+import tempfile
 from time import perf_counter
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 
-from quant_orchestrator.artifacts import ArtifactStore
 from quant_orchestrator.platforms.backtesting_frameworks.shared_book import build_shared_book_weights
 from quant_orchestrator.platforms.backtesting_frameworks.zipline.shared_book import (
     ZiplineSharedBookSummaryJob,
@@ -20,12 +23,11 @@ from quant_orchestrator.platforms.ml_frameworks.torch_autoencoder import (
     LatentAutoencoderConfig,
     LatentAutoencoderIndex,
 )
-from quant_orchestrator.research_tools import (
-    ExperimentArtifacts,
+from quant_orchestrator.research_tools.ml_trading import (
     build_family_prediction_frame,
     build_strategy_score_frame,
     prepare_family_dataset,
-    save_experiment_artifacts,
+    write_ml_trading_artifact_files,
 )
 from quant_orchestrator.tracking import get_tracker
 
@@ -76,7 +78,6 @@ class MLTradingExperimentConfig:
     )
     ae_config: LatentAutoencoderConfig = field(default_factory=LatentAutoencoderConfig)
     quant_warehouse_root: str | None = "/home/jlee153232/PycharmProjects/quant-warehouse"
-    save_local_artifacts: bool = True
     log_mlflow: bool = True
     mlflow_experiment: str = "ml_trading"
     mlflow_tracking_uri: str | None = None
@@ -85,7 +86,7 @@ class MLTradingExperimentConfig:
 @dataclass(frozen=True)
 class MLTradingExperimentResult:
     config: MLTradingExperimentConfig
-    artifacts: ExperimentArtifacts
+    mlflow_run_id: str | None
     model_results: pd.DataFrame
     strategy_scores: pd.DataFrame
     backtest_summary: pd.DataFrame
@@ -115,8 +116,6 @@ class MLTradingExperimentResult:
 
 def run_ml_trading_experiment(
     config: MLTradingExperimentConfig,
-    *,
-    artifact_store: ArtifactStore | None = None,
 ) -> MLTradingExperimentResult:
     started = perf_counter()
     _prepare_quant_warehouse_import(config.quant_warehouse_root)
@@ -251,20 +250,9 @@ def run_ml_trading_experiment(
         event_symbols=event_symbols,
         elapsed_seconds=elapsed_seconds,
     )
-    artifacts = save_experiment_artifacts(
-        experiment_name=config.experiment_name,
-        params=_config_params(config),
-        metrics=metrics,
-        model_results=model_results,
-        strategy_scores=strategy_scores,
-        backtest_summary=backtest_summary,
-        trade_log=trade_log,
-        analysis_markdown=analysis_markdown,
-        store=artifact_store,
-    )
     result = MLTradingExperimentResult(
         config=config,
-        artifacts=artifacts,
+        mlflow_run_id=None,
         model_results=model_results,
         strategy_scores=strategy_scores,
         backtest_summary=backtest_summary,
@@ -273,15 +261,20 @@ def run_ml_trading_experiment(
         elapsed_seconds=elapsed_seconds,
     )
     if config.log_mlflow:
-        log_ml_trading_result_to_mlflow(result, artifact_store=artifact_store)
+        result = MLTradingExperimentResult(
+            config=result.config,
+            mlflow_run_id=log_ml_trading_result_to_mlflow(result, trained_models=models),
+            model_results=result.model_results,
+            strategy_scores=result.strategy_scores,
+            backtest_summary=result.backtest_summary,
+            trade_log=result.trade_log,
+            analysis_markdown=result.analysis_markdown,
+            elapsed_seconds=result.elapsed_seconds,
+        )
     return result
 
 
-def log_ml_trading_result_to_mlflow(
-    result: MLTradingExperimentResult,
-    *,
-    artifact_store: ArtifactStore | None = None,
-) -> None:
+def log_ml_trading_result_to_mlflow(result: MLTradingExperimentResult, *, trained_models: dict | None = None) -> str:
     tracker = get_tracker(tracking_uri=result.config.mlflow_tracking_uri)
     tags = {
         "quant_orchestrator.kind": "ml_trading",
@@ -293,12 +286,100 @@ def log_ml_trading_result_to_mlflow(
         name=result.config.experiment_name,
         experiment=result.config.mlflow_experiment,
         tags=tags,
-    ):
+    ) as run:
         tracker.log_params(_config_params(result.config))
         tracker.log_metrics(_finite_metrics(result.metrics))
-        store = artifact_store or ArtifactStore()
-        for artifact in store.list_artifacts(run_id=result.artifacts.run.id, limit=100):
-            tracker.log_artifact(str(artifact.path), artifact_path=artifact.kind)
+        with tempfile.TemporaryDirectory(prefix="quant-orchestrator-ml-trading-") as tmp_dir:
+            paths = write_ml_trading_artifact_files(
+                model_results=result.model_results,
+                strategy_scores=result.strategy_scores,
+                backtest_summary=result.backtest_summary,
+                trade_log=result.trade_log,
+                analysis_markdown=result.analysis_markdown,
+                directory=tmp_dir,
+            )
+            for path in paths.values():
+                tracker.log_artifact(str(path), artifact_path="ml_trading")
+            if trained_models:
+                model_root = Path(tmp_dir) / "models"
+                _write_trained_model_artifacts(model_root, trained_models)
+                tracker.log_artifact(str(model_root), artifact_path="ml_trading_models")
+        return str(run.info.run_id)
+
+
+def _write_trained_model_artifacts(directory: Path, trained_models: dict) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for (source, family), payload in trained_models.items():
+        strategy_source = f"{source}.{family}"
+        model_dir = directory / _safe_filename(strategy_source)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        features = list(payload.get("features", []))
+        metadata = {
+            "strategy_source": strategy_source,
+            "source": str(source),
+            "family": str(family),
+            "features": features,
+            "feature_count": len(features),
+            "has_classifier": payload.get("classifier") is not None,
+            "has_autoencoder": payload.get("autoencoder") is not None,
+            "classifier_file": "classifier.pkl",
+            "autoencoder_dir": "autoencoder" if payload.get("autoencoder") is not None else None,
+        }
+        classifier = payload.get("classifier")
+        if classifier is not None:
+            try:
+                with (model_dir / "classifier.pkl").open("wb") as handle:
+                    pickle.dump(classifier, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                metadata["classifier_serialized"] = True
+            except Exception as exc:  # pragma: no cover - backend-specific serialization failures
+                metadata["classifier_serialized"] = False
+                metadata["classifier_serialization_error"] = repr(exc)
+                (model_dir / "classifier_serialization_error.txt").write_text(repr(exc), encoding="utf-8")
+        autoencoder = payload.get("autoencoder")
+        if autoencoder is not None:
+            _write_autoencoder_artifacts(model_dir / "autoencoder", autoencoder)
+            metadata["autoencoder_metadata"] = autoencoder.metadata()
+        (model_dir / "metadata.json").write_text(_json_dumps(metadata), encoding="utf-8")
+        manifest.append(metadata)
+    (directory / "manifest.json").write_text(_json_dumps({"models": manifest}), encoding="utf-8")
+
+
+def _write_autoencoder_artifacts(directory: Path, autoencoder) -> None:
+    import torch
+
+    directory.mkdir(parents=True, exist_ok=True)
+    state_dict = {
+        key: value.detach().cpu()
+        for key, value in autoencoder.model.state_dict().items()
+    }
+    torch.save(
+        {
+            "state_dict": state_dict,
+            "in_dim": len(autoencoder.features),
+            "hidden_dim": autoencoder.hidden_dim,
+            "bottleneck_dim": autoencoder.bottleneck_dim,
+            "model_factory": "quant_orchestrator.platforms.ml_frameworks.torch_autoencoder.latent_index.create_family_autoencoder",
+        },
+        directory / "model_state.pt",
+    )
+    np.savez_compressed(
+        directory / "preprocessing.npz",
+        center=autoencoder.center,
+        scale=autoencoder.scale,
+        lower=autoencoder.lower,
+        upper=autoencoder.upper,
+    )
+    with (directory / "nearest_neighbors.pkl").open("wb") as handle:
+        pickle.dump(autoencoder.nn_index, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    metadata = {
+        "features": list(autoencoder.features),
+        "metadata": autoencoder.metadata(),
+        "architecture_diagnostics": list(getattr(autoencoder, "architecture_diagnostics", [])),
+        "config": asdict(autoencoder.config),
+        "latent_distance_cutoff": autoencoder.latent_distance_cutoff,
+    }
+    (directory / "metadata.json").write_text(_json_dumps(metadata), encoding="utf-8")
 
 
 def collapsed_label_rows(
@@ -639,7 +720,12 @@ def _run_shared_book_backtests(
         zipline_jobs,
         max_workers=config.zipline_max_workers,
     )
-    trade_log = pd.concat(trade_logs, ignore_index=True) if trade_logs else pd.DataFrame()
+    usable_trade_logs = [
+        frame.dropna(axis=1, how="all")
+        for frame in trade_logs
+        if frame is not None and not frame.empty and not frame.dropna(axis=1, how="all").empty
+    ]
+    trade_log = pd.concat(usable_trade_logs, ignore_index=True) if usable_trade_logs else pd.DataFrame()
     audit = {
         "strategy_sources": len(strategy_source_order),
         "variants": 3,
@@ -776,8 +862,7 @@ def _build_analysis(
             "",
             "Interpretation:",
             "- Dagster should run this job; notebooks should load the saved artifacts and inspect results.",
-            "- MLflow receives run params, high-level metrics, and the same artifact files for experiment tracking.",
-            "- ArtifactStore remains a local cache for notebook inspection and simple artifact lookup.",
+            "- MLflow is the source of truth for run params, high-level metrics, and artifact files.",
         ]
     )
     return "\n".join(lines)
@@ -831,6 +916,27 @@ def _finite_metrics(metrics: dict) -> dict[str, float]:
         if np.isfinite(numeric):
             out[key] = numeric
     return out
+
+
+def _json_dumps(payload: dict) -> str:
+    return json.dumps(payload, indent=2, sort_keys=True, default=_json_default)
+
+
+def _json_default(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return repr(value)
+
+
+def _safe_filename(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value).strip())
+    return cleaned.strip("._") or "model"
 
 
 def _safe_int(value) -> int | None:

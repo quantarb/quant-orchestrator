@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from pathlib import Path
+import tempfile
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
-from quant_orchestrator.artifacts import ArtifactStore, RunRecord
 from quant_orchestrator.platforms.ml_frameworks.rapids.random_forest import ensure_probability_columns
-
-
-@dataclass(frozen=True)
-class ExperimentArtifacts:
-    run: RunRecord
-    artifact_uris: dict[str, str]
+from quant_orchestrator.tracking import DEFAULT_TRACKING_URI
 
 
 def prepare_family_dataset(
@@ -124,81 +119,80 @@ def strategy_source_name(source: str, family: str) -> str:
     return f"{source}.{family}"
 
 
-def save_experiment_artifacts(
+ML_TRADING_ARTIFACT_FILENAMES = {
+    "model_results": "model_results.csv",
+    "strategy_scores": "strategy_scores.csv",
+    "backtest_summary": "backtest_summary.csv",
+    "trade_log": "trade_log.csv",
+    "analysis": "analysis.md",
+}
+
+
+def write_ml_trading_artifact_files(
     *,
-    experiment_name: str,
-    params: dict,
-    metrics: dict,
     model_results: pd.DataFrame,
     strategy_scores: pd.DataFrame,
     backtest_summary: pd.DataFrame,
     trade_log: pd.DataFrame,
     analysis_markdown: str,
-    store: ArtifactStore | None = None,
-) -> ExperimentArtifacts:
-    artifact_store = store or ArtifactStore()
-    run = artifact_store.create_run(
-        run_type="ml_trading",
-        name=experiment_name,
-        params=params,
-        tags={"experiment_name": experiment_name},
-    )
-    artifact_uris = {
-        "model_results": artifact_store.save_dataframe(
-            run_id=run.id,
-            kind=f"ml_trading_{experiment_name}",
-            name="model_results",
-            frame=model_results,
-        ).uri,
-        "strategy_scores": artifact_store.save_dataframe(
-            run_id=run.id,
-            kind=f"ml_trading_{experiment_name}",
-            name="strategy_scores",
-            frame=strategy_scores,
-        ).uri,
-        "backtest_summary": artifact_store.save_dataframe(
-            run_id=run.id,
-            kind=f"ml_trading_{experiment_name}",
-            name="backtest_summary",
-            frame=backtest_summary,
-        ).uri,
-        "trade_log": artifact_store.save_dataframe(
-            run_id=run.id,
-            kind=f"ml_trading_{experiment_name}",
-            name="trade_log",
-            frame=trade_log,
-        ).uri,
-        "analysis": artifact_store.save_text(
-            run_id=run.id,
-            kind=f"ml_trading_{experiment_name}",
-            name="analysis",
-            text=analysis_markdown,
-            extension="md",
-        ).uri,
+    directory: str | Path,
+) -> dict[str, Path]:
+    output_dir = Path(directory)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "model_results": output_dir / ML_TRADING_ARTIFACT_FILENAMES["model_results"],
+        "strategy_scores": output_dir / ML_TRADING_ARTIFACT_FILENAMES["strategy_scores"],
+        "backtest_summary": output_dir / ML_TRADING_ARTIFACT_FILENAMES["backtest_summary"],
+        "trade_log": output_dir / ML_TRADING_ARTIFACT_FILENAMES["trade_log"],
+        "analysis": output_dir / ML_TRADING_ARTIFACT_FILENAMES["analysis"],
     }
-    run = artifact_store.complete_run(run.id, metrics={**metrics, "artifact_uris": artifact_uris})
-    return ExperimentArtifacts(run=run, artifact_uris=artifact_uris)
+    model_results.to_csv(paths["model_results"], index=False)
+    strategy_scores.to_csv(paths["strategy_scores"], index=False)
+    backtest_summary.to_csv(paths["backtest_summary"], index=False)
+    trade_log.to_csv(paths["trade_log"], index=False)
+    paths["analysis"].write_text(analysis_markdown, encoding="utf-8")
+    return paths
 
 
-def load_latest_experiment_artifacts(
+def load_latest_mlflow_experiment_artifacts(
     experiment_name: str,
     *,
-    store: ArtifactStore | None = None,
+    mlflow_experiment: str = "ml_trading",
+    tracking_uri: str | None = None,
 ) -> dict[str, pd.DataFrame | str]:
-    artifact_store = store or ArtifactStore()
-    kind = f"ml_trading_{experiment_name}"
-    artifacts = {
-        "model_results": artifact_store.latest_artifact(kind=kind, name="model_results").uri,
-        "strategy_scores": artifact_store.latest_artifact(kind=kind, name="strategy_scores").uri,
-        "backtest_summary": artifact_store.latest_artifact(kind=kind, name="backtest_summary").uri,
-        "trade_log": artifact_store.latest_artifact(kind=kind, name="trade_log").uri,
-        "analysis": artifact_store.latest_artifact(kind=kind, name="analysis").uri,
-    }
-    return {
-        "model_results": artifact_store.load_dataframe(artifacts["model_results"]),
-        "strategy_scores": artifact_store.load_dataframe(artifacts["strategy_scores"]),
-        "backtest_summary": artifact_store.load_dataframe(artifacts["backtest_summary"]),
-        "trade_log": artifact_store.load_dataframe(artifacts["trade_log"]),
-        "analysis": artifact_store.load_text(artifacts["analysis"]),
-        "artifact_uris": artifacts,
-    }
+    import mlflow
+
+    mlflow.set_tracking_uri(tracking_uri or DEFAULT_TRACKING_URI)
+    experiment = mlflow.get_experiment_by_name(mlflow_experiment)
+    if experiment is None:
+        raise FileNotFoundError(f"MLflow experiment not found: {mlflow_experiment}")
+    runs = mlflow.search_runs(
+        [experiment.experiment_id],
+        filter_string=f"tags.`quant_orchestrator.experiment_name` = '{experiment_name}'",
+        order_by=["start_time DESC"],
+        max_results=1,
+    )
+    if runs.empty:
+        raise FileNotFoundError(f"No MLflow run found for experiment_name={experiment_name!r}")
+    run_id = str(runs.iloc[0]["run_id"])
+    return load_mlflow_run_artifacts(run_id, tracking_uri=tracking_uri)
+
+
+def load_mlflow_run_artifacts(
+    run_id: str,
+    *,
+    tracking_uri: str | None = None,
+) -> dict[str, pd.DataFrame | str]:
+    import mlflow
+
+    mlflow.set_tracking_uri(tracking_uri or DEFAULT_TRACKING_URI)
+    with tempfile.TemporaryDirectory(prefix="quant-orchestrator-mlflow-") as tmp_dir:
+        local_dir = Path(mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="ml_trading", dst_path=tmp_dir))
+        return {
+            "run_id": run_id,
+            "model_results": pd.read_csv(local_dir / ML_TRADING_ARTIFACT_FILENAMES["model_results"]),
+            "strategy_scores": pd.read_csv(local_dir / ML_TRADING_ARTIFACT_FILENAMES["strategy_scores"]),
+            "backtest_summary": pd.read_csv(local_dir / ML_TRADING_ARTIFACT_FILENAMES["backtest_summary"]),
+            "trade_log": pd.read_csv(local_dir / ML_TRADING_ARTIFACT_FILENAMES["trade_log"]),
+            "analysis": (local_dir / ML_TRADING_ARTIFACT_FILENAMES["analysis"]).read_text(encoding="utf-8"),
+        }
