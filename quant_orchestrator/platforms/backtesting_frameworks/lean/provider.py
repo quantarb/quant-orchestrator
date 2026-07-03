@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from quant_orchestrator.platforms.contracts import ProviderManifest
+from quant_orchestrator.platforms.backtesting_frameworks.lean.runner import (
+    LeanRunConfig,
+    run_lean_backtest,
+)
 
 
 class LeanBacktestEngine:
@@ -10,13 +14,14 @@ class LeanBacktestEngine:
 
     def run(self, strategy: Any, data: Any, **kwargs: Any) -> Any:
         runner = kwargs.get("runner")
-        if runner is None:
+        if runner is not None:
+            return runner(strategy=strategy, data=data, **{k: v for k, v in kwargs.items() if k != "runner"})
+        if not isinstance(data, LeanRunConfig):
             raise ValueError(
-                "LeanBacktestEngine.run requires runner=<callable>. "
-                "Install the QuantConnect LEAN CLI and supply a runner that invokes "
-                "the local LEAN backtest entry point.",
+                "LeanBacktestEngine.run requires runner=<callable> or data=<LeanRunConfig>. "
+                "Use the notebook helper to build a config for a local LEAN workspace.",
             )
-        return runner(strategy=strategy, data=data, **{k: v for k, v in kwargs.items() if k != "runner"})
+        return run_lean_backtest(data)
 
 
 lean_provider = ProviderManifest(
