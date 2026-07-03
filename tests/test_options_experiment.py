@@ -20,10 +20,12 @@ from quant_orchestrator.research_tools.options_experiment import (
     _OptionRetriever,
     _normalize_trade_windows,
     _option_feature_coverage,
+    _build_portfolio_fraction_trade_log,
     _selector_summaries,
     _run_optopsy_selector_backtests,
     _selected_basket_to_optopsy_raw,
     _selected_options_to_optopsy_raw,
+    _selected_actions_to_trade_rows,
     _source_family_diagnostics,
 )
 
@@ -124,7 +126,7 @@ def test_selector_backtest_uses_top_k_for_portfolio_fraction_sizing() -> None:
     assert summary.loc[0, "final_equity"] == 105_000.0
 
 
-def test_selector_summaries_include_global_ranker_and_rule_baselines() -> None:
+def test_selector_summaries_include_simplified_model_selectors() -> None:
     frame = pd.DataFrame(
         {
             "trade_id": ["t1", "t1", "t2", "t2"],
@@ -144,19 +146,12 @@ def test_selector_summaries_include_global_ranker_and_rule_baselines() -> None:
     summary, _, selected = _selector_summaries(frame)
 
     assert set(summary["selector"]) == {
+        "rule_atm_90d",
         "model_ranker",
-        "model_rank_ranker",
-        "model_blended_ranker",
-        "oracle_best_possible",
-        "fixed_near_atm",
-        "highest_liquidity",
-        "lowest_spread",
         "model_mv_basket",
-        "oracle_mv_basket",
     }
+    assert selected["rule_atm_90d"].set_index("trade_id").loc["t1", "dte_gap"] == 1.0
     assert selected["model_ranker"].set_index("trade_id").loc["t1", "pred_return"] == 0.2
-    assert selected["model_rank_ranker"].set_index("trade_id").loc["t2", "pred_rank_score"] == 0.9
-    assert selected["model_blended_ranker"].set_index("trade_id").loc["t2", "pred_rank_score"] == 0.9
 
 
 def test_selector_summaries_do_not_use_oracle_when_model_predictions_missing() -> None:
@@ -179,12 +174,7 @@ def test_selector_summaries_do_not_use_oracle_when_model_predictions_missing() -
     summary, _, selected = _selector_summaries(frame)
 
     assert selected["model_ranker"].empty
-    assert selected["model_rank_ranker"].empty
-    assert selected["model_blended_ranker"].empty
     assert summary.set_index("selector").loc["model_ranker", "trades"] == 0
-    assert summary.set_index("selector").loc["model_rank_ranker", "trades"] == 0
-    assert summary.set_index("selector").loc["model_blended_ranker", "trades"] == 0
-    assert selected["oracle_best_possible"].loc[0, "option_return"] == 1.0
 
 
 def test_selector_summaries_respect_mv_basket_limits() -> None:
@@ -304,9 +294,171 @@ def test_build_option_window_dataset_creates_standard_groups() -> None:
         config=OptionWindowBuildConfig(top_k=1, top_family_count=1, ranking_framework="zipline"),
     )
 
-    assert set(dataset.windows_by_group) == {"ensemble_mean", "top_feature_families", "all_feature_families"}
-    assert dataset.source_groups["top_feature_families"] == ("fmp.a",)
+    assert set(dataset.windows_by_group) == {"individual__fmp.a", "individual__fmp.b", "all_feature_families"}
+    assert dataset.source_groups["individual__fmp.a"] == ("fmp.a",)
     assert dataset.window_summary.set_index("group").loc["all_feature_families", "sources"] == 2
+
+
+def test_option_retriever_full_chain_actions_include_long_calls_and_short_puts_with_collateral_returns() -> None:
+    def fake_read(symbol, *, start_date, end_date, columns):
+        if pd.Timestamp(start_date) == pd.Timestamp("2025-01-02"):
+            return pd.DataFrame(
+                {
+                    "snapshot_date": [start_date, start_date],
+                    "contract_symbol": ["AAPL_C_100", "AAPL_P_100"],
+                    "expiration": [pd.Timestamp("2025-04-18"), pd.Timestamp("2025-04-18")],
+                    "strike": [100.0, 100.0],
+                    "option_type": ["call", "put"],
+                    "bid": [5.0, 4.0],
+                    "ask": [5.5, 4.5],
+                    "mid": [5.25, 4.25],
+                    "dte": [106, 106],
+                    "spread_pct": [0.1, 0.12],
+                }
+            )
+        return pd.DataFrame(
+            {
+                "snapshot_date": [start_date, start_date],
+                "contract_symbol": ["AAPL_C_100", "AAPL_P_100"],
+                "expiration": [pd.Timestamp("2025-04-18"), pd.Timestamp("2025-04-18")],
+                "strike": [100.0, 100.0],
+                "option_type": ["call", "put"],
+                "bid": [7.0, 2.0],
+                "ask": [7.5, 2.5],
+                "mid": [7.25, 2.25],
+                "dte": [88, 88],
+                "spread_pct": [0.07, 0.22],
+            }
+        )
+
+    class _Features:
+        def __init__(self, frame):
+            self.df = frame
+
+    def fake_features(frame, *, underlying_price=None, target_dte=None, compute_model_greeks=True):
+        out = frame.copy()
+        out["dte_gap"] = (out["dte"] - int(target_dte or 90)).abs()
+        out["abs_moneyness"] = (out["strike"] / float(underlying_price) - 1.0).abs()
+        return _Features(out)
+
+    prices = {
+        "AAPL": pd.DataFrame(
+            {"close": [100.0, 110.0]},
+            index=[pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-20")],
+        )
+    }
+    retriever = _OptionRetriever(
+        OptionRetrievalConfig(option_universe="full_chain_actions", target_dte=90, exit_lookback_days=0),
+        price_frames=prices,
+        read_option_chain_arctic=fake_read,
+        build_option_contract_features=fake_features,
+    )
+
+    rows = retriever.retrieve(
+        pd.Series(
+            {
+                "symbol": "AAPL",
+                "side": "long",
+                "entry_date": pd.Timestamp("2025-01-02"),
+                "exit_date": pd.Timestamp("2025-01-20"),
+            }
+        )
+    )
+
+    by_action = rows.set_index("option_action")
+    assert set(by_action.index) == {"buy_call", "sell_put"}
+    assert by_action.loc["buy_call", "option_return"] == pytest.approx((7.0 - 5.5) / 5.5)
+    assert by_action.loc["sell_put", "option_return"] == pytest.approx((4.0 - 2.5) / 100.0)
+    assert by_action.loc["sell_put", "return_denominator"] == pytest.approx(100.0)
+
+
+def test_selected_actions_to_trade_rows_uses_action_aware_denominator() -> None:
+    selected = pd.DataFrame(
+        {
+            "trade_id": ["t1"],
+            "symbol": ["AAPL"],
+            "entry_date": [pd.Timestamp("2025-01-02")],
+            "option_exit_date": [pd.Timestamp("2025-01-20")],
+            "expiration": [pd.Timestamp("2025-04-18")],
+            "return_denominator": [100.0],
+            "option_pnl": [1.5],
+            "option_return": [0.015],
+            "option_action": ["sell_put"],
+            "top_k": [5],
+        }
+    )
+
+    rows = _selected_actions_to_trade_rows(selected)
+
+    assert rows.loc[0, "entry_cost"] == pytest.approx(100.0)
+    assert rows.loc[0, "exit_proceeds"] == pytest.approx(101.5)
+    assert rows.loc[0, "pct_change"] == pytest.approx(0.015)
+
+
+def test_multiple_classifier_sources_trade_as_one_mean_planner_stream() -> None:
+    scores = pd.DataFrame(
+        {
+            "strategy_source": ["fmp.a", "fmp.b", "fmp.a", "fmp.b"] * 3,
+            "source": ["fmp"] * 12,
+            "family": ["a", "b", "a", "b"] * 3,
+            "symbol": ["AAPL", "AAPL", "MSFT", "MSFT"] * 3,
+            "date": ["2025-01-02"] * 4 + ["2025-01-03"] * 4 + ["2025-01-04"] * 4,
+            "long_score": [0.9, 0.8, 0.7, 0.6, 0.2, 0.3, 0.8, 0.7, 0.2, 0.3, 0.2, 0.3],
+            "short_score": [0.1, 0.2, 0.2, 0.1, 0.9, 0.8, 0.1, 0.2, 0.8, 0.7, 0.9, 0.8],
+            "long_exit_score": [0.9, 0.8, 0.7, 0.6, 0.2, 0.3, 0.8, 0.7, 0.2, 0.3, 0.2, 0.3],
+            "short_exit_score": [0.1, 0.2, 0.2, 0.1, 0.9, 0.8, 0.1, 0.2, 0.8, 0.7, 0.9, 0.8],
+            "ae_familiarity": [1.0] * 12,
+        }
+    )
+
+    trades = build_classifier_signal_trade_windows(
+        scores,
+        strategy_sources=("fmp.a", "fmp.b"),
+        variant="long_short",
+        top_k=1,
+        entry_threshold=0.5,
+        exit_threshold=0.5,
+    )
+
+    assert len(trades) == 2
+    assert trades["strategy_source"].nunique() == 1
+    assert trades["strategy_source"].iloc[0] == "ensemble_2_sources"
+    assert trades["entry_date"].tolist() == [pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03")]
+    assert trades["side"].tolist() == ["long", "short"]
+
+
+def test_classifier_trade_windows_require_unanimous_selected_classifier_entry_and_exit_on_any_disagreement() -> None:
+    scores = pd.DataFrame(
+        {
+            "strategy_source": ["fmp.a", "fmp.b", "fmp.a", "fmp.b", "fmp.a", "fmp.b"],
+            "source": ["fmp"] * 6,
+            "family": ["a", "b"] * 3,
+            "symbol": ["AAPL", "AAPL"] * 3,
+            "date": ["2025-01-02", "2025-01-02", "2025-01-03", "2025-01-03", "2025-01-04", "2025-01-04"],
+            "long_score": [0.9, 0.9, 0.9, 0.8, 0.9, 0.9],
+            "short_score": [0.1, 0.9, 0.1, 0.2, 0.1, 0.9],
+            "long_exit_score": [0.9, 0.1, 0.9, 0.8, 0.9, 0.1],
+            "short_exit_score": [0.1, 0.9, 0.1, 0.2, 0.1, 0.9],
+            "long_agree_count": [1, 0, 1, 1, 1, 0],
+            "short_agree_count": [0, 1, 0, 0, 0, 1],
+            "model_count": [1] * 6,
+            "ae_familiarity": [1.0] * 6,
+        }
+    )
+
+    trades = build_classifier_signal_trade_windows(
+        scores,
+        strategy_sources=("fmp.a", "fmp.b"),
+        variant="long_short",
+        top_k=1,
+        entry_threshold=0.5,
+        exit_threshold=0.5,
+    )
+
+    assert len(trades) == 1
+    assert trades.loc[0, "entry_date"] == pd.Timestamp("2025-01-03")
+    assert trades.loc[0, "exit_date"] == pd.Timestamp("2025-01-04")
+    assert trades.loc[0, "side"] == "long"
 
 
 def test_option_retriever_caches_repeated_symbol_date_chain_reads() -> None:
@@ -510,6 +662,67 @@ def test_classifier_trade_windows_require_top_k_for_option_sizing() -> None:
 
     with pytest.raises(KeyError, match="top_k"):
         _normalize_trade_windows(frame)
+
+
+def test_portfolio_fraction_option_log_reserves_cash_across_trading_days() -> None:
+    trades = pd.DataFrame(
+        {
+            "trade_id": ["t1", "t2"],
+            "underlying_symbol": ["AAPL", "MSFT"],
+            "entry_date": [pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03")],
+            "exit_date": [pd.Timestamp("2025-01-10"), pd.Timestamp("2025-01-13")],
+            "expiration": [pd.Timestamp("2025-02-21"), pd.Timestamp("2025-02-21")],
+            "entry_cost": [10.0, 10.0],
+            "exit_proceeds": [20.0, 20.0],
+            "pct_change": [1.0, 1.0],
+            "description": ["call", "call"],
+            "exit_type": ["signal_exit", "signal_exit"],
+            "top_k": [1, 1],
+        }
+    )
+
+    log = _build_portfolio_fraction_trade_log(
+        trades,
+        capital=1_000.0,
+        multiplier=100,
+        max_positions=2,
+        default_fraction=1.0,
+        top_k_column="top_k",
+    )
+
+    assert len(log) == 1
+    assert log.loc[0, "trade_id"] == "t1"
+    assert log.loc[0, "dollar_cost"] == 1_000.0
+    assert log.loc[0, "equity"] == 2_000.0
+
+
+def test_portfolio_fraction_option_log_maps_weekend_exit_to_previous_business_day() -> None:
+    trades = pd.DataFrame(
+        {
+            "trade_id": ["t1"],
+            "underlying_symbol": ["AAPL"],
+            "entry_date": [pd.Timestamp("2025-01-02")],
+            "exit_date": [pd.Timestamp("2025-01-11")],
+            "expiration": [pd.Timestamp("2025-01-11")],
+            "entry_cost": [10.0],
+            "exit_proceeds": [11.0],
+            "pct_change": [0.1],
+            "description": ["call"],
+            "exit_type": ["expiration"],
+            "top_k": [1],
+        }
+    )
+
+    log = _build_portfolio_fraction_trade_log(
+        trades,
+        capital=1_000.0,
+        multiplier=100,
+        max_positions=1,
+        default_fraction=1.0,
+        top_k_column="top_k",
+    )
+
+    assert log.loc[0, "exit_date"] == pd.Timestamp("2025-01-10")
 
 
 def test_option_feature_coverage_reports_greeks_and_iv_rates() -> None:

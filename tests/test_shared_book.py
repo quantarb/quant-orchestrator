@@ -94,6 +94,34 @@ def test_shared_book_can_use_separate_entry_and_exit_scores() -> None:
     assert trades["action"].tolist() == ["enter_long", "exit_long"]
 
 
+def test_shared_book_optimal_planner_requires_unanimous_classifier_entry_and_exits_on_any_disagreement() -> None:
+    scores = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+            "symbol": ["A", "A", "A"],
+            "long_score": [0.80, 0.80, 0.80],
+            "short_score": [0.20, 0.20, 0.20],
+            "long_exit_score": [0.80, 0.80, 0.80],
+            "short_exit_score": [0.20, 0.20, 0.20],
+            "long_agree_count": [1, 2, 1],
+            "short_agree_count": [1, 0, 1],
+            "model_count": [2, 2, 2],
+        }
+    )
+
+    weights, trades = build_shared_book_weights(
+        scores,
+        symbols=["A"],
+        dates=pd.DatetimeIndex(["2024-01-02", "2024-01-03", "2024-01-04"]),
+        top_k=1,
+        variant="long_only",
+        entry_threshold=0.5,
+    )
+
+    assert weights["A"].tolist() == [0.0, 1.0, 0.0]
+    assert trades["action"].tolist() == ["enter_long", "exit_long"]
+
+
 def test_shared_book_costs_apply_to_turnover() -> None:
     weights = pd.DataFrame(
         {"A": [1.0, 0.0]},

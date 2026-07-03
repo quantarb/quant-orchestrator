@@ -1,0 +1,16 @@
+ops:
+  resolve_thetadata_options_backfill_symbols:
+    config:
+      symbols: AAPL,MSFT
+      symbols_file: ""
+  backfill_thetadata_options_symbol:
+    config:
+      start_date: "2026-06-24"
+      end_date: "2026-06-30"
+      max_dte: 90
+      strike_range: 10
+      backfill_window_days: 7
+      fallback_window_days: 1
+      request_sleep: 0.0
+      overwrite: false
+      include_non_us: false

@@ -1,0 +1,30 @@
+execution:
+  config:
+    multiprocess:
+      max_concurrent: 4
+ops:
+  resolve_thetadata_options_backfill_symbols:
+    config:
+      symbols: ""
+      symbols_file: /home/jlee153232/.quant-warehouse/logs/thetadata-options-10b-symbols-20260702T212537Z.txt
+      min_market_cap: 10000000000
+      country: US
+      exchanges: NASDAQ,NYSE,AMEX
+      is_etf: false
+      is_fund: false
+      is_active: true
+      all_share_classes: false
+      limit: 10000
+  backfill_thetadata_options_symbol:
+    config:
+      start_date: "2018-01-02"
+      end_date: "2026-06-30"
+      max_dte:
+      strike_range:
+      require_bid_ask: false
+      min_ask: 0.0
+      backfill_window_days: 7
+      fallback_window_days: 1
+      request_sleep: 0.0
+      overwrite: true
+      include_non_us: false

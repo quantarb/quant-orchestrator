@@ -174,6 +174,27 @@ class LatentAutoencoderIndex:
             index=frame.index,
         )
 
+    def transform_features(self, frame: pd.DataFrame, *, prefix: str = "ae") -> pd.DataFrame:
+        """Return compact autoencoder-derived features for classifier training."""
+
+        x = _standardize_apply(frame, self.features, self.center, self.scale, self.lower, self.upper)
+        err = _autoencoder_recon_error(self.model, x, device=self.device, batch_size=self.config.batch_size)
+        latent = _autoencoder_latent(self.model, x, device=self.device, batch_size=self.config.batch_size)
+        latent_distance, _ = self.nn_index.kneighbors(latent, n_neighbors=1, return_distance=True)
+        latent_distance = latent_distance[:, 0].astype("float64")
+        familiarity = 1.0 / (1.0 + (latent_distance / self.latent_distance_cutoff))
+        out = pd.DataFrame(
+            {
+                f"{prefix}_familiarity": np.clip(familiarity, 0.0, 1.0).astype("float64"),
+                f"{prefix}_recon_error": err.astype("float64"),
+                f"{prefix}_latent_distance": latent_distance,
+            },
+            index=frame.index,
+        )
+        for idx in range(latent.shape[1]):
+            out[f"{prefix}_latent_{idx}"] = latent[:, idx].astype("float64")
+        return out
+
     def metadata(self) -> dict[str, float | int | str]:
         selected = next((row for row in self.architecture_diagnostics if row.get("selected") == 1), {})
         return {

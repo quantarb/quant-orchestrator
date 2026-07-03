@@ -32,6 +32,7 @@ cuda = [
 ]
 backtesting = [
     "backtesting>=0.3.3",
+    "lean>=1.0.0",
     "zipline-reloaded==3.1.1",
     "nautilus-trader==1.228.0",
 ]
@@ -44,6 +45,7 @@ dev = [
 ]
 all = [
     "backtesting>=0.3.3",
+    "lean>=1.0.0",
     "scikit-learn>=1.4",
     "flair>=0.15,<0.16",
     "sentence-transformers>=3",
@@ -66,9 +68,11 @@ sentence_transformers = "quant_orchestrator.platforms.ml_frameworks.sentence_tra
 
 [project.entry-points."quant_orchestrator.backtesting_framework"]
 backtesting_py = "quant_orchestrator.platforms.backtesting_frameworks.backtesting_py:backtesting_py_provider"
+lean = "quant_orchestrator.platforms.backtesting_frameworks.lean:lean_provider"
 zipline = "quant_orchestrator.platforms.backtesting_frameworks.zipline:zipline_provider"
 nautilus = "quant_orchestrator.platforms.backtesting_frameworks.nautilus:nautilus_provider"
 optopsy = "quant_orchestrator.platforms.backtesting_frameworks.optopsy:optopsy_provider"
+panel_weight = "quant_orchestrator.platforms.backtesting_frameworks.panel_weight:panel_weight_provider"
 
 [tool.hatch.build.targets.wheel]
 packages = ["quant_orchestrator"]

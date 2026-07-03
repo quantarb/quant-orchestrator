@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from pathlib import Path
 import pickle
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -29,6 +29,7 @@ class SharedSplitConfig:
 
 @dataclass(frozen=True)
 class OptionRetrievalConfig:
+    option_universe: Literal["filtered", "full_chain_actions"] = "filtered"
     min_dte: int = 30
     max_dte: int = 90
     target_dte: int = 45
@@ -223,11 +224,7 @@ def run_trade_window_option_experiment(
     config: OracleOptionExperimentConfig,
     trade_windows: pd.DataFrame,
 ) -> OracleOptionExperimentResult:
-    """Run the option selector from externally generated equity trade windows.
-
-    ``trade_windows`` should contain actual strategy events only. It must not
-    include daily non-event rows.
-    """
+    """Run the option selector from externally generated equity trade windows."""
 
     started = perf_counter()
     _prepare_quant_warehouse_import(config.quant_warehouse_root)
@@ -280,8 +277,9 @@ def build_classifier_signal_trade_windows(
 ) -> pd.DataFrame:
     """Convert classifier score rows into option-tradable equity windows.
 
-    The output contains actual entry/exit windows only. It does not create
-    negative/non-event training rows.
+    The input must be the full scored trading calendar for the strategy
+    universe. Models are trained on events, but the strategy must be scored and
+    replayed on every trading day so exits and new entries are not skipped.
     """
 
     if strategy_scores.empty:
@@ -304,6 +302,7 @@ def build_classifier_signal_trade_windows(
         scores = scores.loc[scores["strategy_source"].astype(str).isin(wanted)].copy()
     if scores.empty:
         return pd.DataFrame()
+    scores = _planner_score_frame_for_sources(scores, strategy_sources=strategy_sources)
 
     rows: list[dict[str, Any]] = []
     grouped = scores.sort_values(["strategy_source", "date", "symbol"]).groupby("strategy_source", sort=True)
@@ -322,9 +321,33 @@ def build_classifier_signal_trade_windows(
                     row = row.iloc[0]
                 long_exit = _nan_float(row["long_exit_score"])
                 short_exit = _nan_float(row["short_exit_score"])
-                should_exit = (position["side"] == "long" and short_exit > float(exit_threshold)) or (
-                    position["side"] == "short" and long_exit > float(exit_threshold)
-                )
+                if {"long_agree_count", "short_agree_count", "model_count"}.issubset(day.columns):
+                    model_count = _nan_float(row["model_count"])
+                    long_agree = _nan_float(row["long_agree_count"])
+                    short_agree = _nan_float(row["short_agree_count"])
+                    should_exit = (
+                        position["side"] == "long"
+                        and pd.notna(model_count)
+                        and model_count > 0
+                        and long_agree < model_count
+                    ) or (
+                        position["side"] == "short"
+                        and pd.notna(model_count)
+                        and model_count > 0
+                        and short_agree < model_count
+                    )
+                else:
+                    should_exit = (
+                        position["side"] == "long"
+                        and pd.notna(short_exit)
+                        and pd.notna(long_exit)
+                        and short_exit > long_exit
+                    ) or (
+                        position["side"] == "short"
+                        and pd.notna(long_exit)
+                        and pd.notna(short_exit)
+                        and long_exit >= short_exit
+                    )
                 if should_exit:
                     rows.append(_classifier_trade_window_row(position, exit_date=pd.Timestamp(date), exit_score=short_exit if position["side"] == "long" else long_exit))
                     del positions[symbol]
@@ -376,7 +399,7 @@ def build_option_window_dataset(
     *,
     backtest_summary: pd.DataFrame | None = None,
     config: OptionWindowBuildConfig = OptionWindowBuildConfig(),
-    include_groups: tuple[str, ...] = ("ensemble_mean", "top_feature_families", "all_feature_families"),
+    include_groups: tuple[str, ...] = ("individual_feature_families", "all_feature_families"),
 ) -> OptionWindowDataset:
     """Build comparable option-trade-window datasets from classifier scores."""
 
@@ -396,12 +419,19 @@ def build_option_window_dataset(
         else pd.DataFrame()
     )
     top_sources = tuple(ranking["strategy_source"].head(config.top_family_count).astype(str).tolist()) if not ranking.empty else all_sources[: config.top_family_count]
-    candidate_groups = {
-        "ensemble_mean": ("ensemble_mean",),
-        "top_feature_families": top_sources,
-        "all_feature_families": all_sources,
+    candidate_groups = {"all_feature_families": all_sources}
+    if "ensemble_mean" in include_groups:
+        candidate_groups["ensemble_mean"] = ("ensemble_mean",)
+    if "top_feature_families" in include_groups:
+        candidate_groups["top_feature_families"] = top_sources
+    if "individual_feature_families" in include_groups:
+        for source in all_sources:
+            candidate_groups[f"individual__{source}"] = (source,)
+    source_groups = {
+        name: sources
+        for name, sources in candidate_groups.items()
+        if name in include_groups or (name.startswith("individual__") and "individual_feature_families" in include_groups)
     }
-    source_groups = {name: candidate_groups[name] for name in include_groups if name in candidate_groups}
     windows_by_group: dict[str, pd.DataFrame] = {}
     summary_rows = []
     for name, sources in source_groups.items():
@@ -482,17 +512,81 @@ def _classifier_entry_candidates(
             continue
         long_score = _nan_float(getattr(raw, "long_score", np.nan))
         short_score = _nan_float(getattr(raw, "short_score", np.nan))
+        long_direction = _nan_float(getattr(raw, "long_exit_score", long_score))
+        short_direction = _nan_float(getattr(raw, "short_exit_score", short_score))
+        classifier_long = pd.notna(long_direction) and pd.notna(short_direction) and long_direction >= short_direction
+        classifier_short = pd.notna(long_direction) and pd.notna(short_direction) and short_direction > long_direction
+        model_count = _nan_float(getattr(raw, "model_count", np.nan))
+        long_agree = _nan_float(getattr(raw, "long_agree_count", np.nan))
+        short_agree = _nan_float(getattr(raw, "short_agree_count", np.nan))
+        if pd.notna(model_count) and model_count > 0 and pd.notna(long_agree) and pd.notna(short_agree):
+            classifier_long = bool(long_agree == model_count)
+            classifier_short = bool(short_agree == model_count)
         base = {
             "symbol": symbol,
             "ae_familiarity": ae_familiarity,
             "ae_recon_error": _nan_float(getattr(raw, "ae_recon_error", np.nan)),
             "ae_latent_distance": _nan_float(getattr(raw, "ae_latent_distance", np.nan)),
         }
-        if variant in {"long_only", "long_short"} and pd.notna(long_score) and long_score > entry_threshold:
+        if variant in {"long_only", "long_short"} and classifier_long and _entry_score_ok(long_score, entry_threshold):
             rows.append({**base, "side": "long", "entry_score": long_score, "opposite_score": short_score})
-        if variant in {"short_only", "long_short"} and pd.notna(short_score) and short_score > entry_threshold:
+        if variant in {"short_only", "long_short"} and classifier_short and _entry_score_ok(short_score, entry_threshold):
             rows.append({**base, "side": "short", "entry_score": short_score, "opposite_score": long_score})
     return sorted(rows, key=lambda row: (row["entry_score"], -row.get("opposite_score", 0.0)), reverse=True)
+
+
+def _planner_score_frame_for_sources(scores: pd.DataFrame, *, strategy_sources: tuple[str, ...] | None) -> pd.DataFrame:
+    sources = tuple(scores["strategy_source"].dropna().astype(str).unique().tolist())
+    if len(sources) <= 1:
+        return scores.copy()
+    numeric_aggs = {
+        out_col: (in_col, "mean")
+        for out_col, in_col in {
+            "long_score": "long_score",
+            "short_score": "short_score",
+            "long_exit_score": "long_exit_score",
+            "short_exit_score": "short_exit_score",
+            "ae_familiarity": "ae_familiarity",
+            "ae_recon_error": "ae_recon_error",
+            "ae_latent_distance": "ae_latent_distance",
+        }.items()
+        if in_col in scores.columns
+    }
+    optional = {
+        "classifier_long_score": ("classifier_long_score", "mean"),
+        "classifier_short_score": ("classifier_short_score", "mean"),
+        "long_agree_count": ("long_agree_count", "sum"),
+        "short_agree_count": ("short_agree_count", "sum"),
+        "model_count": ("strategy_source", "nunique"),
+    }
+    for col, agg in optional.items():
+        if agg[0] in scores.columns:
+            numeric_aggs[col] = agg
+    out = scores.groupby(["symbol", "date"], as_index=False).agg(**numeric_aggs)
+    label = "ensemble_mean" if strategy_sources is None else "ensemble_" + str(len(sources)) + "_sources"
+    out["source"] = "ensemble"
+    out["family"] = "mean"
+    out["strategy_source"] = label
+    out["net_score"] = out["long_score"] - out["short_score"]
+    return out
+
+
+def _entry_score_ok(value: float, threshold: float) -> bool:
+    return bool(pd.notna(value) and np.isfinite(float(value)) and float(value) > float(threshold))
+
+
+def _option_action_for_signal(side: str, option_type: str) -> str | None:
+    side = str(side).lower()
+    option_type = "call" if str(option_type).lower().startswith("c") else "put"
+    if side == "long" and option_type == "call":
+        return "buy_call"
+    if side == "long" and option_type == "put":
+        return "sell_put"
+    if side == "short" and option_type == "call":
+        return "sell_call"
+    if side == "short" and option_type == "put":
+        return "buy_put"
+    return None
 
 
 def _classifier_trade_window_row(position: dict[str, Any], *, exit_date: pd.Timestamp, exit_score: float) -> dict[str, Any]:
@@ -651,11 +745,22 @@ class _OptionRetriever:
         entry_date = pd.Timestamp(trade["entry_date"]).normalize()
         equity_exit_date = pd.Timestamp(trade["exit_date"]).normalize()
         realized_holding_days = max(0, int((equity_exit_date - entry_date).days))
-        option_type = "call" if side == "long" else "put"
         spot = self._underlying_close(symbol, entry_date)
         entry_chain = self._load_day_chain(symbol, entry_date)
         if entry_chain.empty or spot is None or spot <= 0:
             return pd.DataFrame()
+        if self.config.option_universe == "full_chain_actions":
+            return self._retrieve_full_chain_actions(
+                trade=trade,
+                symbol=symbol,
+                side=side,
+                entry_date=entry_date,
+                equity_exit_date=equity_exit_date,
+                realized_holding_days=realized_holding_days,
+                spot=float(spot),
+                entry_chain=entry_chain,
+            )
+        option_type = "call" if side == "long" else "put"
         candidates = entry_chain.loc[entry_chain["option_type"].astype(str).str.lower().str.startswith(option_type[0])].copy()
         candidates["underlying_spot_entry"] = spot
         candidates["moneyness"] = candidates["strike"] / spot - 1.0
@@ -694,20 +799,28 @@ class _OptionRetriever:
                 continue
             exit_snapshot_date, exit_mid = exit_row
             entry_mid = float(row.mid)
+            entry_price = float(getattr(row, "ask", entry_mid))
+            exit_price = float(exit_mid)
             row_payload = {
                     "trade_id": trade.get("trade_id", f"{symbol}|{entry_date.date()}|{side}"),
                     "symbol": symbol,
                     "side": side,
+                    "equity_signal_side": side,
                     "entry_date": entry_date,
                     "equity_exit_date": equity_exit_date,
                     "option_exit_date": exit_snapshot_date,
                     "expiration": pd.Timestamp(row.expiration).normalize(),
                     "contract_symbol": row.contract_symbol,
                     "option_type": option_type,
+                    "option_action": "buy_call" if option_type == "call" else "buy_put",
                     "strike": float(row.strike),
                     "entry_mid": entry_mid,
                     "exit_mid": float(exit_mid),
-                    "option_return": float(exit_mid) / entry_mid - 1.0,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "option_pnl": exit_price - entry_price,
+                    "return_denominator": entry_price,
+                    "option_return": (exit_price - entry_price) / entry_price if entry_price > 0 else np.nan,
                     "allocation_fraction": _nan_float(getattr(row, "allocation_fraction", np.nan)),
                     "allocation_budget": _nan_float(getattr(row, "allocation_budget", np.nan)),
                     "affordable_contracts": _nan_float(getattr(row, "affordable_contracts", np.nan)),
@@ -726,6 +839,123 @@ class _OptionRetriever:
                 value = trade.get(col)
                 if value is not None and not pd.isna(value):
                     row_payload[col] = str(value)
+            row_payload.update(_row_feature_payload(row))
+            rows.append(row_payload)
+        return pd.DataFrame(rows)
+
+    def _retrieve_full_chain_actions(
+        self,
+        *,
+        trade: pd.Series,
+        symbol: str,
+        side: str,
+        entry_date: pd.Timestamp,
+        equity_exit_date: pd.Timestamp,
+        realized_holding_days: int,
+        spot: float,
+        entry_chain: pd.DataFrame,
+    ) -> pd.DataFrame:
+        candidates = entry_chain.copy()
+        candidates["option_type"] = candidates["option_type"].astype(str).str.lower().str.strip()
+        candidates = candidates.loc[candidates["option_type"].str.startswith(("c", "p"))].copy()
+        if candidates.empty:
+            return candidates
+        candidates["option_type"] = np.where(candidates["option_type"].str.startswith("c"), "call", "put")
+        candidates["underlying_spot_entry"] = float(spot)
+        candidates["moneyness"] = pd.to_numeric(candidates["strike"], errors="coerce") / float(spot) - 1.0
+        candidates["abs_moneyness"] = candidates["moneyness"].abs()
+        for col in ("bid", "ask", "mid", "strike"):
+            candidates[col] = pd.to_numeric(candidates[col], errors="coerce")
+        if "dte" not in candidates.columns:
+            candidates["dte"] = (
+                pd.to_datetime(candidates["expiration"], errors="coerce").dt.normalize() - entry_date
+            ).dt.days
+        candidates = candidates.loc[
+            candidates["contract_symbol"].astype(str).ne("")
+            & candidates["expiration"].notna()
+            & candidates["strike"].gt(0)
+            & candidates["bid"].ge(0)
+            & candidates["ask"].gt(0)
+            & candidates["ask"].ge(candidates["bid"])
+            & pd.to_numeric(candidates["dte"], errors="coerce").gt(0)
+        ].copy()
+        if candidates.empty:
+            return candidates
+        cfg = self.config
+        candidates["dte_gap"] = (pd.to_numeric(candidates["dte"], errors="coerce") - cfg.target_dte).abs()
+        candidates["liquidity_score"] = (
+            candidates.get("volume", pd.Series(0, index=candidates.index)).fillna(0)
+            + candidates.get("open_interest", pd.Series(0, index=candidates.index)).fillna(0) / 100.0
+        )
+        candidates = self.build_option_contract_features(
+            candidates,
+            underlying_price=spot,
+            target_dte=cfg.target_dte,
+            compute_model_greeks=True,
+        ).df
+        rows = []
+        for row in candidates.itertuples(index=False):
+            option_type = "call" if str(row.option_type).lower().startswith("c") else "put"
+            option_action = _option_action_for_signal(side, option_type)
+            if option_action is None:
+                continue
+            exit_prices = self._price_exit_prices(symbol, equity_exit_date, row, option_type)
+            if exit_prices is None:
+                continue
+            exit_snapshot_date, exit_bid, exit_ask, exit_mid = exit_prices
+            entry_bid = _nan_float(getattr(row, "bid", np.nan))
+            entry_ask = _nan_float(getattr(row, "ask", np.nan))
+            if option_action.startswith("buy_"):
+                entry_price = entry_ask
+                exit_price = exit_bid
+                pnl = exit_price - entry_price
+                denominator = entry_price
+            else:
+                entry_price = entry_bid
+                exit_price = exit_ask
+                pnl = entry_price - exit_price
+                denominator = float(row.strike) if option_action == "sell_put" else float(spot)
+            if not np.isfinite(entry_price) or not np.isfinite(exit_price) or not np.isfinite(denominator) or denominator <= 0:
+                continue
+            row_payload = {
+                "trade_id": trade.get("trade_id", f"{symbol}|{entry_date.date()}|{side}"),
+                "symbol": symbol,
+                "side": side,
+                "equity_signal_side": side,
+                "entry_date": entry_date,
+                "equity_exit_date": equity_exit_date,
+                "option_exit_date": exit_snapshot_date,
+                "expiration": pd.Timestamp(row.expiration).normalize(),
+                "contract_symbol": row.contract_symbol,
+                "option_type": option_type,
+                "option_action": option_action,
+                "strike": float(row.strike),
+                "entry_mid": _nan_float(getattr(row, "mid", np.nan)),
+                "exit_mid": float(exit_mid),
+                "entry_bid": entry_bid,
+                "entry_ask": entry_ask,
+                "exit_bid": float(exit_bid),
+                "exit_ask": float(exit_ask),
+                "entry_price": float(entry_price),
+                "exit_price": float(exit_price),
+                "option_pnl": float(pnl),
+                "return_denominator": float(denominator),
+                "option_return": float(pnl) / float(denominator),
+                "realized_holding_days": realized_holding_days,
+                "realized_underlying_trade_return": pd.to_numeric(trade.get("ret_dec"), errors="coerce"),
+            }
+            for source_col, target_col in (
+                ("planned_holding_days", "planned_holding_days"),
+                ("equity_signal_score", "equity_signal_score"),
+                ("equity_signal_rank", "equity_signal_rank"),
+            ):
+                value = trade.get(source_col)
+                if value is not None and not pd.isna(value):
+                    row_payload[target_col] = _nan_float(value)
+            for col in ("source_family", "strategy_source", "source", "family", "top_k", "variant"):
+                value = trade.get(col)
+                if value is not None and not pd.isna(value):
+                    row_payload[col] = value if col == "top_k" else str(value)
             row_payload.update(_row_feature_payload(row))
             rows.append(row_payload)
         return pd.DataFrame(rows)
@@ -754,21 +984,34 @@ class _OptionRetriever:
         return work.loc[affordable].copy()
 
     def _price_exit(self, symbol: str, equity_exit_date: pd.Timestamp, row, option_type: str) -> tuple[pd.Timestamp, float] | None:
+        prices = self._price_exit_prices(symbol, equity_exit_date, row, option_type)
+        if prices is None:
+            return None
+        exit_snapshot_date, _bid, _ask, mid = prices
+        return exit_snapshot_date, mid
+
+    def _price_exit_prices(self, symbol: str, equity_exit_date: pd.Timestamp, row, option_type: str) -> tuple[pd.Timestamp, float, float, float] | None:
         expiration = pd.Timestamp(row.expiration).normalize()
         target_exit = min(pd.Timestamp(equity_exit_date).normalize(), expiration)
         exit_snapshot_date, exit_chain = self._load_nearest_exit_chain(symbol, target_exit)
         if not exit_chain.empty:
             match = exit_chain.loc[exit_chain["contract_symbol"].astype(str).eq(str(row.contract_symbol))]
             if not match.empty:
+                bid = pd.to_numeric(match.iloc[0].get("bid"), errors="coerce")
+                ask = pd.to_numeric(match.iloc[0].get("ask"), errors="coerce")
                 mid = pd.to_numeric(match.iloc[0].get("mid"), errors="coerce")
+                if pd.isna(mid) and pd.notna(bid) and pd.notna(ask):
+                    mid = (float(bid) + float(ask)) / 2.0
                 if pd.notna(mid):
-                    return pd.Timestamp(exit_snapshot_date).normalize(), float(mid)
+                    bid = mid if pd.isna(bid) else bid
+                    ask = mid if pd.isna(ask) else ask
+                    return pd.Timestamp(exit_snapshot_date).normalize(), float(bid), float(ask), float(mid)
         if target_exit >= expiration:
             close = self._underlying_close(symbol, target_exit)
             if close is None:
                 return None
-            exit_mid = max(close - float(row.strike), 0.0) if option_type == "call" else max(float(row.strike) - close, 0.0)
-            return target_exit, float(exit_mid)
+            intrinsic = max(close - float(row.strike), 0.0) if option_type == "call" else max(float(row.strike) - close, 0.0)
+            return target_exit, float(intrinsic), float(intrinsic), float(intrinsic)
         return None
 
     def _load_nearest_exit_chain(self, symbol: str, target_date: pd.Timestamp) -> tuple[pd.Timestamp | None, pd.DataFrame]:
@@ -1050,7 +1293,7 @@ def _train_option_ranker(
     if len(train_panel) < 50 or eval_panel.empty:
         return None, {}, eval_scored
     features_num = option_ranker_feature_columns(train_panel)
-    features_cat = ["symbol", "side", "option_type", *config.categorical_trade_context_columns]
+    features_cat = ["symbol", "equity_signal_side", "option_type", "option_action", *config.categorical_trade_context_columns]
     numeric = [col for col in features_num if col in train_panel.columns and train_panel[col].notna().any()]
     categorical = [col for col in features_cat if col in train_panel.columns and train_panel[col].notna().any()]
     def make_model(seed: int) -> Pipeline:
@@ -1150,7 +1393,7 @@ def _train_mv_basket_ranker(
     if not config.mv_basket.enabled or "mv_weight" not in train_panel.columns or len(train_panel) < 50 or eval_panel.empty:
         return None, {}, eval_scored
     features_num = option_ranker_feature_columns(train_panel)
-    features_cat = ["symbol", "side", "option_type", *config.categorical_trade_context_columns]
+    features_cat = ["symbol", "equity_signal_side", "option_type", "option_action", *config.categorical_trade_context_columns]
     numeric = [col for col in features_num if col in train_panel.columns and train_panel[col].notna().any()]
     categorical = [col for col in features_cat if col in train_panel.columns and train_panel[col].notna().any()]
     if not numeric and not categorical:
@@ -1230,19 +1473,7 @@ def _selector_summaries(
             {"spread_pct": -1.0, "dte_gap": -0.1, "abs_moneyness": -0.1},
         )
     selected_model = _choose_top_per_trade(fixed_work, "pred_return")
-    selected_rank_model = _choose_top_per_trade(fixed_work, "pred_rank_score")
-    selected_blended_model = _choose_top_per_trade(fixed_work, "pred_blended_rank_score")
-    selected_oracle = _choose_top_per_trade(fixed_work, "option_return")
-    selected_fixed = _choose_top_per_trade(fixed_work, "fixed_near_atm_score")
-    selected_liquidity = _choose_top_per_trade(fixed_work, "highest_liquidity_score")
-    selected_lowest_spread = _choose_top_per_trade(fixed_work, "lowest_spread_score")
-    selected_mv_oracle = _choose_weighted_basket_per_trade(
-        eval_panel,
-        "mv_weight",
-        selector_name="oracle_mv_basket",
-        max_legs=mv_basket_config.max_legs if mv_basket_config else None,
-        min_weight=0.0,
-    )
+    selected_rule_atm = _choose_top_per_trade(fixed_work, "fixed_near_atm_score")
     selected_mv_model = _choose_weighted_basket_per_trade(
         eval_panel,
         "pred_mv_weight",
@@ -1252,15 +1483,9 @@ def _selector_summaries(
     )
     selector_summary = pd.DataFrame(
         [
+            _summarize_selected("rule_atm_90d", selected_rule_atm),
             _summarize_selected("model_ranker", selected_model),
-            _summarize_selected("model_rank_ranker", selected_rank_model),
-            _summarize_selected("model_blended_ranker", selected_blended_model),
-            _summarize_selected("oracle_best_possible", selected_oracle),
-            _summarize_selected("fixed_near_atm", selected_fixed),
-            _summarize_selected("highest_liquidity", selected_liquidity),
-            _summarize_selected("lowest_spread", selected_lowest_spread),
             _summarize_basket("model_mv_basket", selected_mv_model),
-            _summarize_basket("oracle_mv_basket", selected_mv_oracle),
         ]
     )
     if selected_model.empty:
@@ -1280,15 +1505,9 @@ def _selector_summaries(
         selector_summary,
         symbol_summary,
         {
+            "rule_atm_90d": selected_rule_atm,
             "model_ranker": selected_model,
-            "model_rank_ranker": selected_rank_model,
-            "model_blended_ranker": selected_blended_model,
-            "oracle_best_possible": selected_oracle,
-            "fixed_near_atm": selected_fixed,
-            "highest_liquidity": selected_liquidity,
-            "lowest_spread": selected_lowest_spread,
             "model_mv_basket": selected_mv_model,
-            "oracle_mv_basket": selected_mv_oracle,
         },
     )
 
@@ -1492,6 +1711,8 @@ def _run_optopsy_selected_option_backtest(
 ):
     if selected.empty:
         return None
+    if "option_action" in selected.columns:
+        return _run_action_aware_selected_option_backtest(selected, config=config)
     import optopsy as op
 
     raw = _selected_basket_to_optopsy_raw(selected) if "basket_weight" in selected.columns else _selected_options_to_optopsy_raw(selected)
@@ -1520,6 +1741,94 @@ def _run_optopsy_selected_option_backtest(
     return simulation
 
 
+def _run_action_aware_selected_option_backtest(
+    selected: pd.DataFrame,
+    *,
+    config: OptopsyExecutionConfig,
+):
+    trades = _selected_actions_to_trade_rows(selected)
+    if trades.empty:
+        return None
+    trade_log = _build_portfolio_fraction_trade_log(
+        trades,
+        capital=float(config.capital),
+        multiplier=int(config.multiplier),
+        max_positions=int(config.max_positions),
+        default_fraction=_default_option_allocation_fraction(config),
+        top_k_column=str(config.top_k_column),
+    )
+    import optopsy.simulator as optopsy_simulator
+
+    summary = optopsy_simulator._compute_summary(trade_log, float(config.capital))
+    equity_curve = trade_log["equity"].copy() if not trade_log.empty else pd.Series(dtype=float, name="equity")
+    if not trade_log.empty and "exit_date" in trade_log:
+        equity_curve.index = pd.to_datetime(trade_log["exit_date"])
+    return SimpleNamespace(trade_log=trade_log, equity_curve=equity_curve, summary=summary)
+
+
+def _selected_actions_to_trade_rows(selected: pd.DataFrame) -> pd.DataFrame:
+    if selected.empty:
+        return pd.DataFrame()
+    required = ["symbol", "entry_date", "option_exit_date", "expiration", "return_denominator", "option_pnl", "option_return"]
+    missing = [col for col in required if col not in selected.columns]
+    if missing:
+        raise ValueError(f"selected action-aware option trades missing columns: {missing}")
+    rows = []
+    work = selected.copy()
+    if "basket_weight" in work.columns:
+        work["basket_weight"] = pd.to_numeric(work["basket_weight"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        for trade_id, group in work.groupby("trade_id", sort=False):
+            weights = group["basket_weight"]
+            total = float(weights.sum())
+            if total <= 0:
+                continue
+            weights = weights / total
+            denominators = pd.to_numeric(group["return_denominator"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            pnls = pd.to_numeric(group["option_pnl"], errors="coerce").fillna(0.0)
+            entry_cost = float((weights * denominators).sum())
+            pnl = float((weights * pnls).sum())
+            if entry_cost <= 0:
+                continue
+            base = group.iloc[0]
+            rows.append(
+                {
+                    "trade_id": trade_id,
+                    "underlying_symbol": str(base["symbol"]).upper(),
+                    "entry_date": pd.Timestamp(base["entry_date"]).normalize(),
+                    "exit_date": pd.Timestamp(base["option_exit_date"]).normalize(),
+                    "expiration": pd.to_datetime(group["expiration"], errors="coerce").min(),
+                    "entry_cost": entry_cost,
+                    "exit_proceeds": entry_cost + pnl,
+                    "pct_change": pnl / entry_cost,
+                    "description": "model_mv_basket",
+                    "exit_type": "basket_signal_exit",
+                    "top_k": base.get("top_k", np.nan),
+                }
+            )
+    else:
+        for row in work.itertuples(index=False):
+            entry_cost = _nan_float(getattr(row, "return_denominator"))
+            pnl = _nan_float(getattr(row, "option_pnl"))
+            if pd.isna(entry_cost) or entry_cost <= 0 or pd.isna(pnl):
+                continue
+            rows.append(
+                {
+                    "trade_id": getattr(row, "trade_id", None),
+                    "underlying_symbol": str(getattr(row, "symbol")).upper(),
+                    "entry_date": pd.Timestamp(getattr(row, "entry_date")).normalize(),
+                    "exit_date": pd.Timestamp(getattr(row, "option_exit_date")).normalize(),
+                    "expiration": pd.Timestamp(getattr(row, "expiration")).normalize(),
+                    "entry_cost": entry_cost,
+                    "exit_proceeds": entry_cost + pnl,
+                    "pct_change": _nan_float(getattr(row, "option_return")),
+                    "description": getattr(row, "option_action", "option_action"),
+                    "exit_type": "signal_exit",
+                    "top_k": getattr(row, "top_k", np.nan),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def _run_optopsy_portfolio_fraction_backtest(
     raw: pd.DataFrame,
     *,
@@ -1545,11 +1854,11 @@ def _run_optopsy_portfolio_fraction_backtest(
         if col in selected_raw.columns:
             trades[col] = selected_raw[col].values
     trades = trades.sort_values("entry_date").reset_index(drop=True)
-    filtered = optopsy_simulator._filter_trades(trades, int(config.max_positions))
     trade_log = _build_portfolio_fraction_trade_log(
-        filtered,
+        trades,
         capital=float(config.capital),
         multiplier=int(config.multiplier),
+        max_positions=int(config.max_positions),
         default_fraction=_default_option_allocation_fraction(config),
         top_k_column=str(config.top_k_column),
     )
@@ -1571,6 +1880,7 @@ def _build_portfolio_fraction_trade_log(
     *,
     capital: float,
     multiplier: int,
+    max_positions: int,
     default_fraction: float,
     top_k_column: str,
 ) -> pd.DataFrame:
@@ -1599,28 +1909,94 @@ def _build_portfolio_fraction_trade_log(
     if trades.empty:
         return pd.DataFrame(columns=columns)
 
-    equity = float(capital)
+    work = trades.copy()
+    work["entry_session"] = pd.to_datetime(work["entry_date"], errors="coerce").map(_next_business_session)
+    work["exit_session"] = pd.to_datetime(work["exit_date"], errors="coerce").map(_previous_business_session)
+    work = work.loc[work["entry_session"].notna() & work["exit_session"].notna()].copy()
+    work = work.loc[work["exit_session"].ge(work["entry_session"])].copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    cash = float(capital)
     cumulative_pnl = 0.0
     rows: list[dict[str, Any]] = []
-    for idx, trade in trades.reset_index(drop=True).iterrows():
+    open_positions: list[dict[str, Any]] = []
+    entry_groups = {date: group.copy() for date, group in work.sort_values("entry_session").groupby("entry_session", sort=True)}
+    sessions = pd.bdate_range(work["entry_session"].min(), work["exit_session"].max())
+    for session in sessions:
+        session_ts = pd.Timestamp(session).normalize()
+        still_open: list[dict[str, Any]] = []
+        for position in open_positions:
+            if pd.Timestamp(position["exit_session"]).normalize() > session_ts:
+                still_open.append(position)
+                continue
+            cash += float(position["dollar_proceeds"])
+            cumulative_pnl += float(position["realized_pnl"])
+            position["cumulative_pnl"] = cumulative_pnl
+            position["equity"] = cash + sum(float(open_pos["dollar_cost"]) for open_pos in still_open)
+            rows.append(position)
+        open_positions = still_open
+
+        day_entries = entry_groups.get(session_ts)
+        if day_entries is None or day_entries.empty:
+            continue
+        for _, trade in day_entries.iterrows():
+            if len(open_positions) >= int(max_positions):
+                break
+            portfolio_value = cash + sum(float(position["dollar_cost"]) for position in open_positions)
+            if portfolio_value <= 0 or cash <= 0:
+                break
+            position = _build_portfolio_fraction_position(
+                trade,
+                cash=cash,
+                portfolio_value=portfolio_value,
+                multiplier=multiplier,
+                default_fraction=default_fraction,
+                top_k_column=top_k_column,
+            )
+            if position is None:
+                continue
+            cash -= float(position["dollar_cost"])
+            open_positions.append(position)
+        if cash + sum(float(position["dollar_cost"]) for position in open_positions) <= 0:
+            break
+    if open_positions:
+        for position in sorted(open_positions, key=lambda item: pd.Timestamp(item["exit_session"])):
+            cash += float(position["dollar_proceeds"])
+            cumulative_pnl += float(position["realized_pnl"])
+            position["cumulative_pnl"] = cumulative_pnl
+            position["equity"] = cash
+            rows.append(position)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _build_portfolio_fraction_position(
+    trade: pd.Series,
+    *,
+    cash: float,
+    portfolio_value: float,
+    multiplier: int,
+    default_fraction: float,
+    top_k_column: str,
+) -> dict[str, Any] | None:
         entry_cost = abs(_nan_float(trade.get("entry_cost")))
         if pd.isna(entry_cost) or entry_cost <= 0:
-            continue
+            return None
         fraction = _allocation_fraction_for_trade(trade, default_fraction=default_fraction, top_k_column=top_k_column)
-        allocated_notional = max(0.0, equity * fraction)
+        allocated_notional = min(max(0.0, portfolio_value * fraction), max(0.0, cash))
         quantity = int(np.floor(allocated_notional / (entry_cost * float(multiplier))))
         if quantity <= 0:
-            continue
+            return None
         lot_size = quantity * int(multiplier)
         exit_proceeds = _nan_float(trade.get("exit_proceeds"))
         realized_pnl = (exit_proceeds - _nan_float(trade.get("entry_cost"))) * lot_size
-        cumulative_pnl += realized_pnl
-        equity = float(capital) + cumulative_pnl
-        row = {
-            "trade_id": len(rows) + 1,
+        return {
+            "trade_id": trade.get("trade_id"),
             "underlying_symbol": trade.get("underlying_symbol"),
-            "entry_date": trade.get("entry_date"),
-            "exit_date": trade.get("exit_date"),
+            "entry_date": pd.Timestamp(trade.get("entry_session")).normalize(),
+            "exit_date": pd.Timestamp(trade.get("exit_session")).normalize(),
+            "exit_session": pd.Timestamp(trade.get("exit_session")).normalize(),
             "expiration": trade.get("expiration"),
             "entry_cost": trade.get("entry_cost"),
             "exit_proceeds": exit_proceeds,
@@ -1634,14 +2010,26 @@ def _build_portfolio_fraction_trade_log(
             "dollar_cost": entry_cost * lot_size,
             "dollar_proceeds": exit_proceeds * lot_size,
             "realized_pnl": realized_pnl,
-            "days_held": (pd.Timestamp(trade.get("exit_date")) - pd.Timestamp(trade.get("entry_date"))).days,
-            "cumulative_pnl": cumulative_pnl,
-            "equity": equity,
+            "days_held": (pd.Timestamp(trade.get("exit_session")) - pd.Timestamp(trade.get("entry_session"))).days,
+            "cumulative_pnl": np.nan,
+            "equity": np.nan,
         }
-        rows.append(row)
-        if equity <= 0:
-            break
-    return pd.DataFrame(rows, columns=columns)
+
+
+def _next_business_session(value: Any) -> pd.Timestamp | pd.NaT:
+    timestamp = pd.Timestamp(value).normalize()
+    if pd.isna(timestamp):
+        return pd.NaT
+    sessions = pd.bdate_range(timestamp, timestamp + pd.Timedelta(days=7))
+    return pd.Timestamp(sessions[0]).normalize() if len(sessions) else pd.NaT
+
+
+def _previous_business_session(value: Any) -> pd.Timestamp | pd.NaT:
+    timestamp = pd.Timestamp(value).normalize()
+    if pd.isna(timestamp):
+        return pd.NaT
+    sessions = pd.bdate_range(timestamp - pd.Timedelta(days=7), timestamp)
+    return pd.Timestamp(sessions[-1]).normalize() if len(sessions) else pd.NaT
 
 
 def _allocation_fraction_for_trade(row, *, default_fraction: float, top_k_column: str) -> float:

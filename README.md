@@ -285,7 +285,80 @@ Dagster definitions live in `quant_orchestrator.dagster_defs`:
 dagster dev -m quant_orchestrator.dagster_defs
 ```
 
-The current module exposes a backtest-framework-comparison job. Production research jobs should compose the same platform capabilities: load warehouse data, run the selected ML framework or backtesting framework only when needed, and register native artifacts.
+Or use the repo launcher, which sets a persistent local `DAGSTER_HOME` so multi-day run history remains visible:
+
+```bash
+scripts/dagster_ui.sh
+```
+
+Open the local Dagster UI URL printed by `dagster dev`, usually `http://127.0.0.1:3000`, to monitor runs, mapped symbol steps, logs, retries, and failures.
+
+The `thetadata_options_backfill_job` pulls the FMP 10B equity universe through Quant Warehouse/OpenBB and backfills ThetaData option history into the provider-isolated Quant Warehouse ArcticDB store. The job is dynamic-mapped by symbol so a failed ticker can be retried without rerunning the whole universe.
+
+Small smoke run:
+
+```yaml
+ops:
+  resolve_thetadata_options_backfill_symbols:
+    config:
+      symbols: AAPL,MSFT
+  backfill_thetadata_options_symbol:
+    config:
+      start_date: "2026-06-24"
+      end_date: "2026-06-30"
+      max_dte: 90
+      strike_range: 10
+      backfill_window_days: 7
+      fallback_window_days: 1
+      request_sleep: 0.0
+      overwrite: false
+      include_non_us: false
+```
+
+The same smoke config is checked in at `dagster_configs/thetadata_options_smoke.yaml` and can be run from the CLI:
+
+```bash
+dagster job execute -m quant_orchestrator.dagster_defs -j thetadata_options_backfill_job -c dagster_configs/thetadata_options_smoke.yaml
+```
+
+10B historical run:
+
+```yaml
+execution:
+  config:
+    multiprocess:
+      max_concurrent: 4
+ops:
+  resolve_thetadata_options_backfill_symbols:
+    config:
+      min_market_cap: 10000000000
+      country: US
+      exchanges: NASDAQ,NYSE,AMEX
+      is_etf: false
+      is_fund: false
+      is_active: true
+      all_share_classes: false
+      limit: 10000
+  backfill_thetadata_options_symbol:
+    config:
+      start_date: "2018-01-02"
+      end_date: "2026-06-30"
+      max_dte: 90
+      strike_range: 10
+      backfill_window_days: 7
+      fallback_window_days: 1
+      request_sleep: 0.0
+      overwrite: false
+      include_non_us: false
+```
+
+The 10B config is checked in at `dagster_configs/thetadata_options_10b_historical.yaml`. Launch it from the Dagster UI or from the CLI:
+
+```bash
+dagster job execute -m quant_orchestrator.dagster_defs -j thetadata_options_backfill_job -c dagster_configs/thetadata_options_10b_historical.yaml
+```
+
+Production research jobs should compose the same platform capabilities: load warehouse data, run the selected ML framework or backtesting framework only when needed, and register native artifacts.
 
 ## Optional Experiment Primitives
 

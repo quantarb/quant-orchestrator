@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from quant_orchestrator.platforms.backtesting_frameworks import (
     backtesting_py_provider,
+    lean_provider,
     nautilus_provider,
     optopsy_provider,
+    panel_weight_provider,
     zipline_provider,
 )
 from quant_orchestrator.platforms.ml_frameworks import (
@@ -22,9 +24,11 @@ def register_builtin_providers() -> None:
         torch_provider,
         transformers_provider,
         backtesting_py_provider,
+        lean_provider,
         zipline_provider,
         nautilus_provider,
         optopsy_provider,
+        panel_weight_provider,
     ):
         registry.register(provider)
 

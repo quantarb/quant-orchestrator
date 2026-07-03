@@ -26,6 +26,9 @@ def configure_torch_runtime(
             raise RuntimeError("CUDA is required, but torch.cuda.is_available() is false.")
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
+    if str(device).strip().lower() == "cuda":
+        device = "cuda:0"
+
     torch_device = torch.device(device)
     if require_cuda and torch_device.type != "cuda":
         raise RuntimeError(f"CUDA is required, got device={torch_device}.")
@@ -40,4 +43,3 @@ def configure_torch_runtime(
         cuda_available=bool(torch.cuda.is_available()),
         cuda_device_name=torch.cuda.get_device_name(torch_device) if torch_device.type == "cuda" else None,
     )
-
