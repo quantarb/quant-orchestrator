@@ -5,7 +5,6 @@ from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.provider
     backtesting_py_provider,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.lean.provider import lean_provider
-from quant_orchestrator.platforms.backtesting_frameworks.optopsy.provider import optopsy_provider
 from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.provider import (
     panel_weight_provider,
 )
@@ -15,7 +14,6 @@ __all__ = [
     "backtesting_py_provider",
     "lean_provider",
     "nautilus_provider",
-    "optopsy_provider",
     "panel_weight_provider",
     "zipline_provider",
 ]

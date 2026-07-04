@@ -71,7 +71,6 @@ backtesting_py = "quant_orchestrator.platforms.backtesting_frameworks.backtestin
 lean = "quant_orchestrator.platforms.backtesting_frameworks.lean:lean_provider"
 zipline = "quant_orchestrator.platforms.backtesting_frameworks.zipline:zipline_provider"
 nautilus = "quant_orchestrator.platforms.backtesting_frameworks.nautilus:nautilus_provider"
-optopsy = "quant_orchestrator.platforms.backtesting_frameworks.optopsy:optopsy_provider"
 panel_weight = "quant_orchestrator.platforms.backtesting_frameworks.panel_weight:panel_weight_provider"
 
 [tool.hatch.build.targets.wheel]

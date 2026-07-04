@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from importlib.metadata import entry_points
 from typing import Any
+import warnings
 
 from quant_orchestrator.platforms.contracts import ProviderManifest
 
@@ -62,7 +63,15 @@ class ProviderRegistry:
             return
         for category, group in ENTRY_POINT_GROUPS.items():
             for entry_point in entry_points(group=group):
-                loaded = entry_point.load()
+                try:
+                    loaded = entry_point.load()
+                except (AttributeError, ImportError, ModuleNotFoundError) as exc:
+                    warnings.warn(
+                        f"Skipping provider entry point {entry_point.name!r} in {group!r}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
                 manifest = (
                     loaded()
                     if callable(loaded) and not isinstance(loaded, ProviderManifest)
