@@ -61,6 +61,7 @@ class OptionRetrievalConfig:
         "rho",
         "iv",
         "implied_volatility",
+        "underlying_price",
         "volume",
         "open_interest",
     )
@@ -203,7 +204,19 @@ def run_oracle_option_experiment(config: OracleOptionExperimentConfig) -> Oracle
     eligible_symbols = tuple(
         coverage.loc[coverage["snapshot_day_count"].fillna(0).gt(0), "symbol"].astype(str).str.upper().tolist()
     )
-    price_frames = _load_price_frames(warehouse, eligible_symbols, start=config.price_start, end=config.price_end)
+    price_frames = _load_price_frames(
+        warehouse,
+        eligible_symbols,
+        start=config.price_start,
+        end=config.price_end,
+    )
+    option_price_frames = _load_price_frames(
+        warehouse,
+        eligible_symbols,
+        start=config.price_start,
+        end=config.price_end,
+        adjustment="unadjusted",
+    )
     label_spec = LabelBuildSpec(
         k_params=config.k_params,
         min_profit_pct=config.min_profit_pct,
@@ -222,6 +235,7 @@ def run_oracle_option_experiment(config: OracleOptionExperimentConfig) -> Oracle
         coverage=coverage,
         trades=oracle_trades,
         price_frames=price_frames,
+        option_price_frames=option_price_frames,
         read_option_chain_arctic=read_option_chain_arctic,
         build_option_contract_features=build_option_contract_features,
         option_ranker_feature_columns=option_ranker_feature_columns,
@@ -259,13 +273,26 @@ def run_trade_window_option_experiment(
     )
     normalized_trades = normalized_trades.loc[normalized_trades["symbol"].isin(eligible_symbols)].copy()
     warehouse = Warehouse()
-    price_frames = _load_price_frames(warehouse, eligible_symbols, start=config.price_start, end=config.price_end)
+    price_frames = _load_price_frames(
+        warehouse,
+        eligible_symbols,
+        start=config.price_start,
+        end=config.price_end,
+    )
+    option_price_frames = _load_price_frames(
+        warehouse,
+        eligible_symbols,
+        start=config.price_start,
+        end=config.price_end,
+        adjustment="unadjusted",
+    )
     return _run_option_experiment_from_trades(
         config=config,
         started=started,
         coverage=coverage,
         trades=normalized_trades,
         price_frames=price_frames,
+        option_price_frames=option_price_frames,
         read_option_chain_arctic=read_option_chain_arctic,
         build_option_contract_features=build_option_contract_features,
         option_ranker_feature_columns=option_ranker_feature_columns,
@@ -629,6 +656,7 @@ def _run_option_experiment_from_trades(
     coverage: pd.DataFrame,
     trades: pd.DataFrame,
     price_frames: dict[str, pd.DataFrame],
+    option_price_frames: dict[str, pd.DataFrame] | None = None,
     read_option_chain_arctic,
     build_option_contract_features,
     option_ranker_feature_columns,
@@ -639,6 +667,7 @@ def _run_option_experiment_from_trades(
         config.retrieval,
         execution=config.execution,
         price_frames=price_frames,
+        option_price_frames=option_price_frames,
         read_option_chain_arctic=read_option_chain_arctic,
         build_option_contract_features=build_option_contract_features,
     )
@@ -772,12 +801,14 @@ class _OptionRetriever:
         *,
         execution: OptopsyExecutionConfig | None = None,
         price_frames: dict[str, pd.DataFrame],
+        option_price_frames: dict[str, pd.DataFrame] | None = None,
         read_option_chain_arctic,
         build_option_contract_features,
     ):
         self.config = config
         self.execution = execution or OptopsyExecutionConfig()
         self.price_frames = price_frames
+        self.option_price_frames = option_price_frames or {}
         self.read_option_chain_arctic = read_option_chain_arctic
         self.build_option_contract_features = build_option_contract_features
         self._chain_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame] = {}
@@ -789,11 +820,14 @@ class _OptionRetriever:
         self.chain_cache_hits = 0
         self.nearest_exit_cache_hits = 0
         self.chain_quote_cache_hits = 0
+        self.quote_chain_read_count = 0
+        self.quote_chain_duplicate_rows_dropped = 0
         self.contract_path_read_count = 0
         self.contract_path_cache_hits = 0
         self.chain_duplicate_rows_dropped = 0
         self.underlying_lookup_count = 0
         self.underlying_cache_hits = 0
+        self.underlying_adjusted_fallback_count = 0
         self.affordability_checked_count = 0
         self.affordability_filtered_count = 0
 
@@ -803,8 +837,10 @@ class _OptionRetriever:
         entry_date = pd.Timestamp(trade["entry_date"]).normalize()
         equity_exit_date = pd.Timestamp(trade["exit_date"]).normalize()
         realized_holding_days = max(0, int((equity_exit_date - entry_date).days))
-        spot = self._underlying_close(symbol, entry_date)
         entry_chain = self._load_day_chain(symbol, entry_date)
+        spot = self._chain_underlying_price(entry_chain)
+        if spot is None:
+            spot = self._underlying_close(symbol, entry_date)
         if entry_chain.empty or spot is None or spot <= 0:
             return pd.DataFrame()
         if self.config.option_universe == "full_chain_actions":
@@ -1307,32 +1343,61 @@ class _OptionRetriever:
         if quote_map is not None:
             self.chain_quote_cache_hits += 1
         else:
-            chain = self._load_day_chain(key[0], key[1])
-            if chain.empty or "contract_symbol" not in chain.columns:
-                quote_map = {}
-            else:
-                work = chain[[col for col in ("contract_symbol", "bid", "ask", "mid") if col in chain.columns]].copy()
-                if "bid" not in work.columns:
-                    work["bid"] = np.nan
-                if "ask" not in work.columns:
-                    work["ask"] = np.nan
-                if "mid" not in work.columns:
-                    work["mid"] = np.nan
-                work["contract_symbol"] = work["contract_symbol"].astype(str)
-                work["bid"] = pd.to_numeric(work["bid"], errors="coerce")
-                work["ask"] = pd.to_numeric(work["ask"], errors="coerce")
-                work["mid"] = pd.to_numeric(work["mid"], errors="coerce")
-                missing_mid = work["mid"].isna() & work["bid"].notna() & work["ask"].notna()
-                work.loc[missing_mid, "mid"] = (work.loc[missing_mid, "bid"] + work.loc[missing_mid, "ask"]) / 2.0
-                work["bid"] = work["bid"].where(work["bid"].notna(), work["mid"])
-                work["ask"] = work["ask"].where(work["ask"].notna(), work["mid"])
-                work = work.loc[work["contract_symbol"].ne("") & work["mid"].notna()].drop_duplicates("contract_symbol", keep="first")
-                quote_map = {
-                    str(row.contract_symbol): (float(row.bid), float(row.ask), float(row.mid))
-                    for row in work.itertuples(index=False)
-                }
+            quote_map = self._load_day_quote_map(key[0], key[1])
             self._chain_quote_cache[key] = quote_map
         return quote_map.get(str(contract_symbol))
+
+    def _load_day_quote_map(
+        self,
+        symbol: str,
+        date: pd.Timestamp,
+    ) -> dict[str, tuple[float, float, float]]:
+        self.quote_chain_read_count += 1
+        chain = self.read_option_chain_arctic(
+            str(symbol).upper(),
+            start_date=pd.Timestamp(date).normalize(),
+            end_date=pd.Timestamp(date).normalize(),
+            columns=["snapshot_date", "contract_symbol", "bid", "ask", "mid", "underlying_price"],
+        )
+        if chain.empty or "contract_symbol" not in chain.columns:
+            return {}
+        chain_spot = self._chain_underlying_price(chain)
+        if chain_spot is not None:
+            self._underlying_cache[(str(symbol).upper(), pd.Timestamp(date).normalize())] = chain_spot
+        work = chain[
+            [
+                col
+                for col in ("snapshot_date", "contract_symbol", "bid", "ask", "mid")
+                if col in chain.columns
+            ]
+        ].copy()
+        if "bid" not in work.columns:
+            work["bid"] = np.nan
+        if "ask" not in work.columns:
+            work["ask"] = np.nan
+        if "mid" not in work.columns:
+            work["mid"] = np.nan
+        work["contract_symbol"] = work["contract_symbol"].astype(str)
+        work["bid"] = pd.to_numeric(work["bid"], errors="coerce")
+        work["ask"] = pd.to_numeric(work["ask"], errors="coerce")
+        work["mid"] = pd.to_numeric(work["mid"], errors="coerce")
+        missing_mid = work["mid"].isna() & work["bid"].notna() & work["ask"].notna()
+        work.loc[missing_mid, "mid"] = (work.loc[missing_mid, "bid"] + work.loc[missing_mid, "ask"]) / 2.0
+        work["bid"] = work["bid"].where(work["bid"].notna(), work["mid"])
+        work["ask"] = work["ask"].where(work["ask"].notna(), work["mid"])
+        work = work.loc[work["contract_symbol"].ne("") & work["mid"].notna()].copy()
+        before = len(work)
+        if "snapshot_date" in work.columns:
+            work["_snapshot_sort"] = pd.to_datetime(work["snapshot_date"], errors="coerce")
+            work = work.sort_values(["contract_symbol", "_snapshot_sort"])
+        else:
+            work = work.sort_values(["contract_symbol"])
+        work = work.drop_duplicates("contract_symbol", keep="last")
+        self.quote_chain_duplicate_rows_dropped += int(before - len(work))
+        return {
+            str(row.contract_symbol): (float(row.bid), float(row.ask), float(row.mid))
+            for row in work.itertuples(index=False)
+        }
 
     def _load_day_chain(self, symbol: str, date: pd.Timestamp) -> pd.DataFrame:
         key = (str(symbol).upper(), pd.Timestamp(date).normalize())
@@ -1351,9 +1416,12 @@ class _OptionRetriever:
             self._chain_cache[key] = chain.copy()
             return chain
         chain = self._dedupe_entry_chain_contracts(chain)
+        chain_spot = self._chain_underlying_price(chain)
+        if chain_spot is not None:
+            self._underlying_cache[key] = chain_spot
         featured = self.build_option_contract_features(
             chain,
-            underlying_price=self._underlying_close(key[0], key[1]),
+            underlying_price=chain_spot if chain_spot is not None else self._underlying_close(key[0], key[1]),
             target_dte=self.config.target_dte,
             compute_model_greeks=False,
         ).df
@@ -1376,24 +1444,47 @@ class _OptionRetriever:
         self.chain_duplicate_rows_dropped += int(before - len(work))
         return work.reset_index(drop=True)
 
+    @staticmethod
+    def _chain_underlying_price(chain: pd.DataFrame) -> float | None:
+        if chain is None or chain.empty or "underlying_price" not in chain.columns:
+            return None
+        values = pd.to_numeric(chain["underlying_price"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        values = values.dropna()
+        values = values.loc[values > 0]
+        if values.empty:
+            return None
+        return float(values.median())
+
     def _underlying_close(self, symbol: str, date: pd.Timestamp) -> float | None:
         key = (str(symbol).upper(), pd.Timestamp(date).normalize())
         if key in self._underlying_cache:
             self.underlying_cache_hits += 1
             return self._underlying_cache[key]
         self.underlying_lookup_count += 1
-        prices = self.price_frames.get(str(symbol).upper())
+        result = self._close_from_frames(self.option_price_frames, key[0], key[1])
+        if result is not None:
+            self._underlying_cache[key] = result
+            return result
+        result = self._close_from_frames(self.price_frames, key[0], key[1])
+        if result is not None:
+            self.underlying_adjusted_fallback_count += 1
+        self._underlying_cache[key] = result
+        return result
+
+    @staticmethod
+    def _close_from_frames(
+        frames: dict[str, pd.DataFrame],
+        symbol: str,
+        date: pd.Timestamp,
+    ) -> float | None:
+        prices = frames.get(str(symbol).upper())
         if prices is None or prices.empty or "close" not in prices.columns:
-            self._underlying_cache[key] = None
             return None
         eligible = prices.loc[prices.index <= pd.Timestamp(date).normalize()]
         if eligible.empty:
-            self._underlying_cache[key] = None
             return None
         value = pd.to_numeric(eligible["close"].iloc[-1], errors="coerce")
-        result = None if pd.isna(value) else float(value)
-        self._underlying_cache[key] = result
-        return result
+        return None if pd.isna(value) else float(value)
 
     def metrics(self) -> dict[str, float]:
         return {
@@ -1405,12 +1496,16 @@ class _OptionRetriever:
             "nearest_exit_cache_size": float(len(self._nearest_exit_snapshot_cache)),
             "chain_quote_cache_hits": float(self.chain_quote_cache_hits),
             "chain_quote_cache_size": float(len(self._chain_quote_cache)),
+            "option_quote_chain_read_count": float(self.quote_chain_read_count),
+            "option_quote_chain_duplicate_rows_dropped": float(self.quote_chain_duplicate_rows_dropped),
             "contract_path_read_count": float(self.contract_path_read_count),
             "contract_path_cache_hits": float(self.contract_path_cache_hits),
             "contract_path_cache_size": float(len(self._contract_path_cache)),
             "underlying_lookup_count": float(self.underlying_lookup_count),
             "underlying_cache_hits": float(self.underlying_cache_hits),
             "underlying_cache_size": float(len(self._underlying_cache)),
+            "underlying_raw_price_frame_count": float(len(self.option_price_frames)),
+            "underlying_adjusted_fallback_count": float(self.underlying_adjusted_fallback_count),
             "affordability_checked_count": float(self.affordability_checked_count),
             "affordability_filtered_count": float(self.affordability_filtered_count),
         }
@@ -2733,10 +2828,28 @@ def _normalize_trade_windows(frame: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["entry_date", "symbol", "side"]).reset_index(drop=True)
 
 
-def _load_price_frames(warehouse, symbols: tuple[str, ...], *, start: str, end: str | None) -> dict[str, pd.DataFrame]:
+def _load_price_frames(
+    warehouse,
+    symbols: tuple[str, ...],
+    *,
+    start: str,
+    end: str | None,
+    adjustment: str = "splits_and_dividends",
+) -> dict[str, pd.DataFrame]:
     frames = {}
     for symbol in symbols:
-        frame = warehouse.read_prices(symbol, provider="fmp", start=start, end=end).copy()
+        try:
+            frame = warehouse.read_prices(
+                symbol,
+                provider="fmp",
+                start=start,
+                end=end,
+                adjustment=adjustment,
+            ).copy()
+        except TypeError:
+            if adjustment != "splits_and_dividends":
+                continue
+            frame = warehouse.read_prices(symbol, provider="fmp", start=start, end=end).copy()
         if frame.empty:
             continue
         frame.index = pd.to_datetime(frame.index, errors="coerce").normalize()
