@@ -15,14 +15,16 @@ from quant_orchestrator.research_tools.ml_trading_experiment import (
     MLTradingExperimentResult,
     run_ml_trading_experiment,
 )
+from quant_orchestrator.research_tools.option_trade_execution import (
+    OptionTradeExecutionBatch,
+    OptionTradeExecutor,
+)
 from quant_orchestrator.research_tools.options_experiment import (
     OptopsyExecutionConfig,
     OptionExperimentArtifacts,
     OptionMvBasketConfig,
     OptionRetrievalConfig,
     OptionRuntimeEstimate,
-    OptionTradeExecutionBatch,
-    OptionTradeExecutor,
     OptionWindowBuildConfig,
     OptionWindowDataset,
     OracleOptionExperimentConfig,
