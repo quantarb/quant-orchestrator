@@ -36,6 +36,11 @@ TRADE_COLUMNS: tuple[str, ...] = (
     "fees",
     "order_id",
     "native_id",
+    "exit_time",
+    "exit_price",
+    "pnl",
+    "return_pct",
+    "duration",
 )
 
 
@@ -137,15 +142,111 @@ def normalize_trade_log(trades: pd.DataFrame | None) -> pd.DataFrame:
         if getattr(timestamps.dt, "tz", None) is not None:
             timestamps = timestamps.dt.tz_convert(None)
         normalized["timestamp"] = timestamps.dt.normalize()
+    if normalized["exit_time"].notna().any():
+        exit_times = pd.to_datetime(normalized["exit_time"], errors="coerce")
+        if getattr(exit_times.dt, "tz", None) is not None:
+            exit_times = exit_times.dt.tz_convert(None)
+        normalized["exit_time"] = exit_times.dt.normalize()
 
     normalized["quantity"] = pd.to_numeric(normalized["quantity"], errors="coerce")
     normalized["price"] = pd.to_numeric(normalized["price"], errors="coerce")
+    normalized["exit_price"] = pd.to_numeric(normalized["exit_price"], errors="coerce")
+    normalized["pnl"] = pd.to_numeric(normalized["pnl"], errors="coerce")
+    normalized["return_pct"] = pd.to_numeric(normalized["return_pct"], errors="coerce")
     missing_notional = normalized["notional"].isna()
     normalized.loc[missing_notional, "notional"] = (
         normalized.loc[missing_notional, "quantity"].abs()
         * normalized.loc[missing_notional, "price"]
     )
     return normalized.loc[:, TRADE_COLUMNS]
+
+
+def normalize_trade_windows(frame: pd.DataFrame | None, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
+    """Normalize closed equity trade windows for downstream execution transforms.
+
+    This is intentionally framework-agnostic. Framework-specific adapters should
+    first produce a normalized report/trade log; option execution can then use
+    these windows without knowing whether they came from Zipline,
+    backtesting.py, Nautilus, or a vectorized shared-book run.
+    """
+
+    if frame is None or frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "trade_id",
+                "symbol",
+                "side",
+                "entry_date",
+                "exit_date",
+                "entry_price",
+                "exit_price",
+                "quantity",
+                "notional",
+                "pnl",
+                "ret_dec",
+            ]
+        )
+    out = frame.copy()
+    rename_map = {
+        "timestamp": "entry_date",
+        "entry_time": "entry_date",
+        "entry_price": "entry_price",
+        "price": "entry_price",
+        "exit_time": "exit_date",
+        "return_pct": "ret_dec",
+    }
+    out = out.rename(columns={source: target for source, target in rename_map.items() if source in out.columns and target not in out.columns})
+    required = {"symbol", "side", "entry_date", "exit_date"}
+    missing = required - set(out.columns)
+    if missing:
+        raise KeyError(f"trade windows missing required columns: {sorted(missing)}")
+    out["symbol"] = out["symbol"].astype(str).str.upper()
+    out["side"] = out["side"].astype(str).str.lower().replace(
+        {
+            "buy": "long",
+            "sell": "short",
+            "long_call": "long",
+            "long_put": "short",
+            "call": "long",
+            "put": "short",
+        }
+    )
+    out["entry_date"] = pd.to_datetime(out["entry_date"], errors="coerce").dt.normalize()
+    out["exit_date"] = pd.to_datetime(out["exit_date"], errors="coerce").dt.normalize()
+    for col in ("entry_price", "exit_price", "quantity", "notional", "pnl", "ret_dec"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "ret_dec" in out.columns and out["ret_dec"].abs().gt(10).any():
+        out["ret_dec"] = out["ret_dec"] / 100.0
+    out = out.loc[
+        out["symbol"].ne("")
+        & out["side"].isin(["long", "short"])
+        & out["entry_date"].notna()
+        & out["exit_date"].notna()
+        & out["exit_date"].gt(out["entry_date"])
+    ].copy()
+    classifier_cols = {"strategy_source", "source", "family"}
+    if require_top_k_for_classifier and classifier_cols.intersection(out.columns):
+        if "top_k" not in out.columns:
+            raise KeyError("classifier trade windows must include top_k for option allocation sizing")
+        top_k = pd.to_numeric(out["top_k"], errors="coerce")
+        if top_k.isna().any() or top_k.le(0).any():
+            raise ValueError("classifier trade windows must include positive top_k values for option allocation sizing")
+    if "trade_id" not in out.columns:
+        out["trade_id"] = out.apply(
+            lambda row: f"{row['symbol']}|{pd.Timestamp(row['entry_date']).date()}|{row['side']}",
+            axis=1,
+        )
+    return out.sort_values(["entry_date", "symbol", "side"]).reset_index(drop=True)
+
+
+def report_trade_windows(report: NormalizedBacktestReport, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
+    """Extract canonical closed trade windows from a normalized backtest report."""
+
+    return normalize_trade_windows(
+        report.trade_log,
+        require_top_k_for_classifier=require_top_k_for_classifier,
+    )
 
 
 def build_normalized_report(

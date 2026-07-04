@@ -17,6 +17,7 @@ from quant_orchestrator.research_tools.options_experiment import (
     rank_option_window_strategy_sources,
     write_oracle_option_artifacts,
     _choose_weighted_basket_per_trade,
+    _execute_rule_trade_windows,
     _OptionRetriever,
     _normalize_trade_windows,
     _option_feature_coverage,
@@ -375,6 +376,106 @@ def test_option_retriever_full_chain_actions_include_long_calls_and_short_puts_w
     assert by_action.loc["buy_call", "option_return"] == pytest.approx((7.0 - 5.5) / 5.5)
     assert by_action.loc["sell_put", "option_return"] == pytest.approx((4.0 - 2.5) / 100.0)
     assert by_action.loc["sell_put", "return_denominator"] == pytest.approx(100.0)
+
+
+def test_fast_rule_execution_prices_only_selected_buy_equivalent_with_path() -> None:
+    entry = pd.Timestamp("2025-01-02")
+    exit_ = pd.Timestamp("2025-01-20")
+
+    def fake_read(symbol, *, start_date, end_date, columns):
+        start = pd.Timestamp(start_date).normalize()
+        end = pd.Timestamp(end_date).normalize()
+        if start == entry and end == entry:
+            return pd.DataFrame(
+                {
+                    "snapshot_date": [entry, entry],
+                    "contract_symbol": ["AAPL_C_100", "AAPL_P_100"],
+                    "expiration": [pd.Timestamp("2025-02-21"), pd.Timestamp("2025-02-21")],
+                    "strike": [100.0, 100.0],
+                    "option_type": ["call", "put"],
+                    "bid": [5.0, 4.0],
+                    "ask": [5.5, 4.5],
+                    "mid": [5.25, 4.25],
+                    "dte": [50, 50],
+                    "spread_pct": [0.1, 0.12],
+                    "underlying_price": [100.0, 100.0],
+                }
+            )
+        if start == exit_ and end == exit_:
+            return pd.DataFrame(
+                {
+                    "snapshot_date": [exit_, exit_],
+                    "contract_symbol": ["AAPL_C_100", "AAPL_P_100"],
+                    "bid": [7.0, 2.0],
+                    "ask": [7.5, 2.5],
+                    "mid": [7.25, 2.25],
+                    "underlying_price": [110.0, 110.0],
+                }
+            )
+        if start == entry and end == exit_:
+            return pd.DataFrame(
+                {
+                    "snapshot_date": [entry, exit_, entry, exit_],
+                    "contract_symbol": ["AAPL_C_100", "AAPL_C_100", "AAPL_P_100", "AAPL_P_100"],
+                    "bid": [5.0, 7.0, 4.0, 2.0],
+                    "ask": [5.5, 7.5, 4.5, 2.5],
+                    "mid": [5.25, 7.25, 4.25, 2.25],
+                    "underlying_price": [100.0, 110.0, 100.0, 110.0],
+                }
+            )
+        return pd.DataFrame()
+
+    class _Features:
+        def __init__(self, frame):
+            self.df = frame
+
+    feature_calls = []
+
+    def fake_features(frame, *, underlying_price=None, target_dte=None, compute_model_greeks=True):
+        feature_calls.append({"rows": len(frame), "compute_model_greeks": compute_model_greeks})
+        out = frame.copy()
+        out["dte_gap"] = (pd.to_numeric(out.get("dte", 50), errors="coerce") - int(target_dte or 50)).abs()
+        out["abs_moneyness"] = (pd.to_numeric(out["strike"], errors="coerce") / float(underlying_price) - 1.0).abs()
+        out["spread_pct"] = pd.to_numeric(out["spread_pct"], errors="coerce")
+        if compute_model_greeks:
+            out["delta"] = 0.5
+        return _Features(out)
+
+    retriever = _OptionRetriever(
+        OptionRetrievalConfig(
+            option_universe="full_chain_actions",
+            target_dte=50,
+            min_entry_mid=0.0,
+            max_entry_spread_pct=10.0,
+            max_abs_moneyness=10.0,
+            exit_lookback_days=0,
+        ),
+        price_frames={},
+        read_option_chain_arctic=fake_read,
+        build_option_contract_features=fake_features,
+    )
+    trades = pd.DataFrame(
+        {
+            "trade_id": ["t1"],
+            "symbol": ["AAPL"],
+            "side": ["long"],
+            "entry_date": [entry],
+            "exit_date": [exit_],
+        }
+    )
+
+    selected, paths, status = _execute_rule_trade_windows(trades, retriever)
+
+    assert len(selected) == 1
+    assert selected.loc[0, "contract_symbol"] == "AAPL_C_100"
+    assert selected.loc[0, "option_action"] == "buy_call"
+    assert selected.loc[0, "option_return"] == pytest.approx((7.0 - 5.5) / 5.5)
+    assert paths["contract_symbol"].unique().tolist() == ["AAPL_C_100"]
+    assert status.loc[0, "status"] == "selected_priced"
+    assert feature_calls == [{"rows": 1, "compute_model_greeks": True}]
+    metrics = retriever.metrics()
+    assert metrics["option_quote_chain_read_count"] == 1.0
+    assert metrics["contract_path_read_count"] == 1.0
 
 
 def test_option_retriever_uses_last_contract_quote_before_expiration_intrinsic() -> None:

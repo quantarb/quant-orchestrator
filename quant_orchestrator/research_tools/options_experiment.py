@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 import json
 from types import SimpleNamespace
@@ -15,6 +16,11 @@ from quant_warehouse.platforms.data_providers.thetadata.settlement import (
     settle_option_exit,
 )
 
+from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
+    NormalizedBacktestReport,
+    normalize_trade_windows as normalize_report_trade_windows,
+    report_trade_windows,
+)
 from quant_orchestrator.tracking import get_tracker
 
 
@@ -115,6 +121,7 @@ class OracleOptionExperimentConfig:
     execution: OptopsyExecutionConfig = field(default_factory=OptopsyExecutionConfig)
     mv_basket: OptionMvBasketConfig = field(default_factory=OptionMvBasketConfig)
     random_seed: int = 20260702
+    option_execution_workers: int = 1
     log_mlflow: bool = True
     mlflow_experiment: str = "options_trading"
     mlflow_tracking_uri: str | None = None
@@ -142,6 +149,15 @@ class OracleOptionExperimentResult:
     artifact_paths: dict[str, Path]
     analysis_markdown: str
     elapsed_seconds: float
+    trade_status: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+@dataclass(frozen=True)
+class OptionTradeExecutionBatch:
+    selected_option_trades: pd.DataFrame
+    selected_option_paths: pd.DataFrame
+    trade_status: pd.DataFrame
+    metrics: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -298,6 +314,175 @@ def run_trade_window_option_experiment(
         option_ranker_feature_columns=option_ranker_feature_columns,
         build_option_mean_variance_labels=build_option_mean_variance_labels,
     )
+
+
+def run_backtest_report_option_experiment(
+    config: OracleOptionExperimentConfig,
+    report: NormalizedBacktestReport,
+) -> OracleOptionExperimentResult:
+    """Run option execution from any framework's normalized backtest report."""
+
+    return run_trade_window_option_experiment(config, report_trade_windows(report))
+
+
+def run_trade_window_option_execution(
+    config: OracleOptionExperimentConfig,
+    trade_windows: pd.DataFrame,
+    *,
+    selector_name: str = "rule_atm_90d",
+) -> OracleOptionExperimentResult:
+    """Execute option equivalents from equity trade windows without training candidate labels.
+
+    This is the fast path for production-style option backtests. It loads the
+    full option chain on each equity entry date, selects the contract on entry
+    information only, then loads/prices only the selected contract forward to
+    the equity exit/option expiration settlement date.
+    """
+
+    started = perf_counter()
+    _prepare_quant_warehouse_import(config.quant_warehouse_root)
+    (
+        Warehouse,
+        _LabelBuildSpec,
+        _build_trade_results,
+        read_option_chain_arctic,
+        option_chain_coverage,
+        build_option_contract_features,
+        _option_ranker_feature_columns,
+        _build_option_mean_variance_labels,
+    ) = _warehouse_imports()
+    normalized_trades = _normalize_trade_windows(trade_windows)
+    if normalized_trades.empty:
+        raise ValueError("trade_windows did not contain any valid option-tradable entry/exit rows")
+    symbols = tuple(sorted(set(normalized_trades["symbol"].astype(str).str.upper()).intersection(config.symbols or ())))
+    if not symbols:
+        symbols = tuple(sorted(normalized_trades["symbol"].astype(str).str.upper().unique().tolist()))
+    coverage = option_chain_coverage(symbols)
+    eligible_symbols = tuple(
+        coverage.loc[coverage["snapshot_day_count"].fillna(0).gt(0), "symbol"].astype(str).str.upper().tolist()
+    )
+    normalized_trades = normalized_trades.loc[normalized_trades["symbol"].isin(eligible_symbols)].copy()
+    warehouse = Warehouse()
+    price_frames = _load_price_frames(
+        warehouse,
+        eligible_symbols,
+        start=config.price_start,
+        end=config.price_end,
+    )
+    option_price_frames = _load_price_frames(
+        warehouse,
+        eligible_symbols,
+        start=config.price_start,
+        end=config.price_end,
+        adjustment="unadjusted",
+    )
+    def retriever_factory() -> _OptionRetriever:
+        return _OptionRetriever(
+            config.retrieval,
+            execution=config.execution,
+            price_frames=price_frames,
+            option_price_frames=option_price_frames,
+            read_option_chain_arctic=read_option_chain_arctic,
+            build_option_contract_features=build_option_contract_features,
+        )
+
+    phase_started = perf_counter()
+    execution_batch = OptionTradeExecutor(
+        retriever_factory,
+        selector_name=selector_name,
+        workers=max(1, int(config.option_execution_workers)),
+    ).execute(normalized_trades)
+    selected_option_trades = execution_batch.selected_option_trades
+    selected_option_paths = execution_batch.selected_option_paths
+    trade_status = execution_batch.trade_status
+    metrics: dict[str, float] = {
+        "phase_entry_selection_and_selected_pricing_seconds": float(perf_counter() - phase_started),
+        "trade_windows": float(len(normalized_trades)),
+        "selected_option_trades": float(len(selected_option_trades)),
+        "selected_option_paths": float(len(selected_option_paths)),
+        "option_execution_workers": float(max(1, int(config.option_execution_workers))),
+    }
+    status_counts = trade_status["status"].value_counts() if not trade_status.empty and "status" in trade_status else pd.Series(dtype=int)
+    for status, count in status_counts.items():
+        metrics[f"trade_status_{status}"] = float(count)
+    selected_by_selector = {selector_name: selected_option_trades}
+    selector_summary, symbol_summary = _summarize_selected_by_selector(selected_by_selector)
+    optopsy_summary = _run_optopsy_selector_backtests(selected_by_selector, config.execution)
+    feature_coverage = _option_feature_coverage(
+        selected_option_trades,
+        train_panel=pd.DataFrame(),
+        eval_panel=selected_option_trades,
+    )
+    metrics.update(execution_batch.metrics)
+    metrics.update(_option_feature_coverage_metrics(feature_coverage))
+    elapsed_seconds = perf_counter() - started
+    metrics["elapsed_seconds"] = float(elapsed_seconds)
+    analysis_markdown = _build_execution_analysis(
+        config,
+        trade_windows=normalized_trades,
+        selected_option_trades=selected_option_trades,
+        selector_summary=selector_summary,
+        optopsy_summary=optopsy_summary,
+        trade_status=trade_status,
+        metrics=metrics,
+    )
+    artifact_paths = write_oracle_option_artifacts(
+        config=config,
+        coverage=coverage,
+        oracle_trades=normalized_trades,
+        option_panel=selected_option_trades,
+        train_panel=pd.DataFrame(),
+        eval_panel=selected_option_trades,
+        selector_summary=selector_summary,
+        optopsy_summary=optopsy_summary,
+        symbol_summary=symbol_summary,
+        source_family_summary=pd.DataFrame(),
+        feature_coverage=feature_coverage,
+        selected_option_trades=selected_option_trades,
+        selected_option_paths=selected_option_paths,
+        model=None,
+        metrics=metrics,
+        analysis_markdown=analysis_markdown,
+        directory=Path(config.artifact_dir) if config.artifact_dir else None,
+    )
+    status_path = artifact_paths["metrics"].with_name("trade_status.csv")
+    trade_status.to_csv(status_path, index=False)
+    artifact_paths["trade_status"] = status_path
+    mlflow_run_id = None
+    if config.log_mlflow:
+        mlflow_run_id = _log_mlflow(config, artifact_paths, metrics)
+    return OracleOptionExperimentResult(
+        config=config,
+        mlflow_run_id=mlflow_run_id,
+        coverage=coverage,
+        oracle_trades=normalized_trades,
+        option_panel=selected_option_trades,
+        train_panel=pd.DataFrame(),
+        eval_panel=selected_option_trades,
+        selector_summary=selector_summary,
+        optopsy_summary=optopsy_summary,
+        symbol_summary=symbol_summary,
+        source_family_summary=pd.DataFrame(),
+        feature_coverage=feature_coverage,
+        selected_option_trades=selected_option_trades,
+        selected_option_paths=selected_option_paths,
+        metrics=metrics,
+        artifact_paths=artifact_paths,
+        analysis_markdown=analysis_markdown,
+        elapsed_seconds=elapsed_seconds,
+        trade_status=trade_status,
+    )
+
+
+def run_backtest_report_option_execution(
+    config: OracleOptionExperimentConfig,
+    report: NormalizedBacktestReport,
+    *,
+    selector_name: str = "rule_atm_90d",
+) -> OracleOptionExperimentResult:
+    """Fast option execution from any framework's normalized backtest report."""
+
+    return run_trade_window_option_execution(config, report_trade_windows(report), selector_name=selector_name)
 
 
 def build_classifier_signal_trade_windows(
@@ -812,12 +997,14 @@ class _OptionRetriever:
         self.read_option_chain_arctic = read_option_chain_arctic
         self.build_option_contract_features = build_option_contract_features
         self._chain_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame] = {}
+        self._raw_chain_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame] = {}
         self._underlying_cache: dict[tuple[str, pd.Timestamp], float | None] = {}
         self._nearest_exit_snapshot_cache: dict[tuple[str, pd.Timestamp], pd.Timestamp | None] = {}
         self._chain_quote_cache: dict[tuple[str, pd.Timestamp], dict[str, tuple[float, float, float]]] = {}
         self._contract_path_cache: dict[tuple[str, str, pd.Timestamp, pd.Timestamp], pd.DataFrame] = {}
         self.chain_read_count = 0
         self.chain_cache_hits = 0
+        self.raw_chain_cache_hits = 0
         self.nearest_exit_cache_hits = 0
         self.chain_quote_cache_hits = 0
         self.quote_chain_read_count = 0
@@ -1050,6 +1237,198 @@ class _OptionRetriever:
                 if priced is None:
                     continue
                 row_payload = priced
+            rows.append(row_payload)
+        return pd.DataFrame(rows)
+
+    def select_rule_atm_entry(self, trade: pd.Series) -> pd.DataFrame:
+        symbol = str(trade["symbol"]).upper()
+        side = str(trade["side"]).lower()
+        entry_date = pd.Timestamp(trade["entry_date"]).normalize()
+        equity_exit_date = pd.Timestamp(trade["exit_date"]).normalize()
+        realized_holding_days = max(0, int((equity_exit_date - entry_date).days))
+        entry_chain = self._load_day_chain_raw(symbol, entry_date)
+        spot = self._chain_underlying_price(entry_chain)
+        if spot is None:
+            spot = self._underlying_close(symbol, entry_date)
+        if entry_chain.empty or spot is None or spot <= 0:
+            return pd.DataFrame()
+        selected = self._select_rule_atm_from_native_chain(
+            trade=trade,
+            symbol=symbol,
+            side=side,
+            entry_date=entry_date,
+            equity_exit_date=equity_exit_date,
+            realized_holding_days=realized_holding_days,
+            spot=float(spot),
+            entry_chain=entry_chain,
+        )
+        if selected.empty:
+            return selected
+        featured = self.build_option_contract_features(
+            selected,
+            underlying_price=float(spot),
+            target_dte=self.config.target_dte,
+            compute_model_greeks=True,
+        ).df
+        if featured.empty:
+            return selected
+        return featured.reset_index(drop=True)
+
+    def _select_rule_atm_from_native_chain(
+        self,
+        *,
+        trade: pd.Series,
+        symbol: str,
+        side: str,
+        entry_date: pd.Timestamp,
+        equity_exit_date: pd.Timestamp,
+        realized_holding_days: int,
+        spot: float,
+        entry_chain: pd.DataFrame,
+    ) -> pd.DataFrame:
+        candidates = entry_chain.copy()
+        if "option_type" not in candidates.columns:
+            return pd.DataFrame()
+        candidates["option_type"] = candidates["option_type"].astype(str).str.lower().str.strip()
+        option_type = "call" if side == "long" else "put"
+        option_action = "buy_call" if side == "long" else "buy_put"
+        candidates = candidates.loc[candidates["option_type"].str.startswith(option_type[0])].copy()
+        if candidates.empty:
+            return candidates
+        candidates["option_type"] = option_type
+        candidates["option_action"] = option_action
+        for col in ("strike", "bid", "ask", "mid", "volume", "open_interest"):
+            if col not in candidates.columns:
+                candidates[col] = np.nan
+            candidates[col] = pd.to_numeric(candidates[col], errors="coerce")
+        if "expiration" not in candidates.columns:
+            candidates["expiration"] = pd.NaT
+        candidates["expiration"] = pd.to_datetime(candidates["expiration"], errors="coerce").dt.normalize()
+        if "snapshot_date" not in candidates.columns:
+            candidates["snapshot_date"] = entry_date
+        candidates["snapshot_date"] = pd.to_datetime(candidates["snapshot_date"], errors="coerce").dt.normalize()
+        missing_mid = candidates["mid"].isna() & candidates["bid"].notna() & candidates["ask"].notna()
+        candidates.loc[missing_mid, "mid"] = (candidates.loc[missing_mid, "bid"] + candidates.loc[missing_mid, "ask"]) / 2.0
+        if "dte" not in candidates.columns:
+            candidates["dte"] = (candidates["expiration"] - entry_date).dt.days
+        else:
+            candidates["dte"] = pd.to_numeric(candidates["dte"], errors="coerce")
+            missing_dte = candidates["dte"].isna() & candidates["expiration"].notna()
+            candidates.loc[missing_dte, "dte"] = (candidates.loc[missing_dte, "expiration"] - entry_date).dt.days
+        candidates["underlying_spot_entry"] = float(spot)
+        candidates["moneyness"] = candidates["strike"] / float(spot) - 1.0
+        candidates["abs_moneyness"] = candidates["moneyness"].abs()
+        candidates["spread"] = candidates["ask"] - candidates["bid"]
+        if "spread_pct" not in candidates.columns:
+            candidates["spread_pct"] = candidates["spread"] / candidates["mid"].replace(0, np.nan)
+        else:
+            candidates["spread_pct"] = pd.to_numeric(candidates["spread_pct"], errors="coerce")
+            missing_spread = candidates["spread_pct"].isna()
+            candidates.loc[missing_spread, "spread_pct"] = (
+                candidates.loc[missing_spread, "spread"] / candidates.loc[missing_spread, "mid"].replace(0, np.nan)
+            )
+        candidates["dte_gap"] = (candidates["dte"] - int(self.config.target_dte)).abs()
+        candidates["liquidity_score"] = candidates["volume"].fillna(0.0) + candidates["open_interest"].fillna(0.0) / 100.0
+        candidates = candidates.loc[
+            candidates["contract_symbol"].astype(str).ne("")
+            & candidates["expiration"].notna()
+            & candidates["strike"].gt(0)
+            & candidates["bid"].ge(0)
+            & candidates["ask"].gt(0)
+            & candidates["ask"].ge(candidates["bid"])
+            & candidates["mid"].gt(0)
+            & candidates["dte"].gt(0)
+        ].copy()
+        if candidates.empty:
+            return candidates
+        if self.config.option_universe != "full_chain_actions":
+            candidates = candidates.loc[
+                candidates["dte"].between(self.config.min_dte, self.config.max_dte)
+                & candidates["mid"].ge(self.config.min_entry_mid)
+                & candidates["spread_pct"].le(self.config.max_entry_spread_pct)
+                & candidates["abs_moneyness"].le(self.config.max_abs_moneyness)
+            ].copy()
+            if candidates.empty:
+                return candidates
+            candidates = self._filter_affordable_candidates(candidates, trade)
+            if candidates.empty:
+                return candidates
+        candidates["option_return"] = np.nan
+        candidates["fixed_near_atm_score"] = _rule_score(
+            candidates,
+            {"dte_gap": -1.0, "abs_moneyness": -1.0, "spread_pct": -1.0},
+        )
+        selected = _choose_top_per_trade(
+            self._native_candidates_to_execution_rows(
+                candidates,
+                trade=trade,
+                symbol=symbol,
+                side=side,
+                equity_exit_date=equity_exit_date,
+                realized_holding_days=realized_holding_days,
+            ),
+            "fixed_near_atm_score",
+        )
+        return selected.reset_index(drop=True)
+
+    def _native_candidates_to_execution_rows(
+        self,
+        candidates: pd.DataFrame,
+        *,
+        trade: pd.Series,
+        symbol: str,
+        side: str,
+        equity_exit_date: pd.Timestamp,
+        realized_holding_days: int,
+    ) -> pd.DataFrame:
+        rows = []
+        for row in candidates.itertuples(index=False):
+            entry_ask = _nan_float(getattr(row, "ask", np.nan))
+            entry_bid = _nan_float(getattr(row, "bid", np.nan))
+            entry_mid = _nan_float(getattr(row, "mid", np.nan))
+            entry_price = entry_ask
+            if not np.isfinite(entry_price) or entry_price <= 0:
+                continue
+            row_payload = {
+                "trade_id": trade.get("trade_id", f"{symbol}|{pd.Timestamp(getattr(row, 'snapshot_date')).date()}|{side}"),
+                "symbol": symbol,
+                "side": side,
+                "equity_signal_side": side,
+                "entry_date": pd.Timestamp(getattr(row, "snapshot_date")).normalize(),
+                "equity_exit_date": equity_exit_date,
+                "option_exit_date": pd.NaT,
+                "expiration": pd.Timestamp(getattr(row, "expiration")).normalize(),
+                "contract_symbol": getattr(row, "contract_symbol"),
+                "option_type": getattr(row, "option_type"),
+                "option_action": getattr(row, "option_action"),
+                "strike": _nan_float(getattr(row, "strike", np.nan)),
+                "entry_mid": entry_mid,
+                "exit_mid": np.nan,
+                "entry_bid": entry_bid,
+                "entry_ask": entry_ask,
+                "exit_bid": np.nan,
+                "exit_ask": np.nan,
+                "entry_price": float(entry_price),
+                "exit_price": np.nan,
+                "option_pnl": np.nan,
+                "return_denominator": float(entry_price),
+                "option_return": np.nan,
+                "realized_holding_days": realized_holding_days,
+                "realized_underlying_trade_return": pd.to_numeric(trade.get("ret_dec"), errors="coerce"),
+            }
+            for source_col, target_col in (
+                ("planned_holding_days", "planned_holding_days"),
+                ("equity_signal_score", "equity_signal_score"),
+                ("equity_signal_rank", "equity_signal_rank"),
+            ):
+                value = trade.get(source_col)
+                if value is not None and not pd.isna(value):
+                    row_payload[target_col] = _nan_float(value)
+            for col in ("source_family", "strategy_source", "source", "family", "top_k", "variant"):
+                value = trade.get(col)
+                if value is not None and not pd.isna(value):
+                    row_payload[col] = value if col == "top_k" else str(value)
+            row_payload.update(_row_feature_payload(row))
             rows.append(row_payload)
         return pd.DataFrame(rows)
 
@@ -1428,6 +1807,27 @@ class _OptionRetriever:
         self._chain_cache[key] = featured.copy()
         return featured
 
+    def _load_day_chain_raw(self, symbol: str, date: pd.Timestamp) -> pd.DataFrame:
+        key = (str(symbol).upper(), pd.Timestamp(date).normalize())
+        cached = self._raw_chain_cache.get(key)
+        if cached is not None:
+            self.raw_chain_cache_hits += 1
+            return cached.copy()
+        self.chain_read_count += 1
+        chain = self.read_option_chain_arctic(
+            key[0],
+            start_date=key[1],
+            end_date=key[1],
+            columns=list(self.config.chain_columns),
+        )
+        if not chain.empty:
+            chain = self._dedupe_entry_chain_contracts(chain)
+            chain_spot = self._chain_underlying_price(chain)
+            if chain_spot is not None:
+                self._underlying_cache[key] = chain_spot
+        self._raw_chain_cache[key] = chain.copy()
+        return chain
+
     def _dedupe_entry_chain_contracts(self, chain: pd.DataFrame) -> pd.DataFrame:
         if chain.empty or "contract_symbol" not in chain.columns:
             return chain
@@ -1491,6 +1891,8 @@ class _OptionRetriever:
             "option_chain_read_count": float(self.chain_read_count),
             "option_chain_cache_hits": float(self.chain_cache_hits),
             "option_chain_cache_size": float(len(self._chain_cache)),
+            "option_raw_chain_cache_hits": float(self.raw_chain_cache_hits),
+            "option_raw_chain_cache_size": float(len(self._raw_chain_cache)),
             "option_chain_duplicate_rows_dropped": float(self.chain_duplicate_rows_dropped),
             "nearest_exit_cache_hits": float(self.nearest_exit_cache_hits),
             "nearest_exit_cache_size": float(len(self._nearest_exit_snapshot_cache)),
@@ -1668,6 +2070,154 @@ def estimate_option_runtime_scaling(
         max_seconds=float(max_seconds),
         runnable_within_budget=bool(conservative <= float(max_seconds)),
     )
+
+
+class OptionTradeExecutor:
+    def __init__(
+        self,
+        retriever_factory,
+        *,
+        selector_name: str = "rule_atm_90d",
+        workers: int = 1,
+    ):
+        if selector_name != "rule_atm_90d":
+            raise ValueError(f"fast option execution currently supports selector_name='rule_atm_90d', got {selector_name!r}")
+        self.retriever_factory = retriever_factory
+        self.selector_name = selector_name
+        self.workers = max(1, int(workers))
+
+    def execute(self, trade_windows: pd.DataFrame) -> OptionTradeExecutionBatch:
+        if trade_windows.empty:
+            return OptionTradeExecutionBatch(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {})
+        if self.workers <= 1 or len(trade_windows) <= 1:
+            return self._execute_chunk(trade_windows)
+        chunks = _split_frame_for_workers(trade_windows, self.workers)
+        batches: list[OptionTradeExecutionBatch] = []
+        with ThreadPoolExecutor(max_workers=min(self.workers, len(chunks))) as pool:
+            futures = [pool.submit(self._execute_chunk, chunk) for chunk in chunks if not chunk.empty]
+            for future in as_completed(futures):
+                batches.append(future.result())
+        return _merge_option_execution_batches(batches)
+
+    def _execute_chunk(self, trade_windows: pd.DataFrame) -> OptionTradeExecutionBatch:
+        retriever = self.retriever_factory()
+        selected_frames = []
+        path_frames = []
+        status_rows: list[dict[str, Any]] = []
+        for trade in trade_windows.itertuples(index=False):
+            selected, paths, status = self._execute_trade(pd.Series(trade._asdict()), retriever)
+            if not selected.empty:
+                selected_frames.append(selected)
+            if not paths.empty:
+                path_frames.append(paths)
+            status_rows.append(status)
+        selected_frame = pd.concat(selected_frames, ignore_index=True) if selected_frames else pd.DataFrame()
+        path_frame = pd.concat(path_frames, ignore_index=True) if path_frames else pd.DataFrame()
+        status_frame = pd.DataFrame(status_rows)
+        return OptionTradeExecutionBatch(selected_frame, path_frame, status_frame, retriever.metrics())
+
+    def _execute_trade(
+        self,
+        payload: pd.Series,
+        retriever: _OptionRetriever,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+        trade_id = payload.get("trade_id")
+        symbol = str(payload.get("symbol", "")).upper()
+        entry_date = pd.Timestamp(payload.get("entry_date")).normalize()
+        exit_date = pd.Timestamp(payload.get("exit_date")).normalize()
+        status_base = {
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "side": payload.get("side"),
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+        }
+        try:
+            selected = retriever.select_rule_atm_entry(payload)
+        except Exception as exc:
+            return pd.DataFrame(), pd.DataFrame(), {**status_base, "status": "entry_error", "message": str(exc)}
+        if selected is None or selected.empty:
+            return pd.DataFrame(), pd.DataFrame(), {**status_base, "status": "no_entry_candidates", "message": ""}
+        priced, paths = retriever.price_selected_options_with_paths(selected, selector_name=self.selector_name)
+        if priced.empty:
+            contract = selected["contract_symbol"].iloc[0] if "contract_symbol" in selected.columns and len(selected) else ""
+            return (
+                pd.DataFrame(),
+                pd.DataFrame(),
+                {**status_base, "status": "selected_unpriced", "contract_symbol": contract, "message": ""},
+            )
+        first = priced.iloc[0]
+        status = {
+            **status_base,
+            "status": "selected_priced",
+            "contract_symbol": first.get("contract_symbol"),
+            "option_exit_date": first.get("option_exit_date"),
+            "expiration": first.get("expiration"),
+            "option_action": first.get("option_action"),
+            "option_return": first.get("option_return"),
+            "path_observations": first.get("path_observations", np.nan),
+            "message": "",
+        }
+        return priced, paths, status
+
+
+def _execute_rule_trade_windows(
+    trade_windows: pd.DataFrame,
+    retriever: _OptionRetriever,
+    *,
+    selector_name: str = "rule_atm_90d",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    batch = OptionTradeExecutor(lambda: retriever, selector_name=selector_name, workers=1).execute(trade_windows)
+    return batch.selected_option_trades, batch.selected_option_paths, batch.trade_status
+
+
+def _split_frame_for_workers(frame: pd.DataFrame, workers: int) -> list[pd.DataFrame]:
+    worker_count = min(max(1, int(workers)), max(1, len(frame)))
+    positions = np.array_split(np.arange(len(frame)), worker_count)
+    return [frame.iloc[pos].copy() for pos in positions if len(pos)]
+
+
+def _merge_option_execution_batches(batches: list[OptionTradeExecutionBatch]) -> OptionTradeExecutionBatch:
+    if not batches:
+        return OptionTradeExecutionBatch(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {})
+    selected = [batch.selected_option_trades for batch in batches if not batch.selected_option_trades.empty]
+    paths = [batch.selected_option_paths for batch in batches if not batch.selected_option_paths.empty]
+    statuses = [batch.trade_status for batch in batches if not batch.trade_status.empty]
+    return OptionTradeExecutionBatch(
+        pd.concat(selected, ignore_index=True) if selected else pd.DataFrame(),
+        pd.concat(paths, ignore_index=True) if paths else pd.DataFrame(),
+        pd.concat(statuses, ignore_index=True) if statuses else pd.DataFrame(),
+        _sum_metric_dicts([batch.metrics for batch in batches]),
+    )
+
+
+def _sum_metric_dicts(metrics: list[dict[str, float]]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for metric in metrics:
+        for key, value in metric.items():
+            if isinstance(value, (int, float, np.integer, np.floating)) and pd.notna(value):
+                out[key] = out.get(key, 0.0) + float(value)
+    return out
+
+
+def _select_rule_atm_option_entry(candidates: pd.DataFrame) -> pd.DataFrame:
+    if candidates.empty:
+        return pd.DataFrame()
+    work = candidates.copy()
+    if "option_action" in work.columns:
+        work = work.loc[work["option_action"].astype(str).str.lower().isin(["buy_call", "buy_put"])].copy()
+    if work.empty:
+        return work
+    for col in ("dte_gap", "abs_moneyness", "spread_pct"):
+        if col not in work.columns:
+            work[col] = np.nan
+    if "option_return" not in work.columns:
+        work["option_return"] = np.nan
+    work["fixed_near_atm_score"] = _rule_score(
+        work,
+        {"dte_gap": -1.0, "abs_moneyness": -1.0, "spread_pct": -1.0},
+    )
+    return _choose_top_per_trade(work, "fixed_near_atm_score")
 
 
 def _build_option_panel(oracle_trades: pd.DataFrame, retriever: _OptionRetriever, *, price_exit: bool = True) -> pd.DataFrame:
@@ -2786,46 +3336,7 @@ def _normalize_oracle_trades(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalize_trade_windows(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame.empty:
-        return frame
-    out = frame.copy()
-    required = {"symbol", "side", "entry_date", "exit_date"}
-    missing = required - set(out.columns)
-    if missing:
-        raise KeyError(f"trade windows missing required columns: {sorted(missing)}")
-    out["symbol"] = out["symbol"].astype(str).str.upper()
-    out["side"] = out["side"].astype(str).str.lower().replace(
-        {
-            "buy": "long",
-            "sell": "short",
-            "long_call": "long",
-            "long_put": "short",
-            "call": "long",
-            "put": "short",
-        }
-    )
-    out["entry_date"] = pd.to_datetime(out["entry_date"], errors="coerce").dt.normalize()
-    out["exit_date"] = pd.to_datetime(out["exit_date"], errors="coerce").dt.normalize()
-    out = out.loc[
-        out["symbol"].ne("")
-        & out["side"].isin(["long", "short"])
-        & out["entry_date"].notna()
-        & out["exit_date"].notna()
-        & out["exit_date"].gt(out["entry_date"])
-    ].copy()
-    classifier_cols = {"strategy_source", "source", "family"}
-    if classifier_cols.intersection(out.columns):
-        if "top_k" not in out.columns:
-            raise KeyError("classifier trade windows must include top_k for option allocation sizing")
-        top_k = pd.to_numeric(out["top_k"], errors="coerce")
-        if top_k.isna().any() or top_k.le(0).any():
-            raise ValueError("classifier trade windows must include positive top_k values for option allocation sizing")
-    if "trade_id" not in out.columns:
-        out["trade_id"] = out.apply(
-            lambda row: f"{row['symbol']}|{pd.Timestamp(row['entry_date']).date()}|{row['side']}",
-            axis=1,
-        )
-    return out.sort_values(["entry_date", "symbol", "side"]).reset_index(drop=True)
+    return normalize_report_trade_windows(frame)
 
 
 def _load_price_frames(
@@ -2967,6 +3478,56 @@ def _build_analysis(
             lines.append(
                 f"  - {source_name}: option_rows={int(getattr(row, 'option_rows', 0)):,}, "
                 f"eval_trade_windows={int(getattr(row, 'eval_trade_windows', 0)):,}."
+            )
+    lines.append("- These artifacts are experiment products, not permanent Quant Warehouse source-of-truth tables.")
+    return "\n".join(lines)
+
+
+def _build_execution_analysis(
+    config: OracleOptionExperimentConfig,
+    *,
+    trade_windows: pd.DataFrame,
+    selected_option_trades: pd.DataFrame,
+    selector_summary: pd.DataFrame,
+    optopsy_summary: pd.DataFrame,
+    trade_status: pd.DataFrame,
+    metrics: dict[str, float],
+) -> str:
+    lines = [
+        "## Written Analysis",
+        "",
+        f"- Equity trade windows supplied: {len(trade_windows):,}.",
+        f"- Fast option execution selected/priced {len(selected_option_trades):,} option trades.",
+        "- Selection mode: entry-date chain only; buy calls for long equity trades and buy puts for short equity trades.",
+        "- Exit mode: selected contract path is loaded forward until the equity exit date or option expiration settlement.",
+    ]
+    if not trade_status.empty and "status" in trade_status.columns:
+        counts = trade_status["status"].value_counts()
+        status_text = ", ".join(f"{status}={int(count)}" for status, count in counts.items())
+        lines.append(f"- Per-trade status counts: {status_text}.")
+    if metrics:
+        lines.append(
+            f"- Runtime: elapsed={metrics.get('elapsed_seconds', np.nan):.2f}s, "
+            f"entry_chain_reads={metrics.get('option_chain_read_count', 0):.0f}, "
+            f"quote_chain_reads={metrics.get('option_quote_chain_read_count', 0):.0f}, "
+            f"contract_path_reads={metrics.get('contract_path_read_count', 0):.0f}."
+        )
+    for row in selector_summary.itertuples(index=False):
+        trades = int(getattr(row, "trades", 0))
+        if trades == 0:
+            continue
+        lines.append(
+            f"- {row.selector}: {trades:,} trades, "
+            f"mean={row.mean_return:.2%}, median={row.median_return:.2%}, win_rate={row.win_rate:.2%}."
+        )
+    if not optopsy_summary.empty:
+        for row in optopsy_summary.itertuples(index=False):
+            closed = int(getattr(row, "closed_trades", 0))
+            final_equity = getattr(row, "final_equity", np.nan)
+            total_return = getattr(row, "total_return", np.nan)
+            lines.append(
+                f"- Optopsy {row.selector}: closed_trades={closed:,}, "
+                f"final_equity={float(final_equity):,.2f}, total_return={float(total_return):.2%}."
             )
     lines.append("- These artifacts are experiment products, not permanent Quant Warehouse source-of-truth tables.")
     return "\n".join(lines)

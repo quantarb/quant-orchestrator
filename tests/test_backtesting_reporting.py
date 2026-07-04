@@ -6,6 +6,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
     build_common_summary,
     normalize_equity_curve,
     normalize_trade_log,
+    normalize_trade_windows,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.shared import combine_equity_curves
 
@@ -80,9 +81,63 @@ def test_normalize_trade_log_keeps_common_columns_and_notional() -> None:
         "fees",
         "order_id",
         "native_id",
+        "exit_time",
+        "exit_price",
+        "pnl",
+        "return_pct",
+        "duration",
     ]
     assert normalized.loc[0, "timestamp"] == pd.Timestamp("2026-01-02")
     assert normalized.loc[0, "notional"] == 1500.0
+
+
+def test_normalize_trade_windows_uses_closed_trade_fields() -> None:
+    trades = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-01-02",
+                "exit_time": "2026-01-09",
+                "symbol": "aapl",
+                "side": "BUY",
+                "quantity": 10,
+                "price": 100.0,
+                "exit_price": 110.0,
+                "return_pct": 0.10,
+            }
+        ]
+    )
+
+    windows = normalize_trade_windows(trades)
+
+    assert windows.loc[0, "trade_id"] == "AAPL|2026-01-02|long"
+    assert windows.loc[0, "symbol"] == "AAPL"
+    assert windows.loc[0, "side"] == "long"
+    assert windows.loc[0, "entry_date"] == pd.Timestamp("2026-01-02")
+    assert windows.loc[0, "exit_date"] == pd.Timestamp("2026-01-09")
+    assert windows.loc[0, "entry_price"] == 100.0
+    assert windows.loc[0, "exit_price"] == 110.0
+    assert windows.loc[0, "ret_dec"] == 0.10
+
+
+def test_normalize_trade_windows_keeps_classifier_top_k_guard() -> None:
+    trades = pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "side": "long",
+                "entry_date": "2026-01-02",
+                "exit_date": "2026-01-09",
+                "strategy_source": "fmp.a",
+            }
+        ]
+    )
+
+    try:
+        normalize_trade_windows(trades)
+    except KeyError as exc:
+        assert "top_k" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected top_k validation error")
 
 
 def test_combine_equity_curves_handles_mixed_timezone_indexes() -> None:
