@@ -6,7 +6,6 @@ from quant_orchestrator.platforms.backtesting_frameworks.zipline.reporting_adapt
     build_zipline_report,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.zipline.runner import run_zipline_signal_strategy
-from quant_orchestrator.platforms.backtesting_frameworks.zipline.sma_crossover import run_sma_crossover_backtest
 
 __all__ = [
     "ZiplineBacktestEngine",
@@ -14,5 +13,4 @@ __all__ = [
     "ZiplineReport",
     "build_zipline_report",
     "run_zipline_signal_strategy",
-    "run_sma_crossover_backtest",
 ]

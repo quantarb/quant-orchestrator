@@ -20,15 +20,16 @@ from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
     normalize_equity_curve,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.shared import (
-    build_sma_crossover_frame as build_shared_sma_crossover_frame,
     combine_equity_curves,
     MAG7_SYMBOLS,
+    OHLCV_COLUMNS,
     load_price_frame,
     normalize_session_label,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.zipline.runner import (
     run_zipline_signal_strategy,
 )
+from quant_warehouse.platforms.data_providers.fmp.feature_engineering import compute_features_worldclass
 
 
 FAST_WINDOWS = (5, 10, 15, 20, 25, 30, 35, 40, 45, 50)
@@ -52,7 +53,52 @@ class FrameworkComparisonResult:
 
 
 def build_sma_frame(prices: pd.DataFrame, *, fast_window: int, slow_window: int) -> pd.DataFrame:
-    return build_shared_sma_crossover_frame(prices, fast_window=fast_window, slow_window=slow_window)
+    if fast_window >= slow_window:
+        raise ValueError("fast_window must be less than slow_window")
+
+    frame = compute_features_worldclass(prices.copy())
+    fast_col = f"SMA{fast_window}"
+    slow_col = f"SMA{slow_window}"
+    missing = [column for column in (fast_col, slow_col) if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            "Quant Warehouse feature output is missing required SMA columns: "
+            f"{missing}. Update quant-warehouse feature engineering first.",
+        )
+
+    frame["fast_sma"] = frame[fast_col]
+    frame["slow_sma"] = frame[slow_col]
+    frame["signal"] = (frame["fast_sma"] > frame["slow_sma"]).astype(int).fillna(0)
+    return frame.dropna(subset=list(OHLCV_COLUMNS)).copy()
+
+
+def run_sma_crossover_backtest(
+    prices: pd.DataFrame,
+    *,
+    framework: str,
+    symbol: str,
+    fast_window: int,
+    slow_window: int,
+    capital_base: float,
+) -> FrameworkRun:
+    """Notebook-facing SMA example runner used for framework comparisons."""
+
+    frame = build_sma_frame(prices, fast_window=fast_window, slow_window=slow_window)
+    if len(frame) <= slow_window:
+        raise ValueError(f"Need more than {slow_window} rows for the SMA crossover example.")
+    runners = {
+        "backtesting.py": run_backtesting_py,
+        "zipline": run_zipline,
+        "nautilus": run_nautilus,
+    }
+    runner = runners.get(str(framework))
+    if runner is None:
+        raise ValueError(f"Unsupported SMA example framework: {framework}")
+    run = runner(frame, symbol=symbol, capital_base=capital_base)
+    summary = run.summary.copy()
+    summary["fast_window"] = fast_window
+    summary["slow_window"] = slow_window
+    return FrameworkRun(run.raw_result, summary, run.equity)
 
 
 def _combine_equity_sleeves(sleeves: list[pd.Series]) -> pd.Series:
@@ -84,15 +130,6 @@ def _framework_comparison_rows(table: pd.DataFrame, *, metric: str) -> pd.DataFr
             }
         ],
     )
-
-
-def _coerce_framework_run(result: object) -> FrameworkRun:
-    if isinstance(result, FrameworkRun):
-        return result
-    if isinstance(result, tuple) and len(result) == 3:
-        raw_result, summary, equity = result
-        return FrameworkRun(raw_result=raw_result, summary=summary, equity=equity)
-    raise TypeError(f"Unsupported framework run result: {type(result)!r}")
 
 
 def _run_nautilus_isolated(
@@ -192,13 +229,6 @@ def run_framework_comparison(
     slow_window: int = 200,
     capital_base: float = 100_000.0,
 ) -> FrameworkComparisonResult:
-    from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.sma_crossover import (
-        run_sma_crossover_backtest as run_backtesting_py_runner,
-    )
-    from quant_orchestrator.platforms.backtesting_frameworks.zipline.sma_crossover import (
-        run_sma_crossover_backtest as run_zipline_runner,
-    )
-
     def load_provider_frames(context: PipelineContext) -> dict[str, Any]:
         return {
             "provider_frames": {
@@ -226,20 +256,17 @@ def run_framework_comparison(
                     )
                 else:
                     runners = {
-                        "backtesting.py": run_backtesting_py_runner,
-                        "zipline": run_zipline_runner,
+                        "backtesting.py": run_backtesting_py,
+                        "zipline": run_zipline,
                     }
                     runner = runners.get(framework)
                     if runner is None:
                         raise ValueError(f"Unsupported framework for comparison: {framework}")
-                    run = _coerce_framework_run(
-                        runner(
-                            frame.loc[:, ["open", "high", "low", "close", "volume"]].copy(),
-                            symbol=symbol,
-                            fast_window=fast_window,
-                            slow_window=slow_window,
-                            capital_base=capital_base,
-                        ),
+                    signal_frame = build_sma_frame(frame, fast_window=fast_window, slow_window=slow_window)
+                    run = runner(
+                        signal_frame,
+                        symbol=symbol,
+                        capital_base=capital_base,
                     )
                 wall_clock_seconds = perf_counter() - started
                 summary = run.summary.copy()

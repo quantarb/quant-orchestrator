@@ -18,7 +18,7 @@ Current reusable code placement:
 - Framework-specific data adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/data_adapter.py`.
 - Framework-specific reporting adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/reporting_adapter.py`.
 - Framework-specific reusable signal runners live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/runner.py` when they exist. Current runners exist for Zipline Reloaded and NautilusTrader.
-- Framework-specific SMA crossover examples now live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/sma_crossover.py`.
+- Strategy-specific SMA crossover examples live in notebook-facing helpers under `quant_orchestrator/backtests/` until they prove a more durable home.
 - FlairNLP helper functions used by the current multi-ML notebook live under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`.
 
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.
