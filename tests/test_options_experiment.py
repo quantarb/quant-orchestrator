@@ -377,6 +377,158 @@ def test_option_retriever_full_chain_actions_include_long_calls_and_short_puts_w
     assert by_action.loc["sell_put", "return_denominator"] == pytest.approx(100.0)
 
 
+def test_option_retriever_uses_last_contract_quote_before_expiration_intrinsic() -> None:
+    def fake_read(symbol, *, start_date, end_date, columns):
+        date = pd.Timestamp(start_date).normalize()
+        if date == pd.Timestamp("2021-02-03"):
+            return pd.DataFrame(
+                {
+                    "snapshot_date": [date],
+                    "contract_symbol": ["GOOG_put_20210205_2015"],
+                    "expiration": [pd.Timestamp("2021-02-05")],
+                    "strike": [2015.0],
+                    "option_type": ["put"],
+                    "bid": [1.8],
+                    "ask": [2.5],
+                    "mid": [2.15],
+                    "dte": [2],
+                    "spread_pct": [0.25],
+                }
+            )
+        if date == pd.Timestamp("2021-02-04"):
+            return pd.DataFrame(
+                {
+                    "snapshot_date": [date],
+                    "contract_symbol": ["GOOG_put_20210205_2015"],
+                    "expiration": [pd.Timestamp("2021-02-05")],
+                    "strike": [2015.0],
+                    "option_type": ["put"],
+                    "bid": [0.10],
+                    "ask": [1.20],
+                    "mid": [0.65],
+                    "dte": [1],
+                    "spread_pct": [1.69],
+                }
+            )
+        return pd.DataFrame()
+
+    class _Features:
+        def __init__(self, frame):
+            self.df = frame
+
+    def fake_features(frame, *, underlying_price=None, target_dte=None, compute_model_greeks=True):
+        out = frame.copy()
+        out["dte_gap"] = (pd.to_numeric(out["dte"], errors="coerce") - int(target_dte or 2)).abs()
+        out["abs_moneyness"] = (pd.to_numeric(out["strike"], errors="coerce") / float(underlying_price) - 1.0).abs()
+        return _Features(out)
+
+    prices = {
+        "GOOG": pd.DataFrame(
+            {"close": [102.66, 102.29, 104.05]},
+            index=[pd.Timestamp("2021-02-03"), pd.Timestamp("2021-02-04"), pd.Timestamp("2021-02-05")],
+        )
+    }
+    retriever = _OptionRetriever(
+        OptionRetrievalConfig(
+            option_universe="filtered",
+            min_dte=1,
+            max_dte=5,
+            target_dte=2,
+            max_abs_moneyness=100.0,
+            min_entry_mid=0.0,
+            max_entry_spread_pct=10.0,
+            exit_lookback_days=3,
+        ),
+        price_frames=prices,
+        read_option_chain_arctic=fake_read,
+        build_option_contract_features=fake_features,
+    )
+
+    rows = retriever.retrieve(
+        pd.Series(
+            {
+                "symbol": "GOOG",
+                "side": "short",
+                "entry_date": pd.Timestamp("2021-02-03"),
+                "exit_date": pd.Timestamp("2021-02-16"),
+            }
+        )
+    )
+
+    assert len(rows) == 1
+    row = rows.iloc[0]
+    assert row["option_exit_date"] == pd.Timestamp("2021-02-04")
+    assert row["exit_price_source"] == "last_contract_quote"
+    assert row["exit_price"] == pytest.approx(0.10)
+    assert row["option_return"] == pytest.approx((0.10 - 2.5) / 2.5)
+
+
+def test_option_retriever_blocks_scale_mismatched_intrinsic_fallback() -> None:
+    def fake_read(symbol, *, start_date, end_date, columns):
+        date = pd.Timestamp(start_date).normalize()
+        if date == pd.Timestamp("2021-02-03"):
+            return pd.DataFrame(
+                {
+                    "snapshot_date": [date],
+                    "contract_symbol": ["GOOG_put_20210205_2015"],
+                    "expiration": [pd.Timestamp("2021-02-05")],
+                    "strike": [2015.0],
+                    "option_type": ["put"],
+                    "bid": [1.8],
+                    "ask": [2.5],
+                    "mid": [2.15],
+                    "dte": [2],
+                    "spread_pct": [0.25],
+                }
+            )
+        return pd.DataFrame()
+
+    class _Features:
+        def __init__(self, frame):
+            self.df = frame
+
+    def fake_features(frame, *, underlying_price=None, target_dte=None, compute_model_greeks=True):
+        out = frame.copy()
+        out["dte_gap"] = 0
+        out["abs_moneyness"] = (pd.to_numeric(out["strike"], errors="coerce") / float(underlying_price) - 1.0).abs()
+        return _Features(out)
+
+    prices = {
+        "GOOG": pd.DataFrame(
+            {"close": [102.66, 104.05]},
+            index=[pd.Timestamp("2021-02-03"), pd.Timestamp("2021-02-05")],
+        )
+    }
+    retriever = _OptionRetriever(
+        OptionRetrievalConfig(
+            option_universe="filtered",
+            min_dte=1,
+            max_dte=5,
+            target_dte=2,
+            max_abs_moneyness=100.0,
+            min_entry_mid=0.0,
+            max_entry_spread_pct=10.0,
+            exit_lookback_days=3,
+        ),
+        price_frames=prices,
+        read_option_chain_arctic=fake_read,
+        build_option_contract_features=fake_features,
+    )
+
+    rows = retriever.retrieve(
+        pd.Series(
+            {
+                "symbol": "GOOG",
+                "side": "short",
+                "entry_date": pd.Timestamp("2021-02-03"),
+                "exit_date": pd.Timestamp("2021-02-16"),
+            }
+        )
+    )
+
+    assert rows.empty
+
+
 def test_selected_actions_to_trade_rows_uses_action_aware_denominator() -> None:
     selected = pd.DataFrame(
         {

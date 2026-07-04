@@ -10,6 +10,10 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+from quant_warehouse.platforms.data_providers.thetadata.settlement import (
+    OptionSettlement,
+    settle_option_exit,
+)
 
 from quant_orchestrator.tracking import get_tracker
 
@@ -1057,10 +1061,13 @@ class _OptionRetriever:
         equity_exit_date = pd.Timestamp(payload.get("equity_exit_date")).normalize()
         option_type = "call" if str(payload.get("option_type", "")).lower().startswith("c") else "put"
         row = SimpleNamespace(**payload)
-        exit_prices = self._price_exit_prices(symbol, equity_exit_date, row, option_type)
-        if exit_prices is None:
+        settlement = self._price_exit_settlement(symbol, equity_exit_date, row, option_type)
+        if settlement is None:
             return None
-        exit_snapshot_date, exit_bid, exit_ask, exit_mid = exit_prices
+        exit_snapshot_date = settlement.snapshot_date
+        exit_bid = settlement.bid
+        exit_ask = settlement.ask
+        exit_mid = settlement.mid
         option_action = str(payload.get("option_action", ""))
         entry_price = _nan_float(payload.get("entry_price", np.nan))
         if not np.isfinite(entry_price):
@@ -1093,6 +1100,7 @@ class _OptionRetriever:
                 "exit_ask": float(exit_ask),
                 "entry_price": float(entry_price),
                 "exit_price": float(exit_price),
+                "exit_price_source": settlement.price_source,
                 "option_pnl": float(pnl),
                 "return_denominator": float(denominator),
                 "option_return": float(pnl) / float(denominator),
@@ -1242,28 +1250,36 @@ class _OptionRetriever:
         return work.loc[affordable].copy()
 
     def _price_exit(self, symbol: str, equity_exit_date: pd.Timestamp, row, option_type: str) -> tuple[pd.Timestamp, float] | None:
-        prices = self._price_exit_prices(symbol, equity_exit_date, row, option_type)
-        if prices is None:
+        settlement = self._price_exit_settlement(symbol, equity_exit_date, row, option_type)
+        if settlement is None:
             return None
-        exit_snapshot_date, _bid, _ask, mid = prices
-        return exit_snapshot_date, mid
+        return settlement.snapshot_date, settlement.mid
 
     def _price_exit_prices(self, symbol: str, equity_exit_date: pd.Timestamp, row, option_type: str) -> tuple[pd.Timestamp, float, float, float] | None:
-        expiration = pd.Timestamp(row.expiration).normalize()
-        target_exit = min(pd.Timestamp(equity_exit_date).normalize(), expiration)
-        exit_snapshot_date = self._nearest_exit_snapshot(symbol, target_exit)
-        if exit_snapshot_date is not None:
-            quote = self._chain_quote(symbol, exit_snapshot_date, str(row.contract_symbol))
-            if quote is not None:
-                bid, ask, mid = quote
-                return pd.Timestamp(exit_snapshot_date).normalize(), float(bid), float(ask), float(mid)
-        if target_exit >= expiration:
-            close = self._underlying_close(symbol, target_exit)
-            if close is None:
-                return None
-            intrinsic = max(close - float(row.strike), 0.0) if option_type == "call" else max(float(row.strike) - close, 0.0)
-            return target_exit, float(intrinsic), float(intrinsic), float(intrinsic)
-        return None
+        settlement = self._price_exit_settlement(symbol, equity_exit_date, row, option_type)
+        if settlement is None:
+            return None
+        return settlement.snapshot_date, settlement.bid, settlement.ask, settlement.mid
+
+    def _price_exit_settlement(
+        self,
+        symbol: str,
+        equity_exit_date: pd.Timestamp,
+        row,
+        option_type: str,
+    ) -> OptionSettlement | None:
+        return settle_option_exit(
+            symbol=symbol,
+            contract_symbol=str(row.contract_symbol),
+            option_type=option_type,
+            strike=float(row.strike),
+            expiration=pd.Timestamp(row.expiration).normalize(),
+            equity_exit_date=pd.Timestamp(equity_exit_date).normalize(),
+            quote_loader=self._chain_quote,
+            underlying_close_loader=self._underlying_close,
+            entry_date=getattr(row, "entry_date", None),
+            exit_lookback_days=self.config.exit_lookback_days,
+        )
 
     def _load_nearest_exit_chain(self, symbol: str, target_date: pd.Timestamp) -> tuple[pd.Timestamp | None, pd.DataFrame]:
         snapshot = self._nearest_exit_snapshot(symbol, target_date)
