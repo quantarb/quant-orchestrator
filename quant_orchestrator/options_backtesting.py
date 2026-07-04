@@ -36,7 +36,6 @@ class OptopsyBacktestSpec:
     download_missing: bool = False
     allow_delta_proxy: bool = False
     price_provider: str = "fmp"
-    strike_range: int = 10
     extra_strategy_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -55,8 +54,6 @@ def load_thetadata_options_for_optopsy(
     *,
     start_date: str,
     end_date: str,
-    max_dte: int = 60,
-    strike_range: int = 10,
     use_cache: bool = True,
     download_missing: bool = False,
     allow_delta_proxy: bool = False,
@@ -69,13 +66,11 @@ def load_thetadata_options_for_optopsy(
         return pd.DataFrame()
 
     frames: list[pd.DataFrame] = []
-    spec = ThetaDataDownloadSpec(max_dte=max_dte, strike_range=strike_range)
+    spec = ThetaDataDownloadSpec()
     for symbol in _normalize_symbols(symbols):
         snapshots = load_thetadata_option_snapshots(
             symbol,
             dates,
-            max_dte=max_dte,
-            strike_range=strike_range,
             use_cache=use_cache,
             download_spec=spec,
             download_missing=download_missing,
@@ -184,8 +179,6 @@ def run_optopsy_backtest(spec: OptopsyBacktestSpec) -> OptopsyBacktestResult:
         spec.symbols,
         start_date=spec.start_date,
         end_date=spec.end_date,
-        max_dte=spec.max_entry_dte,
-        strike_range=spec.strike_range,
         use_cache=spec.use_cache,
         download_missing=spec.download_missing,
         allow_delta_proxy=spec.allow_delta_proxy,

@@ -90,10 +90,6 @@ THETADATA_OPTIONS_BACKFILL_UNIVERSE_CONFIG_SCHEMA = {
 THETADATA_OPTIONS_BACKFILL_SYMBOL_CONFIG_SCHEMA = {
     "start_date": Field(str, default_value="2018-01-02"),
     "end_date": Field(str, default_value="2026-06-30"),
-    "max_dte": Field(Noneable(int), default_value=None),
-    "strike_range": Field(Noneable(int), default_value=None),
-    "require_bid_ask": Field(bool, default_value=False),
-    "min_ask": Field(float, default_value=0.0),
     "backfill_window_days": Field(int, default_value=7),
     "fallback_window_days": Field(int, default_value=1),
     "request_sleep": Field(float, default_value=0.0),
@@ -295,12 +291,10 @@ def backfill_thetadata_options_symbol(context, symbol: str) -> dict[str, object]
 
     started = time.perf_counter()
     logger.info(
-        "Starting ThetaData options backfill for %s start=%s end=%s max_dte=%s strike_range=%s window_days=%s overwrite=%s",
+        "Starting full-chain ThetaData options backfill for %s start=%s end=%s window_days=%s overwrite=%s",
         symbol,
         config["start_date"],
         config["end_date"],
-        config["max_dte"],
-        config["strike_range"],
         config["backfill_window_days"],
         config["overwrite"],
     )
@@ -308,10 +302,6 @@ def backfill_thetadata_options_symbol(context, symbol: str) -> dict[str, object]
         symbols=(symbol,),
         start_date=config["start_date"],
         end_date=_optional(config["end_date"]),
-        max_dte=_optional_int(config["max_dte"]),
-        strike_range=_optional_int(config["strike_range"]),
-        require_bid_ask=bool(config["require_bid_ask"]),
-        min_ask=float(config["min_ask"]),
         backfill_window_days=int(config["backfill_window_days"]),
         fallback_window_days=int(config["fallback_window_days"]),
         skip_existing=not bool(config["overwrite"]),
@@ -373,12 +363,6 @@ defs = Definitions(
 def _optional(value: str) -> str | None:
     cleaned = str(value).strip()
     return cleaned or None
-
-
-def _optional_int(value: object) -> int | None:
-    if value is None:
-        return None
-    return int(value)
 
 
 def _csv_items(value: str) -> tuple[str, ...]:

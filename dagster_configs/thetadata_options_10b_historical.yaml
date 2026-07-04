@@ -19,10 +19,6 @@ ops:
     config:
       start_date: "2018-01-02"
       end_date: "2026-06-30"
-      max_dte:
-      strike_range:
-      require_bid_ask: false
-      min_ask: 0.0
       backfill_window_days: 7
       fallback_window_days: 1
       request_sleep: 0.0

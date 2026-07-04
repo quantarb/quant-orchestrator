@@ -306,8 +306,6 @@ ops:
     config:
       start_date: "2026-06-24"
       end_date: "2026-06-30"
-      max_dte: 90
-      strike_range: 10
       backfill_window_days: 7
       fallback_window_days: 1
       request_sleep: 0.0
@@ -343,8 +341,6 @@ ops:
     config:
       start_date: "2018-01-02"
       end_date: "2026-06-30"
-      max_dte: 90
-      strike_range: 10
       backfill_window_days: 7
       fallback_window_days: 1
       request_sleep: 0.0
