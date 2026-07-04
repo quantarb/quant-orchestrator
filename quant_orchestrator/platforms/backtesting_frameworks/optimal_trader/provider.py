@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Mapping
 
 import pandas as pd
 
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.data_adapter import (
+    load_strategy_dataset_artifact,
+)
 from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.equity import (
     OptimalTraderBacktestConfig,
     run_optimal_trader_equity_backtest,
@@ -16,8 +20,10 @@ class OptimalTraderBacktestEngine:
 
     def run(self, strategy: Any, data: Any, **kwargs: Any) -> Any:
         _ = strategy
+        if isinstance(data, (str, Path)):
+            data = load_strategy_dataset_artifact(data)
         if not isinstance(data, pd.DataFrame):
-            raise TypeError("optimal_trader.run requires a pandas strategy dataset DataFrame")
+            raise TypeError("optimal_trader.run requires a pandas strategy dataset DataFrame or artifact path")
         config = _resolve_config(kwargs)
         return run_optimal_trader_equity_backtest(data, config=config)
 

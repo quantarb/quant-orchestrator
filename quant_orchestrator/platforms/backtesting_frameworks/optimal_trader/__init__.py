@@ -1,3 +1,7 @@
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.data_adapter import (
+    load_strategy_dataset_artifact,
+    normalize_strategy_dataset_frame,
+)
 from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.equity import (
     OptimalTraderBacktestConfig,
     OptimalTraderBacktestResult,
@@ -25,6 +29,8 @@ __all__ = [
     "build_optimal_trader_daily_rows",
     "build_optimal_trader_trade_frame",
     "compute_optimal_trader_backtest",
+    "load_strategy_dataset_artifact",
+    "normalize_strategy_dataset_frame",
     "optimal_trader_provider",
     "prepare_optimal_trader_backtest_frame",
     "prepare_optimal_trader_position_state",

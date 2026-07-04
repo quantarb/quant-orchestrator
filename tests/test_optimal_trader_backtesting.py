@@ -5,6 +5,7 @@ import pytest
 
 from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader import (
     OptimalTraderBacktestConfig,
+    load_strategy_dataset_artifact,
     run_optimal_trader_equity_backtest,
 )
 from quant_orchestrator.platforms.registry import registry
@@ -50,6 +51,17 @@ def test_optimal_trader_provider_runs_strategy_dataset_frame() -> None:
     assert len(result.daily_rows) == 4
 
 
+def test_optimal_trader_provider_runs_saved_strategy_dataset_path(tmp_path) -> None:
+    path = tmp_path / "strategy_dataset.csv"
+    _strategy_frame().to_csv(path, index=False)
+    engine_cls = registry.adapter("backtesting_framework", "optimal_trader")
+    engine = engine_cls()
+
+    result = engine.run(None, path, config={"fee_bps": 0.0, "slippage_bps": 0.0})
+
+    assert result.final_equity == pytest.approx(1.08675)
+
+
 def test_optimal_trader_equity_backtest_uses_transaction_cost_fallback() -> None:
     result = run_optimal_trader_equity_backtest(
         _strategy_frame(),
@@ -63,6 +75,25 @@ def test_optimal_trader_equity_backtest_uses_transaction_cost_fallback() -> None
     daily = pd.DataFrame(result.daily_rows).set_index("date")
     assert daily["turnover_cost"].tolist() == pytest.approx([0.0, 0.0005, 0.0005, 0.001])
     assert daily["net_daily_return"].tolist() == pytest.approx([0.0, 0.1495, -0.1005, 0.049])
+
+
+def test_optimal_trader_data_adapter_loads_saved_strategy_dataset(tmp_path) -> None:
+    path = tmp_path / "strategy_dataset.pkl"
+    pd.DataFrame(
+        {
+            "Date": ["2024-01-02", "2024-01-02"],
+            "Symbol": ["aaa", "bbb"],
+            "Target Weight": [0.5, -0.5],
+            "Asset Return": [0.10, -0.20],
+        }
+    ).to_pickle(path)
+
+    dataset = load_strategy_dataset_artifact(path)
+
+    assert dataset.to_dict("records") == [
+        {"date": "2024-01-02", "symbol": "AAA", "target_weight": 0.5, "asset_return": 0.10},
+        {"date": "2024-01-02", "symbol": "BBB", "target_weight": -0.5, "asset_return": -0.20},
+    ]
 
 
 def _strategy_frame() -> pd.DataFrame:
