@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from quant_orchestrator.dagster_defs import defs
-from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.ml_score import (
+from quant_orchestrator.backtests.ml_score import (
     build_ml_score_signal_frame,
     run_ml_score_signal_backtest,
 )

@@ -43,6 +43,11 @@ from quant_orchestrator.research_tools.options_experiment import (
     run_trade_window_option_execution,
     run_trade_window_option_experiment,
 )
+from quant_orchestrator.research_tools.synthetic_options_experiment import (
+    SyntheticOptionsBacktestConfig,
+    SyntheticOptionsBacktestResult,
+    run_synthetic_options_backtest,
+)
 from quant_orchestrator.research_tools.synthetic_options_backtest import (
     SyntheticOptionsBacktestRunConfig,
     SyntheticOptionsBacktestRunResult,
@@ -68,6 +73,8 @@ __all__ = [
     "SharedSplitConfig",
     "SyntheticOptionsBacktestRunConfig",
     "SyntheticOptionsBacktestRunResult",
+    "SyntheticOptionsBacktestConfig",
+    "SyntheticOptionsBacktestResult",
     "build_classifier_signal_trade_windows",
     "build_option_window_dataset",
     "build_family_prediction_frame",
@@ -89,6 +96,7 @@ __all__ = [
     "run_backtest_report_option_execution",
     "run_backtest_report_option_experiment",
     "run_oracle_option_experiment",
+    "run_synthetic_options_backtest",
     "run_synthetic_options_backtest_experiment",
     "run_trade_window_option_execution",
     "run_trade_window_option_experiment",

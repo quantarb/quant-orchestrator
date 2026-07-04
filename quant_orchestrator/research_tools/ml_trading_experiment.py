@@ -18,7 +18,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.shared_book import (
     run_shared_book_backtest,
     shared_book_performance_metrics,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.ml_score import (
+from quant_orchestrator.backtests.ml_score import (
     run_ml_score_signal_backtest,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.zipline.shared_book import (

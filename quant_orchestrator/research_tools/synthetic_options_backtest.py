@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from quant_orchestrator.platforms.backtesting_frameworks.panel_weight import (
+from quant_orchestrator.research_tools.synthetic_options_experiment import (
     SyntheticOptionsBacktestConfig,
     SyntheticOptionsBacktestResult,
     run_synthetic_options_backtest,

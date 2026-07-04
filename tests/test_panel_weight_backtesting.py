@@ -6,21 +6,21 @@ import pandas as pd
 from quant_orchestrator.platforms.registry import registry
 from quant_orchestrator.platforms.backtesting_frameworks.panel_weight import (
     ExecutionConfig,
-    SyntheticOptionsBacktestConfig,
     backtest_panel,
     build_constant_maturity_call_price_panel,
     build_realized_vol_panel,
     build_synthetic_option_return_panels,
-    run_synthetic_options_backtest,
     run_top_k_long_short_score_rule,
 )
 from quant_orchestrator.research_tools.synthetic_options_backtest import (
     SyntheticOptionsBacktestRunConfig,
     run_synthetic_options_backtest_experiment,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.synthetic_options_experiment import (
+from quant_orchestrator.research_tools.synthetic_options_experiment import (
+    SyntheticOptionsBacktestConfig,
     _build_maturing_option_return_panel,
     _build_real_quote_option_return_panel,
+    run_synthetic_options_backtest,
 )
 
 
