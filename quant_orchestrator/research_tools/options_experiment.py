@@ -10,15 +10,14 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from quant_warehouse.platforms.data_providers.thetadata.settlement import (
-    OptionSettlement,
-    settle_option_exit,
-)
 
 from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
     NormalizedBacktestReport,
     normalize_trade_windows as normalize_report_trade_windows,
     report_trade_windows,
+)
+from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.thetadata_data_adapter import (
+    settle_panel_weight_thetadata_option_exit,
 )
 from quant_orchestrator.research_tools.option_trade_execution import (
     OptionTradeExecutionBatch,
@@ -1678,8 +1677,8 @@ class _OptionRetriever:
         equity_exit_date: pd.Timestamp,
         row,
         option_type: str,
-    ) -> OptionSettlement | None:
-        return settle_option_exit(
+    ) -> Any | None:
+        return settle_panel_weight_thetadata_option_exit(
             symbol=symbol,
             contract_symbol=str(row.contract_symbol),
             option_type=option_type,
@@ -3455,22 +3454,23 @@ def _prepare_quant_warehouse_import(path: str | None) -> None:
 def _warehouse_imports():
     from quant_warehouse import Warehouse
     from quant_warehouse.platforms.data_providers.fmp.target_engineering import LabelBuildSpec, build_trade_results
-    from quant_warehouse.platforms.data_providers.thetadata.feature_engineering import (
-        build_option_contract_features,
-        option_ranker_feature_columns,
+    from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.thetadata_data_adapter import (
+        build_panel_weight_thetadata_option_contract_features,
+        build_panel_weight_thetadata_option_mean_variance_labels,
+        panel_weight_thetadata_option_chain_coverage,
+        panel_weight_thetadata_option_ranker_feature_columns,
+        read_panel_weight_thetadata_option_chain,
     )
-    from quant_warehouse.platforms.data_providers.thetadata.target_engineering import build_option_mean_variance_labels
-    from quant_warehouse.platforms.data_providers.thetadata.options import read_option_chain_arctic, option_chain_coverage
 
     return (
         Warehouse,
         LabelBuildSpec,
         build_trade_results,
-        read_option_chain_arctic,
-        option_chain_coverage,
-        build_option_contract_features,
-        option_ranker_feature_columns,
-        build_option_mean_variance_labels,
+        read_panel_weight_thetadata_option_chain,
+        panel_weight_thetadata_option_chain_coverage,
+        build_panel_weight_thetadata_option_contract_features,
+        panel_weight_thetadata_option_ranker_feature_columns,
+        build_panel_weight_thetadata_option_mean_variance_labels,
     )
 
 

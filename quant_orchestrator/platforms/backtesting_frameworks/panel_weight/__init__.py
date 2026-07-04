@@ -32,10 +32,20 @@ from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.synthetic_
     SyntheticOptionsBacktestResult,
     run_synthetic_options_backtest,
 )
+from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.thetadata_data_adapter import (
+    PANEL_WEIGHT_THETADATA_OPTION_COLUMNS,
+    build_panel_weight_thetadata_option_contract_features,
+    build_panel_weight_thetadata_option_mean_variance_labels,
+    panel_weight_thetadata_option_chain_coverage,
+    panel_weight_thetadata_option_ranker_feature_columns,
+    read_panel_weight_thetadata_option_chain,
+    settle_panel_weight_thetadata_option_exit,
+)
 
 __all__ = [
     "BacktestResult",
     "ExecutionConfig",
+    "PANEL_WEIGHT_THETADATA_OPTION_COLUMNS",
     "PanelWeightBacktestEngine",
     "Strategy",
     "SyntheticOptionsBacktestConfig",
@@ -44,10 +54,14 @@ __all__ = [
     "backtest_positions_with_directional_asset_returns",
     "build_constant_maturity_call_price_panel",
     "build_constant_maturity_put_price_panel",
+    "build_panel_weight_thetadata_option_contract_features",
+    "build_panel_weight_thetadata_option_mean_variance_labels",
     "build_panel_from_daily_by_symbol",
     "build_realized_vol_panel",
     "build_synthetic_option_return_panels",
     "ensure_panel_index",
+    "panel_weight_thetadata_option_chain_coverage",
+    "panel_weight_thetadata_option_ranker_feature_columns",
     "panel_weight_provider",
     "prepare_backtest_position_state",
     "resolve_component_cols",
@@ -57,5 +71,7 @@ __all__ = [
     "run_top_k_long_only_score_rule",
     "run_top_k_long_short_score_rule",
     "run_top_k_momentum_baseline",
+    "read_panel_weight_thetadata_option_chain",
+    "settle_panel_weight_thetadata_option_exit",
     "summarize_curve",
 ]

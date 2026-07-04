@@ -26,6 +26,9 @@ from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.synthetic_
     build_realized_vol_panel,
     build_synthetic_option_return_panels,
 )
+from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.thetadata_data_adapter import (
+    read_panel_weight_thetadata_option_chain,
+)
 
 FamilyPanelBuilder = Callable[[str], pd.DataFrame]
 OptionChainLoader = Callable[[str, pd.Timestamp, pd.Timestamp], pd.DataFrame]
@@ -553,11 +556,7 @@ def _load_option_chain_frame(
     loader = config.option_chain_loader
     if loader is None:
         try:
-            from quant_warehouse.platforms.data_providers.thetadata.options import read_option_chain_arctic
-        except Exception:
-            frame = pd.DataFrame()
-        else:
-            frame = read_option_chain_arctic(
+            frame = read_panel_weight_thetadata_option_chain(
                 str(symbol).upper(),
                 start_date=start,
                 end_date=end,
@@ -574,6 +573,8 @@ def _load_option_chain_frame(
                     "open_interest",
                 ],
             )
+        except Exception:
+            frame = pd.DataFrame()
     else:
         frame = loader(str(symbol).upper(), start, end)
     option_chain_cache[key] = pd.DataFrame() if frame is None else frame.copy()
