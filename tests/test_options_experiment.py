@@ -148,10 +148,14 @@ def test_selector_summaries_include_simplified_model_selectors() -> None:
     assert set(summary["selector"]) == {
         "rule_atm_90d",
         "model_ranker",
+        "oracle_best_possible",
         "model_mv_basket",
+        "oracle_mv_basket",
     }
     assert selected["rule_atm_90d"].set_index("trade_id").loc["t1", "dte_gap"] == 1.0
     assert selected["model_ranker"].set_index("trade_id").loc["t1", "pred_return"] == 0.2
+    assert selected["oracle_best_possible"].set_index("trade_id").loc["t1", "option_return"] == 0.5
+    assert selected["oracle_best_possible"].set_index("trade_id").loc["t2", "option_return"] == 0.8
 
 
 def test_selector_summaries_do_not_use_oracle_when_model_predictions_missing() -> None:
@@ -175,6 +179,7 @@ def test_selector_summaries_do_not_use_oracle_when_model_predictions_missing() -
 
     assert selected["model_ranker"].empty
     assert summary.set_index("selector").loc["model_ranker", "trades"] == 0
+    assert summary.set_index("selector").loc["oracle_best_possible", "trades"] == 1
 
 
 def test_selector_summaries_respect_mv_basket_limits() -> None:

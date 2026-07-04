@@ -3,9 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 from time import perf_counter
 
 import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from quant_orchestrator.research_tools.ml_trading import write_ml_trading_artifact_files
 from quant_orchestrator.research_tools.ml_trading_experiment import (
@@ -51,8 +56,8 @@ def main() -> None:
     parser.add_argument("--equity-artifact-dir", default="")
     parser.add_argument("--option-groups", default="")
     parser.add_argument("--max-option-groups", type=int, default=0)
-    parser.add_argument("--run-rule", action="store_true", default=True)
-    parser.add_argument("--run-full-chain", action="store_true", default=True)
+    parser.add_argument("--run-rule", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-full-chain", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     started = perf_counter()
@@ -188,6 +193,10 @@ def _run_option_group(
     retrieval: OptionRetrievalConfig,
     log_mlflow: bool,
 ) -> dict[str, object]:
+    if variant_name == "option_full_chain_actions" and retrieval.option_universe != "full_chain_actions":
+        raise ValueError(
+            "option_full_chain_actions must use OptionRetrievalConfig(option_universe='full_chain_actions')"
+        )
     artifact_dir = root / "options" / variant_name / group_name.replace("/", "_")
     config = OracleOptionExperimentConfig(
         experiment_name=f"clean_oracle_1t_{variant_name}_{group_name}",

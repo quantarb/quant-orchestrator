@@ -40,6 +40,7 @@ class OptionRetrievalConfig:
     require_affordable: bool = True
     min_affordable_contracts: int = 1
     exit_lookback_days: int = 7
+    price_eval_candidates: bool = True
     chain_columns: tuple[str, ...] = (
         "snapshot_date",
         "contract_symbol",
@@ -130,6 +131,8 @@ class OracleOptionExperimentResult:
     symbol_summary: pd.DataFrame
     source_family_summary: pd.DataFrame
     feature_coverage: pd.DataFrame
+    selected_option_trades: pd.DataFrame
+    selected_option_paths: pd.DataFrame
     metrics: dict[str, float]
     artifact_paths: dict[str, Path]
     analysis_markdown: str
@@ -157,6 +160,8 @@ class OptionExperimentArtifacts:
     symbol_summary: pd.DataFrame
     source_family_summary: pd.DataFrame
     feature_coverage: pd.DataFrame
+    selected_option_trades: pd.DataFrame
+    selected_option_paths: pd.DataFrame
     metrics: dict[str, Any]
     config: dict[str, Any]
     analysis_markdown: str
@@ -633,36 +638,72 @@ def _run_option_experiment_from_trades(
         read_option_chain_arctic=read_option_chain_arctic,
         build_option_contract_features=build_option_contract_features,
     )
-    option_panel = _build_option_panel(oracle_trades, retriever)
-    if config.mv_basket.enabled:
-        option_panel = _add_mean_variance_basket_labels(
-            option_panel,
-            config.mv_basket,
-            build_option_mean_variance_labels=build_option_mean_variance_labels,
-        )
-    train_panel, eval_panel = _split_option_panel(option_panel, config.split)
+    phase_metrics: dict[str, float] = {}
+    phase_started = perf_counter()
+    if config.retrieval.price_eval_candidates:
+        option_panel = _build_option_panel(oracle_trades, retriever, price_exit=True)
+        phase_metrics["phase_option_panel_seconds"] = float(perf_counter() - phase_started)
+        phase_started = perf_counter()
+        if config.mv_basket.enabled:
+            option_panel = _add_mean_variance_basket_labels(
+                option_panel,
+                config.mv_basket,
+                build_option_mean_variance_labels=build_option_mean_variance_labels,
+            )
+        phase_metrics["phase_mv_labels_seconds"] = float(perf_counter() - phase_started)
+        phase_started = perf_counter()
+        train_panel, eval_panel = _split_option_panel(option_panel, config.split)
+    else:
+        train_trades, eval_trades = _split_trade_windows(oracle_trades, config.split)
+        train_panel = _build_option_panel(train_trades, retriever, price_exit=True)
+        eval_panel = _build_option_panel(eval_trades, retriever, price_exit=False)
+        phase_metrics["phase_option_panel_seconds"] = float(perf_counter() - phase_started)
+        phase_started = perf_counter()
+        if config.mv_basket.enabled:
+            train_panel = _add_mean_variance_basket_labels(
+                train_panel,
+                config.mv_basket,
+                build_option_mean_variance_labels=build_option_mean_variance_labels,
+            )
+        phase_metrics["phase_mv_labels_seconds"] = float(perf_counter() - phase_started)
+        phase_started = perf_counter()
+        option_panel = pd.concat([train_panel, eval_panel], ignore_index=True) if not eval_panel.empty else train_panel.copy()
+    phase_metrics["phase_split_seconds"] = float(perf_counter() - phase_started)
+    phase_started = perf_counter()
     model, model_metrics, eval_scored = _train_option_ranker(
         train_panel,
         eval_panel,
         config=config,
         option_ranker_feature_columns=option_ranker_feature_columns,
     )
+    phase_metrics["phase_return_ranker_seconds"] = float(perf_counter() - phase_started)
+    phase_started = perf_counter()
     mv_model, mv_metrics, eval_scored = _train_mv_basket_ranker(
         train_panel,
         eval_scored,
         config=config,
         option_ranker_feature_columns=option_ranker_feature_columns,
     )
+    phase_metrics["phase_mv_ranker_seconds"] = float(perf_counter() - phase_started)
     model_payload = {"single_leg_ranker": model, "mv_basket_ranker": mv_model}
+    model_metrics.update(phase_metrics)
     model_metrics.update(mv_metrics)
-    model_metrics.update(retriever.metrics())
-    selector_summary, symbol_summary, selected_by_selector = _selector_summaries(eval_scored, mv_basket_config=config.mv_basket)
+    phase_started = perf_counter()
+    selected_by_selector = _select_options_by_selector(eval_scored, mv_basket_config=config.mv_basket)
+    selected_by_selector, selected_option_paths = _price_selected_by_selector(selected_by_selector, retriever)
+    selected_option_trades = _selected_by_selector_to_frame(selected_by_selector)
+    selector_summary, symbol_summary = _summarize_selected_by_selector(selected_by_selector)
     source_family_summary = _source_family_diagnostics(eval_scored, selected_by_selector)
     feature_coverage = _option_feature_coverage(option_panel, train_panel=train_panel, eval_panel=eval_scored)
+    model_metrics.update(retriever.metrics())
     model_metrics.update(_option_feature_coverage_metrics(feature_coverage))
+    model_metrics["phase_summaries_seconds"] = float(perf_counter() - phase_started)
+    phase_started = perf_counter()
     optopsy_summary = _run_optopsy_selector_backtests(selected_by_selector, config.execution)
+    model_metrics["phase_optopsy_seconds"] = float(perf_counter() - phase_started)
     elapsed_seconds = perf_counter() - started
     model_metrics["elapsed_seconds"] = float(elapsed_seconds)
+    phase_started = perf_counter()
     analysis_markdown = _build_analysis(
         config,
         oracle_trades=oracle_trades,
@@ -675,6 +716,7 @@ def _run_option_experiment_from_trades(
         feature_coverage=feature_coverage,
         metrics=model_metrics,
     )
+    model_metrics["phase_analysis_seconds"] = float(perf_counter() - phase_started)
     artifact_paths = write_oracle_option_artifacts(
         config=config,
         coverage=coverage,
@@ -687,6 +729,8 @@ def _run_option_experiment_from_trades(
         symbol_summary=symbol_summary,
         source_family_summary=source_family_summary,
         feature_coverage=feature_coverage,
+        selected_option_trades=selected_option_trades,
+        selected_option_paths=selected_option_paths,
         model=model_payload,
         metrics=model_metrics,
         analysis_markdown=analysis_markdown,
@@ -708,6 +752,8 @@ def _run_option_experiment_from_trades(
         symbol_summary=symbol_summary,
         source_family_summary=source_family_summary,
         feature_coverage=feature_coverage,
+        selected_option_trades=selected_option_trades,
+        selected_option_paths=selected_option_paths,
         metrics=model_metrics,
         artifact_paths=artifact_paths,
         analysis_markdown=analysis_markdown,
@@ -732,14 +778,22 @@ class _OptionRetriever:
         self.build_option_contract_features = build_option_contract_features
         self._chain_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame] = {}
         self._underlying_cache: dict[tuple[str, pd.Timestamp], float | None] = {}
+        self._nearest_exit_snapshot_cache: dict[tuple[str, pd.Timestamp], pd.Timestamp | None] = {}
+        self._chain_quote_cache: dict[tuple[str, pd.Timestamp], dict[str, tuple[float, float, float]]] = {}
+        self._contract_path_cache: dict[tuple[str, str, pd.Timestamp, pd.Timestamp], pd.DataFrame] = {}
         self.chain_read_count = 0
         self.chain_cache_hits = 0
+        self.nearest_exit_cache_hits = 0
+        self.chain_quote_cache_hits = 0
+        self.contract_path_read_count = 0
+        self.contract_path_cache_hits = 0
+        self.chain_duplicate_rows_dropped = 0
         self.underlying_lookup_count = 0
         self.underlying_cache_hits = 0
         self.affordability_checked_count = 0
         self.affordability_filtered_count = 0
 
-    def retrieve(self, trade: pd.Series) -> pd.DataFrame:
+    def retrieve(self, trade: pd.Series, *, price_exit: bool = True) -> pd.DataFrame:
         symbol = str(trade["symbol"]).upper()
         side = str(trade["side"]).lower()
         entry_date = pd.Timestamp(trade["entry_date"]).normalize()
@@ -759,6 +813,7 @@ class _OptionRetriever:
                 realized_holding_days=realized_holding_days,
                 spot=float(spot),
                 entry_chain=entry_chain,
+                price_exit=price_exit,
             )
         option_type = "call" if side == "long" else "put"
         candidates = entry_chain.loc[entry_chain["option_type"].astype(str).str.lower().str.startswith(option_type[0])].copy()
@@ -794,13 +849,8 @@ class _OptionRetriever:
         ).df
         rows = []
         for row in candidates.itertuples(index=False):
-            exit_row = self._price_exit(symbol, equity_exit_date, row, option_type)
-            if exit_row is None:
-                continue
-            exit_snapshot_date, exit_mid = exit_row
             entry_mid = float(row.mid)
             entry_price = float(getattr(row, "ask", entry_mid))
-            exit_price = float(exit_mid)
             row_payload = {
                     "trade_id": trade.get("trade_id", f"{symbol}|{entry_date.date()}|{side}"),
                     "symbol": symbol,
@@ -808,19 +858,19 @@ class _OptionRetriever:
                     "equity_signal_side": side,
                     "entry_date": entry_date,
                     "equity_exit_date": equity_exit_date,
-                    "option_exit_date": exit_snapshot_date,
+                    "option_exit_date": pd.NaT,
                     "expiration": pd.Timestamp(row.expiration).normalize(),
                     "contract_symbol": row.contract_symbol,
                     "option_type": option_type,
                     "option_action": "buy_call" if option_type == "call" else "buy_put",
                     "strike": float(row.strike),
                     "entry_mid": entry_mid,
-                    "exit_mid": float(exit_mid),
+                    "exit_mid": np.nan,
                     "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "option_pnl": exit_price - entry_price,
+                    "exit_price": np.nan,
+                    "option_pnl": np.nan,
                     "return_denominator": entry_price,
-                    "option_return": (exit_price - entry_price) / entry_price if entry_price > 0 else np.nan,
+                    "option_return": np.nan,
                     "allocation_fraction": _nan_float(getattr(row, "allocation_fraction", np.nan)),
                     "allocation_budget": _nan_float(getattr(row, "allocation_budget", np.nan)),
                     "affordable_contracts": _nan_float(getattr(row, "affordable_contracts", np.nan)),
@@ -840,6 +890,11 @@ class _OptionRetriever:
                 if value is not None and not pd.isna(value):
                     row_payload[col] = str(value)
             row_payload.update(_row_feature_payload(row))
+            if price_exit:
+                priced = self._price_option_payload(row_payload)
+                if priced is None:
+                    continue
+                row_payload = priced
             rows.append(row_payload)
         return pd.DataFrame(rows)
 
@@ -854,6 +909,7 @@ class _OptionRetriever:
         realized_holding_days: int,
         spot: float,
         entry_chain: pd.DataFrame,
+        price_exit: bool = True,
     ) -> pd.DataFrame:
         candidates = entry_chain.copy()
         candidates["option_type"] = candidates["option_type"].astype(str).str.lower().str.strip()
@@ -899,23 +955,15 @@ class _OptionRetriever:
             option_action = _option_action_for_signal(side, option_type)
             if option_action is None:
                 continue
-            exit_prices = self._price_exit_prices(symbol, equity_exit_date, row, option_type)
-            if exit_prices is None:
-                continue
-            exit_snapshot_date, exit_bid, exit_ask, exit_mid = exit_prices
             entry_bid = _nan_float(getattr(row, "bid", np.nan))
             entry_ask = _nan_float(getattr(row, "ask", np.nan))
             if option_action.startswith("buy_"):
                 entry_price = entry_ask
-                exit_price = exit_bid
-                pnl = exit_price - entry_price
                 denominator = entry_price
             else:
                 entry_price = entry_bid
-                exit_price = exit_ask
-                pnl = entry_price - exit_price
                 denominator = float(row.strike) if option_action == "sell_put" else float(spot)
-            if not np.isfinite(entry_price) or not np.isfinite(exit_price) or not np.isfinite(denominator) or denominator <= 0:
+            if not np.isfinite(entry_price) or not np.isfinite(denominator) or denominator <= 0:
                 continue
             row_payload = {
                 "trade_id": trade.get("trade_id", f"{symbol}|{entry_date.date()}|{side}"),
@@ -924,23 +972,23 @@ class _OptionRetriever:
                 "equity_signal_side": side,
                 "entry_date": entry_date,
                 "equity_exit_date": equity_exit_date,
-                "option_exit_date": exit_snapshot_date,
+                "option_exit_date": pd.NaT,
                 "expiration": pd.Timestamp(row.expiration).normalize(),
                 "contract_symbol": row.contract_symbol,
                 "option_type": option_type,
                 "option_action": option_action,
                 "strike": float(row.strike),
                 "entry_mid": _nan_float(getattr(row, "mid", np.nan)),
-                "exit_mid": float(exit_mid),
+                "exit_mid": np.nan,
                 "entry_bid": entry_bid,
                 "entry_ask": entry_ask,
-                "exit_bid": float(exit_bid),
-                "exit_ask": float(exit_ask),
+                "exit_bid": np.nan,
+                "exit_ask": np.nan,
                 "entry_price": float(entry_price),
-                "exit_price": float(exit_price),
-                "option_pnl": float(pnl),
+                "exit_price": np.nan,
+                "option_pnl": np.nan,
                 "return_denominator": float(denominator),
-                "option_return": float(pnl) / float(denominator),
+                "option_return": np.nan,
                 "realized_holding_days": realized_holding_days,
                 "realized_underlying_trade_return": pd.to_numeric(trade.get("ret_dec"), errors="coerce"),
             }
@@ -957,8 +1005,218 @@ class _OptionRetriever:
                 if value is not None and not pd.isna(value):
                     row_payload[col] = value if col == "top_k" else str(value)
             row_payload.update(_row_feature_payload(row))
+            if price_exit:
+                priced = self._price_option_payload(row_payload)
+                if priced is None:
+                    continue
+                row_payload = priced
             rows.append(row_payload)
         return pd.DataFrame(rows)
+
+    def price_selected_options(self, selected: pd.DataFrame) -> pd.DataFrame:
+        priced, _paths = self.price_selected_options_with_paths(selected)
+        return priced
+
+    def price_selected_options_with_paths(
+        self,
+        selected: pd.DataFrame,
+        *,
+        selector_name: str | None = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if selected.empty:
+            return selected.copy(), pd.DataFrame()
+        rows = []
+        path_frames = []
+        for payload in selected.to_dict("records"):
+            priced, path = self._price_selected_option_payload_with_path(payload, selector_name=selector_name)
+            if priced is not None:
+                rows.append(priced)
+            if path is not None and not path.empty:
+                path_frames.append(path)
+        priced_frame = pd.DataFrame(rows) if rows else pd.DataFrame(columns=selected.columns)
+        path_frame = pd.concat(path_frames, ignore_index=True) if path_frames else pd.DataFrame()
+        return priced_frame, path_frame
+
+    def _price_selected_option_payload_with_path(
+        self,
+        payload: dict[str, Any],
+        *,
+        selector_name: str | None,
+    ) -> tuple[dict[str, Any] | None, pd.DataFrame]:
+        priced = self._price_option_payload(payload)
+        if priced is None:
+            return None, pd.DataFrame()
+        path = self._selected_contract_path(payload, priced=priced, selector_name=selector_name)
+        stats = _selected_contract_path_stats(path)
+        if stats:
+            priced.update(stats)
+        return priced, path
+
+    def _price_option_payload(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        symbol = str(payload.get("symbol", "")).upper()
+        equity_exit_date = pd.Timestamp(payload.get("equity_exit_date")).normalize()
+        option_type = "call" if str(payload.get("option_type", "")).lower().startswith("c") else "put"
+        row = SimpleNamespace(**payload)
+        exit_prices = self._price_exit_prices(symbol, equity_exit_date, row, option_type)
+        if exit_prices is None:
+            return None
+        exit_snapshot_date, exit_bid, exit_ask, exit_mid = exit_prices
+        option_action = str(payload.get("option_action", ""))
+        entry_price = _nan_float(payload.get("entry_price", np.nan))
+        if not np.isfinite(entry_price):
+            if option_action.startswith("buy_"):
+                entry_price = _nan_float(payload.get("entry_ask", payload.get("entry_mid", np.nan)))
+            else:
+                entry_price = _nan_float(payload.get("entry_bid", payload.get("entry_mid", np.nan)))
+        denominator = _nan_float(payload.get("return_denominator", np.nan))
+        if not np.isfinite(denominator) or denominator <= 0:
+            if option_action == "sell_put":
+                denominator = _nan_float(payload.get("strike", np.nan))
+            elif option_action == "sell_call":
+                denominator = _nan_float(payload.get("underlying_spot_entry", np.nan))
+            else:
+                denominator = entry_price
+        if option_action.startswith("buy_"):
+            exit_price = float(exit_bid)
+            pnl = exit_price - float(entry_price)
+        else:
+            exit_price = float(exit_ask)
+            pnl = float(entry_price) - exit_price
+        if not np.isfinite(entry_price) or not np.isfinite(exit_price) or not np.isfinite(denominator) or denominator <= 0:
+            return None
+        priced = dict(payload)
+        priced.update(
+            {
+                "option_exit_date": pd.Timestamp(exit_snapshot_date).normalize(),
+                "exit_mid": float(exit_mid),
+                "exit_bid": float(exit_bid),
+                "exit_ask": float(exit_ask),
+                "entry_price": float(entry_price),
+                "exit_price": float(exit_price),
+                "option_pnl": float(pnl),
+                "return_denominator": float(denominator),
+                "option_return": float(pnl) / float(denominator),
+            }
+        )
+        return priced
+
+    def _selected_contract_path(
+        self,
+        payload: dict[str, Any],
+        *,
+        priced: dict[str, Any],
+        selector_name: str | None,
+    ) -> pd.DataFrame:
+        symbol = str(payload.get("symbol", "")).upper()
+        contract_symbol = str(payload.get("contract_symbol", ""))
+        entry_date = pd.Timestamp(payload.get("entry_date")).normalize()
+        expiration = pd.Timestamp(payload.get("expiration")).normalize()
+        equity_exit_date = pd.Timestamp(payload.get("equity_exit_date")).normalize()
+        target_exit = min(equity_exit_date, expiration)
+        path = self._load_contract_price_path(symbol, contract_symbol, entry_date, target_exit)
+        option_action = str(payload.get("option_action", ""))
+        if path.empty:
+            path = pd.DataFrame()
+        else:
+            path = path.copy()
+        final_date = pd.Timestamp(priced["option_exit_date"]).normalize()
+        if path.empty or not pd.to_datetime(path["snapshot_date"], errors="coerce").dt.normalize().eq(final_date).any():
+            path = pd.concat(
+                [
+                    path,
+                    pd.DataFrame(
+                        [
+                            {
+                                "snapshot_date": final_date,
+                                "contract_symbol": contract_symbol,
+                                "bid": priced.get("exit_bid", np.nan),
+                                "ask": priced.get("exit_ask", np.nan),
+                                "mid": priced.get("exit_mid", np.nan),
+                            }
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+        if path.empty:
+            return path
+        path["snapshot_date"] = pd.to_datetime(path["snapshot_date"], errors="coerce").dt.normalize()
+        for col in ("bid", "ask", "mid"):
+            if col not in path.columns:
+                path[col] = np.nan
+            path[col] = pd.to_numeric(path[col], errors="coerce")
+        quote_col = "bid" if option_action.startswith("buy_") else "ask"
+        path["mark_price"] = path[quote_col].where(path[quote_col].notna(), path["mid"])
+        entry_price = _nan_float(priced.get("entry_price", np.nan))
+        denominator = _nan_float(priced.get("return_denominator", np.nan))
+        if option_action.startswith("buy_"):
+            path["path_pnl"] = path["mark_price"] - entry_price
+        else:
+            path["path_pnl"] = entry_price - path["mark_price"]
+        path["path_return"] = path["path_pnl"] / denominator if np.isfinite(denominator) and denominator > 0 else np.nan
+        path["selector"] = selector_name
+        path["trade_id"] = payload.get("trade_id")
+        path["symbol"] = symbol
+        path["side"] = payload.get("side")
+        path["option_action"] = option_action
+        path["option_type"] = payload.get("option_type")
+        path["entry_date"] = entry_date
+        path["equity_exit_date"] = equity_exit_date
+        path["option_exit_date"] = final_date
+        path["expiration"] = expiration
+        path["strike"] = _nan_float(payload.get("strike", np.nan))
+        path["entry_price"] = entry_price
+        path["return_denominator"] = denominator
+        path["expired_before_equity_exit"] = bool(expiration < equity_exit_date)
+        return path.sort_values(["snapshot_date", "contract_symbol"]).reset_index(drop=True)
+
+    def _load_contract_price_path(
+        self,
+        symbol: str,
+        contract_symbol: str,
+        start_date: pd.Timestamp,
+        end_date: pd.Timestamp,
+    ) -> pd.DataFrame:
+        key = (
+            str(symbol).upper(),
+            str(contract_symbol),
+            pd.Timestamp(start_date).normalize(),
+            pd.Timestamp(end_date).normalize(),
+        )
+        cached = self._contract_path_cache.get(key)
+        if cached is not None:
+            self.contract_path_cache_hits += 1
+            return cached.copy()
+        self.contract_path_read_count += 1
+        columns = list(dict.fromkeys([*self.config.chain_columns, "snapshot_date", "contract_symbol", "bid", "ask", "mid"]))
+        chain = self.read_option_chain_arctic(
+            key[0],
+            start_date=key[2],
+            end_date=key[3],
+            columns=columns,
+        )
+        if chain.empty or "contract_symbol" not in chain.columns:
+            out = pd.DataFrame()
+        else:
+            out = chain.loc[chain["contract_symbol"].astype(str).eq(key[1])].copy()
+            if not out.empty:
+                if "snapshot_date" not in out.columns:
+                    out["snapshot_date"] = out.index
+                out["snapshot_date"] = pd.to_datetime(out["snapshot_date"], errors="coerce").dt.normalize()
+                for col in ("bid", "ask", "mid"):
+                    if col not in out.columns:
+                        out[col] = np.nan
+                    out[col] = pd.to_numeric(out[col], errors="coerce")
+                missing_mid = out["mid"].isna() & out["bid"].notna() & out["ask"].notna()
+                out.loc[missing_mid, "mid"] = (out.loc[missing_mid, "bid"] + out.loc[missing_mid, "ask"]) / 2.0
+                out = (
+                    out.loc[out["snapshot_date"].notna()]
+                    .sort_values("snapshot_date")
+                    .drop_duplicates("snapshot_date", keep="last")
+                    .reset_index(drop=True)
+                )
+        self._contract_path_cache[key] = out.copy()
+        return out
 
     def _filter_affordable_candidates(self, candidates: pd.DataFrame, trade: pd.Series) -> pd.DataFrame:
         if candidates.empty or not bool(self.config.require_affordable):
@@ -993,19 +1251,12 @@ class _OptionRetriever:
     def _price_exit_prices(self, symbol: str, equity_exit_date: pd.Timestamp, row, option_type: str) -> tuple[pd.Timestamp, float, float, float] | None:
         expiration = pd.Timestamp(row.expiration).normalize()
         target_exit = min(pd.Timestamp(equity_exit_date).normalize(), expiration)
-        exit_snapshot_date, exit_chain = self._load_nearest_exit_chain(symbol, target_exit)
-        if not exit_chain.empty:
-            match = exit_chain.loc[exit_chain["contract_symbol"].astype(str).eq(str(row.contract_symbol))]
-            if not match.empty:
-                bid = pd.to_numeric(match.iloc[0].get("bid"), errors="coerce")
-                ask = pd.to_numeric(match.iloc[0].get("ask"), errors="coerce")
-                mid = pd.to_numeric(match.iloc[0].get("mid"), errors="coerce")
-                if pd.isna(mid) and pd.notna(bid) and pd.notna(ask):
-                    mid = (float(bid) + float(ask)) / 2.0
-                if pd.notna(mid):
-                    bid = mid if pd.isna(bid) else bid
-                    ask = mid if pd.isna(ask) else ask
-                    return pd.Timestamp(exit_snapshot_date).normalize(), float(bid), float(ask), float(mid)
+        exit_snapshot_date = self._nearest_exit_snapshot(symbol, target_exit)
+        if exit_snapshot_date is not None:
+            quote = self._chain_quote(symbol, exit_snapshot_date, str(row.contract_symbol))
+            if quote is not None:
+                bid, ask, mid = quote
+                return pd.Timestamp(exit_snapshot_date).normalize(), float(bid), float(ask), float(mid)
         if target_exit >= expiration:
             close = self._underlying_close(symbol, target_exit)
             if close is None:
@@ -1015,12 +1266,57 @@ class _OptionRetriever:
         return None
 
     def _load_nearest_exit_chain(self, symbol: str, target_date: pd.Timestamp) -> tuple[pd.Timestamp | None, pd.DataFrame]:
-        target = pd.Timestamp(target_date).normalize()
-        for date in pd.bdate_range(target, target - pd.Timedelta(days=self.config.exit_lookback_days), freq="-1B"):
-            chain = self._load_day_chain(symbol, pd.Timestamp(date))
+        snapshot = self._nearest_exit_snapshot(symbol, target_date)
+        if snapshot is None:
+            return None, pd.DataFrame()
+        return snapshot, self._load_day_chain(symbol, snapshot)
+
+    def _nearest_exit_snapshot(self, symbol: str, target_date: pd.Timestamp) -> pd.Timestamp | None:
+        key = (str(symbol).upper(), pd.Timestamp(target_date).normalize())
+        if key in self._nearest_exit_snapshot_cache:
+            self.nearest_exit_cache_hits += 1
+            return self._nearest_exit_snapshot_cache[key]
+        for date in pd.bdate_range(key[1], key[1] - pd.Timedelta(days=self.config.exit_lookback_days), freq="-1B"):
+            snapshot = pd.Timestamp(date).normalize()
+            chain = self._load_day_chain(key[0], snapshot)
             if not chain.empty:
-                return pd.Timestamp(date).normalize(), chain
-        return None, pd.DataFrame()
+                self._nearest_exit_snapshot_cache[key] = snapshot
+                return snapshot
+        self._nearest_exit_snapshot_cache[key] = None
+        return None
+
+    def _chain_quote(self, symbol: str, snapshot_date: pd.Timestamp, contract_symbol: str) -> tuple[float, float, float] | None:
+        key = (str(symbol).upper(), pd.Timestamp(snapshot_date).normalize())
+        quote_map = self._chain_quote_cache.get(key)
+        if quote_map is not None:
+            self.chain_quote_cache_hits += 1
+        else:
+            chain = self._load_day_chain(key[0], key[1])
+            if chain.empty or "contract_symbol" not in chain.columns:
+                quote_map = {}
+            else:
+                work = chain[[col for col in ("contract_symbol", "bid", "ask", "mid") if col in chain.columns]].copy()
+                if "bid" not in work.columns:
+                    work["bid"] = np.nan
+                if "ask" not in work.columns:
+                    work["ask"] = np.nan
+                if "mid" not in work.columns:
+                    work["mid"] = np.nan
+                work["contract_symbol"] = work["contract_symbol"].astype(str)
+                work["bid"] = pd.to_numeric(work["bid"], errors="coerce")
+                work["ask"] = pd.to_numeric(work["ask"], errors="coerce")
+                work["mid"] = pd.to_numeric(work["mid"], errors="coerce")
+                missing_mid = work["mid"].isna() & work["bid"].notna() & work["ask"].notna()
+                work.loc[missing_mid, "mid"] = (work.loc[missing_mid, "bid"] + work.loc[missing_mid, "ask"]) / 2.0
+                work["bid"] = work["bid"].where(work["bid"].notna(), work["mid"])
+                work["ask"] = work["ask"].where(work["ask"].notna(), work["mid"])
+                work = work.loc[work["contract_symbol"].ne("") & work["mid"].notna()].drop_duplicates("contract_symbol", keep="first")
+                quote_map = {
+                    str(row.contract_symbol): (float(row.bid), float(row.ask), float(row.mid))
+                    for row in work.itertuples(index=False)
+                }
+            self._chain_quote_cache[key] = quote_map
+        return quote_map.get(str(contract_symbol))
 
     def _load_day_chain(self, symbol: str, date: pd.Timestamp) -> pd.DataFrame:
         key = (str(symbol).upper(), pd.Timestamp(date).normalize())
@@ -1038,6 +1334,7 @@ class _OptionRetriever:
         if chain.empty:
             self._chain_cache[key] = chain.copy()
             return chain
+        chain = self._dedupe_entry_chain_contracts(chain)
         featured = self.build_option_contract_features(
             chain,
             underlying_price=self._underlying_close(key[0], key[1]),
@@ -1046,6 +1343,22 @@ class _OptionRetriever:
         ).df
         self._chain_cache[key] = featured.copy()
         return featured
+
+    def _dedupe_entry_chain_contracts(self, chain: pd.DataFrame) -> pd.DataFrame:
+        if chain.empty or "contract_symbol" not in chain.columns:
+            return chain
+        before = len(chain)
+        work = chain.copy()
+        if "snapshot_date" in work.columns:
+            work["_snapshot_sort"] = pd.to_datetime(work["snapshot_date"], errors="coerce")
+            sort_cols = ["contract_symbol", "_snapshot_sort"]
+        else:
+            sort_cols = ["contract_symbol"]
+        work = work.sort_values(sort_cols).drop_duplicates("contract_symbol", keep="last")
+        if "_snapshot_sort" in work.columns:
+            work = work.drop(columns=["_snapshot_sort"])
+        self.chain_duplicate_rows_dropped += int(before - len(work))
+        return work.reset_index(drop=True)
 
     def _underlying_close(self, symbol: str, date: pd.Timestamp) -> float | None:
         key = (str(symbol).upper(), pd.Timestamp(date).normalize())
@@ -1071,6 +1384,14 @@ class _OptionRetriever:
             "option_chain_read_count": float(self.chain_read_count),
             "option_chain_cache_hits": float(self.chain_cache_hits),
             "option_chain_cache_size": float(len(self._chain_cache)),
+            "option_chain_duplicate_rows_dropped": float(self.chain_duplicate_rows_dropped),
+            "nearest_exit_cache_hits": float(self.nearest_exit_cache_hits),
+            "nearest_exit_cache_size": float(len(self._nearest_exit_snapshot_cache)),
+            "chain_quote_cache_hits": float(self.chain_quote_cache_hits),
+            "chain_quote_cache_size": float(len(self._chain_quote_cache)),
+            "contract_path_read_count": float(self.contract_path_read_count),
+            "contract_path_cache_hits": float(self.contract_path_cache_hits),
+            "contract_path_cache_size": float(len(self._contract_path_cache)),
             "underlying_lookup_count": float(self.underlying_lookup_count),
             "underlying_cache_hits": float(self.underlying_cache_hits),
             "underlying_cache_size": float(len(self._underlying_cache)),
@@ -1095,6 +1416,8 @@ def write_oracle_option_artifacts(
     model: Any,
     metrics: dict[str, float],
     analysis_markdown: str,
+    selected_option_trades: pd.DataFrame | None = None,
+    selected_option_paths: pd.DataFrame | None = None,
     directory: Path | None = None,
 ) -> dict[str, Path]:
     base = directory or option_experiment_artifact_dir(config)
@@ -1111,6 +1434,8 @@ def write_oracle_option_artifacts(
         "symbol_summary": base / "symbol_summary.csv",
         "source_family_summary": base / "source_family_summary.csv",
         "feature_coverage": base / "feature_coverage.csv",
+        "selected_option_trades": base / "selected_option_trades.parquet",
+        "selected_option_paths": base / "selected_option_paths.parquet",
         "metrics": base / "metrics.json",
         "config": base / "config.json",
         "analysis": base / "analysis.md",
@@ -1126,6 +1451,14 @@ def write_oracle_option_artifacts(
     symbol_summary.to_csv(paths["symbol_summary"], index=False)
     source_family_summary.to_csv(paths["source_family_summary"], index=False)
     feature_coverage.to_csv(paths["feature_coverage"], index=False)
+    (selected_option_trades if selected_option_trades is not None else pd.DataFrame()).to_parquet(
+        paths["selected_option_trades"],
+        index=False,
+    )
+    (selected_option_paths if selected_option_paths is not None else pd.DataFrame()).to_parquet(
+        paths["selected_option_paths"],
+        index=False,
+    )
     paths["metrics"].write_text(json.dumps(metrics, indent=2, default=str), encoding="utf-8")
     paths["config"].write_text(json.dumps(_config_dict(config), indent=2, default=str), encoding="utf-8")
     paths["analysis"].write_text(analysis_markdown, encoding="utf-8")
@@ -1152,6 +1485,8 @@ def load_option_experiment_artifacts(base_dir: str | Path) -> OptionExperimentAr
         trade_windows_path = base / "oracle_trades.parquet"
     source_family_path = base / "source_family_summary.csv"
     feature_coverage_path = base / "feature_coverage.csv"
+    selected_trades_path = base / "selected_option_trades.parquet"
+    selected_paths_path = base / "selected_option_paths.parquet"
     return OptionExperimentArtifacts(
         base_dir=base,
         coverage=pd.read_parquet(base / "coverage.parquet"),
@@ -1164,6 +1499,8 @@ def load_option_experiment_artifacts(base_dir: str | Path) -> OptionExperimentAr
         symbol_summary=pd.read_csv(base / "symbol_summary.csv"),
         source_family_summary=pd.read_csv(source_family_path) if source_family_path.exists() else pd.DataFrame(),
         feature_coverage=pd.read_csv(feature_coverage_path) if feature_coverage_path.exists() else pd.DataFrame(),
+        selected_option_trades=pd.read_parquet(selected_trades_path) if selected_trades_path.exists() else pd.DataFrame(),
+        selected_option_paths=pd.read_parquet(selected_paths_path) if selected_paths_path.exists() else pd.DataFrame(),
         metrics=metrics,
         config=config,
         analysis_markdown=(base / "analysis.md").read_text(encoding="utf-8") if (base / "analysis.md").exists() else "",
@@ -1222,17 +1559,27 @@ def estimate_option_runtime_scaling(
     )
 
 
-def _build_option_panel(oracle_trades: pd.DataFrame, retriever: _OptionRetriever) -> pd.DataFrame:
+def _build_option_panel(oracle_trades: pd.DataFrame, retriever: _OptionRetriever, *, price_exit: bool = True) -> pd.DataFrame:
     frames = []
     for trade in oracle_trades.itertuples(index=False):
-        frame = retriever.retrieve(pd.Series(trade._asdict()))
+        frame = retriever.retrieve(pd.Series(trade._asdict()), price_exit=price_exit)
         if frame is not None and not frame.empty:
             frames.append(frame)
     if not frames:
         return pd.DataFrame()
     panel = pd.concat(frames, ignore_index=True)
-    panel["rank_y"] = panel.groupby("trade_id")["option_return"].rank(method="average", pct=True, ascending=True)
+    if "option_return" in panel.columns:
+        returns = pd.to_numeric(panel["option_return"], errors="coerce")
+        if returns.notna().any():
+            panel["rank_y"] = returns.groupby(panel["trade_id"]).rank(method="average", pct=True, ascending=True)
     return panel
+
+
+def _split_trade_windows(oracle_trades: pd.DataFrame, split: SharedSplitConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if oracle_trades.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    dates = pd.to_datetime(oracle_trades["entry_date"], errors="coerce").dt.normalize()
+    return oracle_trades.loc[dates.le(split.insample_end_ts)].copy(), oracle_trades.loc[dates.ge(split.oos_start_ts)].copy()
 
 
 def _add_mean_variance_basket_labels(
@@ -1353,20 +1700,39 @@ def _train_option_ranker(
         "eval_trades": float(eval_scored["trade_id"].nunique()),
         "train_mae": float(mean_absolute_error(train_panel[target], train_pred)),
         "train_r2": float(r2_score(train_panel[target], train_pred)),
-        "eval_mae": float(mean_absolute_error(eval_scored[target], eval_scored["pred_return"])),
-        "eval_r2": float(r2_score(eval_scored[target], eval_scored["pred_return"])) if len(eval_scored) > 1 else np.nan,
         "numeric_feature_count": float(len(numeric)),
         "categorical_feature_count": float(len(categorical)),
         "ranker_model_count": 1.0 + (1.0 if rank_model is not None else 0.0),
     }
+    eval_target = pd.to_numeric(eval_scored[target], errors="coerce") if target in eval_scored.columns else pd.Series(dtype=float)
+    eval_label_mask = eval_target.notna() & pd.to_numeric(eval_scored["pred_return"], errors="coerce").notna()
+    metrics["eval_mae"] = (
+        float(mean_absolute_error(eval_target.loc[eval_label_mask], eval_scored.loc[eval_label_mask, "pred_return"]))
+        if eval_label_mask.any()
+        else np.nan
+    )
+    metrics["eval_r2"] = (
+        float(r2_score(eval_target.loc[eval_label_mask], eval_scored.loc[eval_label_mask, "pred_return"]))
+        if int(eval_label_mask.sum()) > 1
+        else np.nan
+    )
     if rank_model is not None and "rank_y" in eval_scored.columns:
         eval_rank_target = pd.to_numeric(eval_scored["rank_y"], errors="coerce")
+        eval_rank_mask = eval_rank_target.notna() & pd.to_numeric(eval_scored["pred_rank_score"], errors="coerce").notna()
         metrics.update(
             {
                 "rank_train_mae": float(mean_absolute_error(train_panel["rank_y"], rank_train_pred)),
                 "rank_train_r2": float(r2_score(train_panel["rank_y"], rank_train_pred)) if len(train_panel) > 1 else np.nan,
-                "rank_eval_mae": float(mean_absolute_error(eval_rank_target, eval_scored["pred_rank_score"])),
-                "rank_eval_r2": float(r2_score(eval_rank_target, eval_scored["pred_rank_score"])) if len(eval_scored) > 1 else np.nan,
+                "rank_eval_mae": (
+                    float(mean_absolute_error(eval_rank_target.loc[eval_rank_mask], eval_scored.loc[eval_rank_mask, "pred_rank_score"]))
+                    if eval_rank_mask.any()
+                    else np.nan
+                ),
+                "rank_eval_r2": (
+                    float(r2_score(eval_rank_target.loc[eval_rank_mask], eval_scored.loc[eval_rank_mask, "pred_rank_score"]))
+                    if int(eval_rank_mask.sum()) > 1
+                    else np.nan
+                ),
             }
         )
     metrics["numeric_features"] = ",".join(numeric)
@@ -1435,11 +1801,22 @@ def _train_mv_basket_ranker(
     model.fit(train_panel[numeric + categorical], train_panel[target])
     train_pred = model.predict(train_panel[numeric + categorical])
     eval_scored["pred_mv_weight"] = np.clip(model.predict(eval_scored[numeric + categorical]), 0.0, None)
+    eval_target = pd.to_numeric(eval_scored[target], errors="coerce") if target in eval_scored.columns else pd.Series(dtype=float)
+    eval_pred = pd.to_numeric(eval_scored["pred_mv_weight"], errors="coerce")
+    eval_label_mask = eval_target.notna() & eval_pred.notna()
     metrics = {
         "mv_train_mae": float(mean_absolute_error(train_panel[target], train_pred)),
         "mv_train_r2": float(r2_score(train_panel[target], train_pred)) if len(train_panel) > 1 else np.nan,
-        "mv_eval_mae": float(mean_absolute_error(eval_scored[target], eval_scored["pred_mv_weight"])) if target in eval_scored else np.nan,
-        "mv_eval_r2": float(r2_score(eval_scored[target], eval_scored["pred_mv_weight"])) if target in eval_scored and len(eval_scored) > 1 else np.nan,
+        "mv_eval_mae": (
+            float(mean_absolute_error(eval_target.loc[eval_label_mask], eval_scored.loc[eval_label_mask, "pred_mv_weight"]))
+            if eval_label_mask.any()
+            else np.nan
+        ),
+        "mv_eval_r2": (
+            float(r2_score(eval_target.loc[eval_label_mask], eval_scored.loc[eval_label_mask, "pred_mv_weight"]))
+            if int(eval_label_mask.sum()) > 1
+            else np.nan
+        ),
         "mv_numeric_feature_count": float(len(numeric)),
         "mv_categorical_feature_count": float(len(categorical)),
     }
@@ -1453,6 +1830,16 @@ def _selector_summaries(
     *,
     mv_basket_config: OptionMvBasketConfig | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
+    selected_by_selector = _select_options_by_selector(eval_panel, mv_basket_config=mv_basket_config)
+    selector_summary, symbol_summary = _summarize_selected_by_selector(selected_by_selector)
+    return selector_summary, symbol_summary, selected_by_selector
+
+
+def _select_options_by_selector(
+    eval_panel: pd.DataFrame,
+    *,
+    mv_basket_config: OptionMvBasketConfig | None = None,
+) -> dict[str, pd.DataFrame]:
     fixed_work = eval_panel.copy()
     if not fixed_work.empty:
         if "pred_return" in fixed_work.columns and "pred_rank_score" in fixed_work.columns:
@@ -1473,6 +1860,7 @@ def _selector_summaries(
             {"spread_pct": -1.0, "dte_gap": -0.1, "abs_moneyness": -0.1},
         )
     selected_model = _choose_top_per_trade(fixed_work, "pred_return")
+    selected_oracle = _choose_top_per_trade(fixed_work, "option_return")
     selected_rule_atm = _choose_top_per_trade(fixed_work, "fixed_near_atm_score")
     selected_mv_model = _choose_weighted_basket_per_trade(
         eval_panel,
@@ -1481,11 +1869,63 @@ def _selector_summaries(
         max_legs=mv_basket_config.max_legs if mv_basket_config else None,
         min_weight=mv_basket_config.min_predicted_weight if mv_basket_config else 0.0,
     )
+    selected_mv_oracle = _choose_weighted_basket_per_trade(
+        eval_panel,
+        "mv_weight",
+        selector_name="oracle_mv_basket",
+        max_legs=mv_basket_config.max_legs if mv_basket_config else None,
+        min_weight=0.0,
+    )
+    return {
+        "rule_atm_90d": selected_rule_atm,
+        "model_ranker": selected_model,
+        "oracle_best_possible": selected_oracle,
+        "model_mv_basket": selected_mv_model,
+        "oracle_mv_basket": selected_mv_oracle,
+    }
+
+
+def _price_selected_by_selector(
+    selected_by_selector: dict[str, pd.DataFrame],
+    retriever: _OptionRetriever,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    priced_by_selector: dict[str, pd.DataFrame] = {}
+    path_frames = []
+    for selector, selected in selected_by_selector.items():
+        priced, paths = retriever.price_selected_options_with_paths(selected, selector_name=selector)
+        priced_by_selector[selector] = priced
+        if not paths.empty:
+            path_frames.append(paths)
+    selected_paths = pd.concat(path_frames, ignore_index=True) if path_frames else pd.DataFrame()
+    return priced_by_selector, selected_paths
+
+
+def _selected_by_selector_to_frame(selected_by_selector: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    frames = []
+    for selector, selected in selected_by_selector.items():
+        if selected.empty:
+            continue
+        frame = selected.copy()
+        frame["selector"] = selector
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _summarize_selected_by_selector(
+    selected_by_selector: dict[str, pd.DataFrame],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    selected_rule_atm = selected_by_selector.get("rule_atm_90d", pd.DataFrame())
+    selected_model = selected_by_selector.get("model_ranker", pd.DataFrame())
+    selected_oracle = selected_by_selector.get("oracle_best_possible", pd.DataFrame())
+    selected_mv_model = selected_by_selector.get("model_mv_basket", pd.DataFrame())
+    selected_mv_oracle = selected_by_selector.get("oracle_mv_basket", pd.DataFrame())
     selector_summary = pd.DataFrame(
         [
             _summarize_selected("rule_atm_90d", selected_rule_atm),
             _summarize_selected("model_ranker", selected_model),
+            _summarize_selected("oracle_best_possible", selected_oracle),
             _summarize_basket("model_mv_basket", selected_mv_model),
+            _summarize_basket("oracle_mv_basket", selected_mv_oracle),
         ]
     )
     if selected_model.empty:
@@ -1501,15 +1941,7 @@ def _selector_summaries(
             .reset_index()
             .sort_values("mean_return", ascending=False)
         )
-    return (
-        selector_summary,
-        symbol_summary,
-        {
-            "rule_atm_90d": selected_rule_atm,
-            "model_ranker": selected_model,
-            "model_mv_basket": selected_mv_model,
-        },
-    )
+    return selector_summary, symbol_summary
 
 
 def _source_family_diagnostics(eval_panel: pd.DataFrame, selected_by_selector: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -1673,6 +2105,23 @@ def _rule_score(frame: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
             values = values / float(scale)
         score = score + float(weight) * values.fillna(0.0)
     return score
+
+
+def _selected_contract_path_stats(path: pd.DataFrame) -> dict[str, float | int] | None:
+    if path.empty or "path_return" not in path.columns:
+        return None
+    returns = pd.to_numeric(path["path_return"], errors="coerce").dropna()
+    if returns.empty:
+        return None
+    equity = 1.0 + returns
+    running_peak = equity.cummax()
+    drawdown = equity / running_peak.replace(0, np.nan) - 1.0
+    return {
+        "path_observations": int(len(returns)),
+        "path_min_return": float(returns.min()),
+        "path_max_return": float(returns.max()),
+        "path_max_drawdown": float(drawdown.min()) if drawdown.notna().any() else np.nan,
+    }
 
 
 def _run_optopsy_selector_backtests(
