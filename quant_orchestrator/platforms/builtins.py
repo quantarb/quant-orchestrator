@@ -4,6 +4,7 @@ from quant_orchestrator.platforms.backtesting_frameworks import (
     backtesting_py_provider,
     lean_provider,
     nautilus_provider,
+    optimal_trader_provider,
     panel_weight_provider,
     zipline_provider,
 )
@@ -27,6 +28,7 @@ def register_builtin_providers() -> None:
         zipline_provider,
         nautilus_provider,
         panel_weight_provider,
+        optimal_trader_provider,
     ):
         registry.register(provider)
 
