@@ -516,13 +516,18 @@ def _load_day_chain(
     cached = chain_cache.get(key)
     if cached is not None:
         return cached.copy()
-    chain = read_panel_weight_thetadata_option_chain(
-        key[0],
-        start_date=key[1],
-        end_date=key[1],
-        columns=OPTION_COLUMNS,
-        require_rich_columns=True,
-    )
+    try:
+        chain = read_panel_weight_thetadata_option_chain(
+            key[0],
+            start_date=key[1],
+            end_date=key[1],
+            columns=OPTION_COLUMNS,
+            require_rich_columns=True,
+        )
+    except ValueError as exc:
+        if "missing required rich endpoint columns" not in str(exc):
+            raise
+        chain = pd.DataFrame()
     if not chain.empty:
         chain = _dedupe_contracts(chain)
     chain_cache[key] = chain.copy()
