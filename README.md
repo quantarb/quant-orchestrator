@@ -35,7 +35,7 @@ For the full local research/backtesting/ML environment:
 pip install -e ".[all,dev]"
 ```
 
-For just ThetaData-backed options backtests through Optopsy:
+For option research dependencies used by the older Optopsy experiment paths:
 
 ```bash
 pip install -e ".[options]"
@@ -59,6 +59,7 @@ The platform contract is intentionally small:
 - run backtesting framework providers, data adapters, reporting adapters, and reusable runners when a workflow needs strategy evaluation
 - run reusable optimization primitives such as parameter grids, metric filters, result ranking, and portfolio weighting
 - normalize common backtest summaries, equity curves, returns, and trade logs while keeping each framework's native report
+- write standard strategy artifacts (`scored_panel`, `action_tape`, `trade_windows`, and a manifest) when downstream workflows need a stable handoff
 - track runs in MLflow
 - store native model, report, prediction, backtest, and strategy artifacts in the artifact registry
 
@@ -96,13 +97,17 @@ Current built-in ML framework modules are:
 - `sklearn`
 - `torch`
 - `transformers`
+- `sentence_transformers`
 
 Current built-in backtesting framework modules are:
 
 - `backtesting.py`
+- Lean
 - Zipline Reloaded
 - NautilusTrader
-- Optopsy for options research paths
+- panel-weight vectorized backtests
+
+The `optimal_trader` package under `platforms/backtesting_frameworks` is a concrete compatibility/replay module, not a registered entry-point provider in `pyproject.toml`. It loads saved optimal_trader artifacts without importing live-trading code and emits the same standard strategy artifacts as the generic scored-panel replay helpers.
 
 Installed packages can register providers through entry points:
 
@@ -120,7 +125,7 @@ At runtime, providers are resolved from the registry:
 from quant_orchestrator.platforms.registry import registry
 
 registry.list("backtesting_framework")
-engine_cls = registry.adapter("backtesting_framework", "optopsy")
+engine_cls = registry.adapter("backtesting_framework", "zipline")
 engine = engine_cls()
 ```
 
@@ -129,13 +134,33 @@ Backtesting framework providers are adapters around native engines, not strategy
 Current reusable backtesting code is intentionally concrete:
 
 - `backtesting_py/data_adapter.py` converts warehouse OHLCV plus precomputed features into `backtesting.py`'s expected dataframe shape.
+- `lean/runner.py` contains notebook support for Lean-style research runs.
 - `zipline/data_adapter.py` builds an in-memory Zipline daily bar reader.
 - `nautilus/data_adapter.py` converts warehouse OHLCV into Nautilus bar objects.
 - `zipline/runner.py` and `nautilus/runner.py` run a precomputed long/flat signal strategy through the native engines.
+- `panel_weight/` contains vectorized shared-book and synthetic option return primitives.
+- `optimal_trader/` contains historical replay adapters for saved optimal_trader artifacts, FMP synthetic option-equivalent replay, and MoE paper-strategy replay. It must not contain live broker or Robinhood code.
+- `strategy_artifacts.py` defines the standard strategy artifact bundle and validation.
+- `scored_panel_replay.py` converts a daily scored panel into an action tape and trade windows through a shifted top-k rule.
 - `<framework>/reporting_adapter.py` normalizes common backtest outputs while keeping each framework's native report.
 - `<framework>/sma_crossover.py` contains the reusable SMA example strategy wrappers used by the CLI and notebooks.
 
 A QuantConnect strategy should be exposed through a backtesting framework provider or runner that receives prepared `quant-warehouse` data, runs the native QuantConnect strategy, and registers whatever files or reports that engine emits. QuantConnect support is not currently implemented in this repo.
+
+### Strategy Artifact Contract
+
+The current handoff between strategy research, validation, and option-equivalent replay is file based and intentionally small:
+
+- `feature_panel.parquet`: optional prepared feature rows with at least `date` and `symbol`
+- `scored_panel.parquet`: daily strategy scores with at least `date`, `symbol`, and `close`
+- `action_tape.parquet`: normalized strategy actions with at least `date`, `symbol`, `action`, and `price`
+- `trade_windows.parquet`: closed strategy windows with at least `trade_id`, `symbol`, `side`, `entry_date`, and `exit_date`
+- `strategy_artifacts_manifest.json`: paths, row counts, schema version, and strategy name
+- `summary.json`: strategy-specific summary metadata
+
+Use `write_strategy_artifacts` and `read_strategy_artifacts` from `quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts`. The validator normalizes dates and symbols, rejects malformed trade windows, and keeps optional fields such as `equity_entry_notional` when present. `equity_entry_notional` is the preferred option-equivalent budget because the option replay should use the same capital assigned to the original equity trade.
+
+Strategy notebooks should produce this contract instead of embedding downstream option mechanics. Option-equivalent replay should consume `trade_windows.parquet` or the manifest, then select and price options per trade. This keeps strategy signal research, option selection, and option portfolio accounting separable.
 
 ## Experiment Tracking
 
@@ -145,13 +170,16 @@ MLflow is the built-in experiment tracker. Use it through the orchestrator track
 from quant_orchestrator.tracking import log_backtest_run
 
 log_backtest_run(
-    run_name="optopsy-tsla-2025q1",
-    engine="optopsy",
-    strategy="long_calls",
-    data_source="quant-warehouse:thetadata",
-    params={"delta_min": 0.25, "delta_max": 0.45},
+    run_name="zipline-ml-top-k-smoke",
+    engine="zipline",
+    strategy="scored_panel_top_k",
+    data_source="quant-warehouse:fmp",
+    params={"score_col": "prob_buy", "top_k": 5},
     metrics={"sharpe": 1.2, "max_drawdown": -0.08},
-    artifacts={"trades": "artifacts/trades.csv", "equity": "artifacts/equity.csv"},
+    artifacts={
+        "manifest": "artifacts/classifier_1t_contract_replay/strategy_artifacts_manifest.json",
+        "trade_windows": "artifacts/classifier_1t_contract_replay/trade_windows.parquet",
+    },
 )
 ```
 
@@ -203,6 +231,18 @@ result = job.execute_in_process(
 
 Use `mode="classifier_ae"` for the classifier plus latent autoencoder version. Review completed runs in `notebooks/ml_trading/mlflow_experiment_review.ipynb`; that notebook reads MLflow runs and MLflow artifacts only and does not execute training or backtests.
 
+### Option-Equivalent Backtests
+
+The current preferred option workflow starts from equity strategy trades, not from a daily option rebalancing loop:
+
+1. Produce a standard strategy artifact contract from an equity strategy or scored panel.
+2. Read `trade_windows.parquet`.
+3. For each equity trade, select option candidates on the equity entry date for the same underlying symbol.
+4. Price only the selected option paths through the equity exit date, or through option expiration if the contract expires first.
+5. Apply intrinsic value at expiration when an option still has value. Do not roll into a new option unless a strategy explicitly defines a roll rule.
+
+The trade-window approach is easier to parallelize and easier to debug: each equity trade can report missing option data, selected contract, exit handling, and PnL independently. Older research helpers under `quant_orchestrator.research_tools.options_experiment` and the optional Optopsy dependency still exist, but new notebooks should prefer the standard contract plus trade-window option execution path.
+
 ## Artifact Registry
 
 `quant-orchestrator` owns ML training, backtest, model, prediction, and strategy artifacts. Downstream apps should ask the orchestrator to train, infer, backtest, or run external strategy evaluations, then load the returned artifact URI or path instead of maintaining separate research storage.
@@ -245,6 +285,7 @@ Recent notebooks follow this pattern:
 
 - data vendors, adjusted OHLCV features, and target-engineered labels come from Quant Warehouse
 - notebooks keep major datasets, predictions, reports, and summaries in `PipelineContext`
+- repeated strategy outputs are written as standard strategy artifacts when downstream workflows need to consume them
 - strategy examples may live in package code when reused across frameworks, but notebook-only experiment glue stays in notebooks
 - framework-specific data adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/data_adapter.py`
 - framework-specific reporting adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/reporting_adapter.py`

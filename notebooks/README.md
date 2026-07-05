@@ -10,6 +10,9 @@ They are examples, not required paths:
 - `multi_backtest_frameworks/sample_strategy_validation.ipynb` demonstrates provider-specific SMA parameter optimization with `backtesting.py`, then independently forward-tests the selected parameters on Zipline Reloaded and NautilusTrader.
 - `mult-ml-frameworks/sample_model_training.ipynb` demonstrates CUDA-first toy model training across MAG7, `yfinance`, and `fmp` using Quant Warehouse adjusted OHLCV features and optimal-trading labels: RAPIDS cuML RandomForest for trade-side classification, PyTorch autoencoder, and FlairNLP's native multitask model for trade-side classification plus return-percentile regression with a tiny pretrained transformer.
 - `ml_trading/ml_filtered_sma_trading.ipynb` trains a pre-2020 CUDA cuML optimal-side classifier, injects fixed 2020+ ML predictions into `backtesting.py`, runs yearly anchored WFO over SMA variants, portfolio-optimizes profitable variants, and runs Monte Carlo on out-of-sample trade contributions.
+- `ml_trading/optimal_trader_trading_app_contract_replay.ipynb` replays saved optimal_trader trading-app artifacts historically without importing live-trading code, then writes the standard strategy artifact contract.
+- `ml_trading/optimal_trader_moe_paper_contract_replay.ipynb` replays saved MoE paper-strategy artifacts or a historical MoE feature/scored panel and writes the same contract.
+- `ml_trading/classifier_1t_options_signal_backtest.ipynb`, `ml_trading/classifier_1t_feature_family_option_windows.ipynb`, and `ml_trading/traditional_ml_synthetic_options_backtest.ipynb` are contract producers. They convert scored panels into `action_tape` and `trade_windows`; downstream option replay should consume those artifacts instead of embedding option mechanics in the notebook.
 
 The notebooks should stay focused on orchestration patterns. They should not become the place where reusable platform code lives, and the notebook directory should contain notebook files only.
 
@@ -18,9 +21,12 @@ Current reusable code placement:
 - Framework-specific data adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/data_adapter.py`.
 - Framework-specific reporting adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/reporting_adapter.py`.
 - Framework-specific reusable signal runners live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/runner.py` when they exist. Current runners exist for Zipline Reloaded and NautilusTrader.
+- Standard strategy artifact helpers live in `quant_orchestrator/platforms/backtesting_frameworks/strategy_artifacts.py`.
+- Generic scored-panel top-k replay lives in `quant_orchestrator/platforms/backtesting_frameworks/scored_panel_replay.py`.
+- optimal_trader historical replay helpers live under `quant_orchestrator/platforms/backtesting_frameworks/optimal_trader/`; live trading and broker code should stay in optimal_trader, not here.
 - Strategy-specific SMA crossover examples live in notebook-facing helpers under `quant_orchestrator/backtests/` until they prove a more durable home.
 - Strategy-specific backtesting.py ML-score helpers live under `quant_orchestrator/backtests/`.
-- Synthetic options experiment workflows live under `quant_orchestrator/research_tools/`; the panel-weight package keeps only the generic engine and option-return primitives.
+- Synthetic and real-quote option research helpers still exist under `quant_orchestrator/research_tools/`, but new option-equivalent backtests should start from standard `trade_windows` artifacts. The panel-weight package keeps only the generic engine and option-return primitives.
 - FlairNLP helper functions used by the current multi-ML notebook live under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`.
 
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.

@@ -19,6 +19,8 @@
 - Do not add live trading, broker order submission, or broker account mutation code here.
 - If a workflow needs market data, features, labels, or warehouse refreshes, call `quant-warehouse` rather than OpenBB or vendor APIs directly.
 - Artifact storage should be schema-light. Different ML frameworks and backtesting frameworks may emit incompatible reports, models, plots, directories, or binary objects; store the native outputs with minimal metadata rather than forcing one universal report shape.
+- Standard strategy artifacts are the exception to the schema-light rule. Reusable strategy/backtest handoffs should use `StrategyArtifactBundle` from `quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts` with `scored_panel`, `action_tape`, `trade_windows`, `summary`, and `strategy_artifacts_manifest.json` when downstream workflows need to consume the result.
+- `trade_windows` is the preferred handoff into option-equivalent replay, WFO summaries, Monte Carlo over trades, and cross-framework comparison. Keep the required columns stable: `trade_id`, `symbol`, `side`, `entry_date`, and `exit_date`. Preserve `equity_entry_notional` when available so option replay can use the same capital budget as the equity trade.
 - Do not assume every workflow is ML-driven, equity-only, or backtest-driven. Train-only, inference-only, backtest-only, train-then-backtest, and external-engine strategy runs should all fit the platform model.
 
 ## ML Training Vs Strategy Backtesting Boundary
@@ -29,6 +31,16 @@
 - Trading strategy backtests, option-window generation, portfolio simulation, and strategy parameter optimization must use the full scored strategy dataset for the intended universe/calendar. Do not restrict strategy backtests to ML label rows, event rows, or target rows unless the strategy itself explicitly trades only on those event rows.
 - Keep these dataframes separate in code and artifacts: event-only model training/evaluation frames, full-universe score frames, and full-universe strategy/backtest frames.
 - ML strategy comparisons should vary the model prediction source, not the trading planner. Single feature-family models, MoE family experts, classifier/regressor/AE composites, and mean ensembles should all be normalized into the same daily score schema and traded through the optimal_trader-compatible capacity planner: hold until classifier direction flips, fill freed capacity with the highest-scored eligible opportunities, and avoid time-based/random rotations. For the current optimal_trader-compatible ML option strategy, classifiers control direction and exits: new entries require selected classifier agreement for the side, and existing positions exit when any selected classifier stops agreeing with the held side. Regressor/ranking and AE/familiarity signals contribute to entry filtering/ranking, not exits, unless a future strategy explicitly defines different permissions.
+- For generic scored-panel strategy experiments, use `scored_panel_replay.py` to convert daily scores into `action_tape` and `trade_windows` through the shifted top-k rule instead of rebuilding that loop in notebooks.
+
+## Option Backtesting Boundary
+
+- Equity strategies are the decision makers for option-equivalent backtests. Generate or load equity `trade_windows`, then select and price options for each trade window.
+- Do not implement option-equivalent backtests as a daily loop over every date, symbol, and option candidate unless a strategy specifically requires daily option rebalancing.
+- Option selection should pull the full option chain only on the equity entry date. After selecting contracts, load or price only the selected option time series through the equity exit date or option expiration.
+- If the selected option expires before the equity trade exits, apply expiration value including intrinsic value. Do not roll into a new option unless the strategy explicitly defines a roll rule.
+- Option replay should log trade-level statuses such as missing chain, no eligible option, missing selected path, expired worthless, and priced. This makes failures inspectable and keeps parallel trade execution safe.
+- New option strategy notebooks should consume `trade_windows.parquet` or `strategy_artifacts_manifest.json`. They should not rebuild classifier signal windows, option candidate panels, and portfolio accounting in the same notebook.
 
 ## Compatibility Policy
 
@@ -48,6 +60,7 @@
 - Do not add provider abstractions for orchestration or experiment tracking. Use Dagster and MLflow directly through the repo's opinionated interfaces.
 - Do not add broker platforms or live-trading adapters.
 - Backtesting framework providers should be thin adapters around native engines and caller-provided strategies/runners. For engines such as QuantConnect, keep the native strategy implementation intact and adapt warehouse inputs plus artifact outputs around it.
+- Framework-specific historical replay code belongs under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/`. Current optimal_trader replay code belongs under `platforms/backtesting_frameworks/optimal_trader/` and must remain historical/backtesting-only.
 
 ## Notebook Policy
 
@@ -58,6 +71,7 @@
 - Notebooks in this repo must not implement feature engineering, target engineering, or warehouse refresh logic. Pull prepared datasets from `quant-warehouse`.
 - If a notebook needs a new feature family or label, implement it in `quant-warehouse` first, then consume it here.
 - Data adapters, reporting adapters, and repeated framework runners are reusable platform code and should live under the relevant framework module, not inside notebooks.
+- Repeated strategy contract writers and readers belong in package code. Notebooks may choose the strategy, score columns, thresholds, universe, and output directories, but should call package helpers to write the standard artifact contract.
 - Notebook documentation and saved outputs should be updated when notebook behavior materially changes.
 
 ## CUDA Policy

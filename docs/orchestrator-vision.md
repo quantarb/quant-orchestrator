@@ -20,6 +20,7 @@ It should coordinate:
 - external-engine strategy runs
 - parameter search
 - portfolio construction
+- strategy artifact generation and replay
 - Monte Carlo and equity-curve simulations
 - artifact storage and retrieval
 - normalized comparison views over native reports
@@ -89,6 +90,17 @@ Different frameworks should be allowed to produce different native reports or fi
 
 Common reporting should be additive, not destructive. Backtesting reporting adapters should expose comparable summaries, equity curves, returns, and trade logs where possible, while preserving each framework's unique native metrics and artifacts.
 
+There is one deliberate exception to the schema-light rule: reusable strategy handoffs now use a small standard artifact contract. `quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts` reads and writes:
+
+- `feature_panel.parquet`
+- `scored_panel.parquet`
+- `action_tape.parquet`
+- `trade_windows.parquet`
+- `summary.json`
+- `strategy_artifacts_manifest.json`
+
+This contract is not meant to replace native framework outputs. It is an additive bridge for downstream workflows that should not care whether the original strategy came from a notebook, a framework runner, optimal_trader artifacts, or a future external engine. `trade_windows.parquet` is the key handoff for option-equivalent replay, walk-forward summaries, Monte Carlo over trade outcomes, and cross-framework comparison.
+
 ## Backtesting Model
 
 Backtesting adapters should stay thin. Current code separates three concerns:
@@ -102,6 +114,27 @@ Data adapters should bridge Quant Warehouse frames into each native engine witho
 Current Zipline Reloaded and NautilusTrader runners execute a precomputed long/flat signal column through the native engine. That is useful for SMA examples and ML-prediction filters, but it should not become the only strategy model. Future external-engine support should be able to run native strategy implementations with prepared warehouse inputs and native artifacts.
 
 Example strategies can live in package code when they are reused across notebooks for framework comparison. Notebook-specific experiment orchestration should stay in notebooks until it becomes a repeated platform capability.
+
+The current repeated strategy handoff is:
+
+`scored_panel -> action_tape -> trade_windows -> strategy_artifacts_manifest.json`
+
+`scored_panel_replay.py` implements a generic shifted top-k replay for daily score panels. optimal_trader replay modules use their own historical strategy logic but write the same standard contract. This should stay concrete until more strategy families prove that a richer abstraction is needed.
+
+## Options Model
+
+The preferred option-equivalent backtest path is trade-window based. Equity strategies are the decision makers: if an equity strategy buys a symbol on an entry date and exits on an exit date, the option workflow uses that same symbol/date window and the same equity capital budget to select and price the option equivalent.
+
+The option workflow should:
+
+- load `trade_windows` from the standard strategy artifact contract
+- select option candidates from the full chain on the equity entry date
+- price only selected option contracts forward to the equity exit date or option expiration
+- apply expiration intrinsic value when an option expires before the equity trade exits
+- not roll into a new option unless a strategy explicitly defines a roll rule
+- log trade-level failures such as missing chain data, no eligible option, missing selected path, or expired worthless
+
+This is intentionally simpler and more inspectable than relooping over every date/symbol/option candidate in a notebook. Each equity trade is an independent unit and can be parallelized. ThetaData and FMP synthetic option handling can differ internally because their input data differ, but both should consume the same equity trade-window contract.
 
 ## ML Framework Model
 
@@ -119,6 +152,8 @@ ML outputs should remain native unless there is a clear reason to normalize them
 
 - Train one model in one ML framework, then feed its predictions into a strategy.
 - Train multiple models in multiple frameworks, then compare their downstream strategy outputs.
+- Convert a scored panel into standard strategy artifacts, then run option-equivalent replay from the resulting trade windows.
+- Replay saved optimal_trader artifacts historically without importing live-trading code, then compare the emitted trade windows to another framework.
 - Future external-engine path: backtest a QuantConnect-style strategy on warehouse data, then optionally replay its equity curve in another engine. QuantConnect support is not currently implemented.
 - Optimize parameters in a fast engine, then validate the chosen parameters in a slower or more realistic engine.
 - Run Monte Carlo on a backtest result without treating Monte Carlo as a strategy.
@@ -140,6 +175,8 @@ Already present:
 - in-memory data adapters for the current backtesting examples
 - reusable signal runners for Zipline Reloaded and NautilusTrader
 - normalized backtesting reports for common summaries, equity curves, returns, and trade logs
+- standard strategy artifact helpers and a generic scored-panel top-k replay helper
+- optimal_trader historical artifact replay helpers that avoid live-trading imports
 - sample framework-specific SMA crossover strategies for `backtesting.py`, Zipline Reloaded, and NautilusTrader
 - executed notebooks covering multi-provider, multi-backtesting-framework, WFO, Monte Carlo, cross-framework validation, and multi-ML-framework MAG7 workflows
 - notebooks as integration tests for the current research workflows
@@ -147,7 +184,7 @@ Already present:
 Still missing:
 
 - leakage-aware dataset visibility controls
-- generic job wrappers for strategy execution, parameter optimization, portfolio combination, and simulation
+- generic job wrappers for strategy execution, parameter optimization, portfolio combination, and simulation beyond the current concrete replay helpers
 - a generic external-engine adapter example
 
 ## Next Implementation Steps
