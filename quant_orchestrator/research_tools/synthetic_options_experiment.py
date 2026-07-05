@@ -12,7 +12,7 @@ try:
 except Exception:  # pragma: no cover - scipy is optional at import time
     _scipy_ndtr = None
 
-from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.synthetic_backtest import (
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.synthetic_backtest import (
     backtest_positions_with_directional_asset_returns,
     prepare_backtest_position_state,
     resolve_component_cols,
@@ -22,12 +22,12 @@ from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.synthetic_
     run_top_k_momentum_baseline,
     summarize_curve,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.synthetic_options import (
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.synthetic_option_panels import (
     build_realized_vol_panel,
     build_synthetic_option_return_panels,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.thetadata_data_adapter import (
-    read_panel_weight_thetadata_option_chain,
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.thetadata_data_adapter import (
+    read_optimal_trader_thetadata_option_chain,
 )
 
 FamilyPanelBuilder = Callable[[str], pd.DataFrame]
@@ -556,7 +556,7 @@ def _load_option_chain_frame(
     loader = config.option_chain_loader
     if loader is None:
         try:
-            frame = read_panel_weight_thetadata_option_chain(
+            frame = read_optimal_trader_thetadata_option_chain(
                 str(symbol).upper(),
                 start_date=start,
                 end_date=end,

@@ -16,8 +16,8 @@ from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
     normalize_trade_windows as normalize_report_trade_windows,
     report_trade_windows,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.thetadata_data_adapter import (
-    settle_panel_weight_thetadata_option_exit,
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.thetadata_data_adapter import (
+    settle_optimal_trader_thetadata_option_exit,
 )
 from quant_orchestrator.research_tools.option_trade_execution import (
     OptionTradeExecutionBatch,
@@ -1678,7 +1678,7 @@ class _OptionRetriever:
         row,
         option_type: str,
     ) -> Any | None:
-        return settle_panel_weight_thetadata_option_exit(
+        return settle_optimal_trader_thetadata_option_exit(
             symbol=symbol,
             contract_symbol=str(row.contract_symbol),
             option_type=option_type,
@@ -3454,23 +3454,23 @@ def _prepare_quant_warehouse_import(path: str | None) -> None:
 def _warehouse_imports():
     from quant_warehouse import Warehouse
     from quant_warehouse.platforms.data_providers.fmp.target_engineering import LabelBuildSpec, build_trade_results
-    from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.thetadata_data_adapter import (
-        build_panel_weight_thetadata_option_contract_features,
-        build_panel_weight_thetadata_option_mean_variance_labels,
-        panel_weight_thetadata_option_chain_coverage,
-        panel_weight_thetadata_option_ranker_feature_columns,
-        read_panel_weight_thetadata_option_chain,
+    from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.thetadata_data_adapter import (
+        build_optimal_trader_thetadata_option_contract_features,
+        build_optimal_trader_thetadata_option_mean_variance_labels,
+        optimal_trader_thetadata_option_chain_coverage,
+        optimal_trader_thetadata_option_ranker_feature_columns,
+        read_optimal_trader_thetadata_option_chain,
     )
 
     return (
         Warehouse,
         LabelBuildSpec,
         build_trade_results,
-        read_panel_weight_thetadata_option_chain,
-        panel_weight_thetadata_option_chain_coverage,
-        build_panel_weight_thetadata_option_contract_features,
-        panel_weight_thetadata_option_ranker_feature_columns,
-        build_panel_weight_thetadata_option_mean_variance_labels,
+        read_optimal_trader_thetadata_option_chain,
+        optimal_trader_thetadata_option_chain_coverage,
+        build_optimal_trader_thetadata_option_contract_features,
+        optimal_trader_thetadata_option_ranker_feature_columns,
+        build_optimal_trader_thetadata_option_mean_variance_labels,
     )
 
 

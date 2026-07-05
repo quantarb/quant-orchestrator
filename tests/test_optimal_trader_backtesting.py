@@ -21,7 +21,7 @@ from quant_orchestrator.platforms.registry import registry
 def test_optimal_trader_provider_is_registered() -> None:
     provider = registry.get("backtesting_framework", "optimal_trader")
     assert provider.name == "optimal_trader"
-    assert provider.capabilities == ("run", "equity", "strategy_dataset")
+    assert {"run", "equity", "strategy_dataset"}.issubset(set(provider.capabilities))
 
 
 def test_optimal_trader_equity_backtest_matches_hand_computed_vectorized_accounting() -> None:

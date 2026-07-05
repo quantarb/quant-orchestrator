@@ -40,8 +40,15 @@ optimal_trader_provider = ProviderManifest(
     name="optimal_trader",
     category="backtesting_framework",
     display_name="Optimal Trader",
-    description="Optimal Trader-compatible equity backtest accounting for strategy datasets.",
+    description="Optimal Trader-compatible equity, vectorized panel, and option replay helpers.",
     website=None,
-    capabilities=("run", "equity", "strategy_dataset"),
+    capabilities=(
+        "run",
+        "equity",
+        "strategy_dataset",
+        "vectorized_panel",
+        "synthetic_options",
+        "thetadata_options",
+    ),
     adapters={"default": OptimalTraderBacktestEngine},
 )

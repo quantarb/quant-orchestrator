@@ -18,10 +18,10 @@ for path in (REPO_ROOT, QUANT_WAREHOUSE_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.thetadata_data_adapter import (  # noqa: E402
-    build_panel_weight_thetadata_option_mean_variance_labels,
-    build_panel_weight_thetadata_option_contract_features,
-    read_panel_weight_thetadata_option_chain,
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.thetadata_data_adapter import (  # noqa: E402
+    build_optimal_trader_thetadata_option_mean_variance_labels,
+    build_optimal_trader_thetadata_option_contract_features,
+    read_optimal_trader_thetadata_option_chain,
 )
 from quant_orchestrator.research_tools.options_experiment import _normalize_oracle_trades  # noqa: E402
 from quant_warehouse import Warehouse  # noqa: E402
@@ -492,7 +492,7 @@ def add_mean_variance_oracle_labels(
             values = values / float(scale)
         risk_terms.append(values.clip(lower=0.0))
     work["mv_risk_proxy"] = sum(risk_terms) if risk_terms else 0.0
-    labels = build_panel_weight_thetadata_option_mean_variance_labels(
+    labels = build_optimal_trader_thetadata_option_mean_variance_labels(
         work,
         group_cols=("trade_id",),
         expected_return_col="option_return",
@@ -725,7 +725,7 @@ def _candidate_rows_for_trade_with_diagnostics(
         diagnostic["status"] = "missing_call_put_contracts"
         return candidates, diagnostic
     candidates["option_type"] = np.where(candidates["option_type"].str.startswith("c"), "call", "put")
-    candidates = build_panel_weight_thetadata_option_contract_features(
+    candidates = build_optimal_trader_thetadata_option_contract_features(
         candidates,
         underlying_price=float(spot),
         target_dte=int(target_dte),
@@ -950,7 +950,7 @@ def _load_day_chain(
     if cached is not None:
         return cached.copy()
     try:
-        chain = read_panel_weight_thetadata_option_chain(
+        chain = read_optimal_trader_thetadata_option_chain(
             key[0],
             start_date=key[1],
             end_date=key[1],
@@ -977,7 +977,7 @@ def _load_day_quotes(
     cached = quote_cache.get(key)
     if cached is not None:
         return cached.copy()
-    chain = read_panel_weight_thetadata_option_chain(
+    chain = read_optimal_trader_thetadata_option_chain(
         key[0],
         start_date=key[1],
         end_date=key[1],

@@ -127,7 +127,7 @@ def run_backtest(
 ) -> tuple[BacktestResult, pd.DataFrame]:
     strategy = getattr(spec, "strategy", None)
     if strategy is None:
-        raise ValueError("spec.strategy is required for panel_weight run_backtest")
+        raise ValueError("spec.strategy is required for optimal_trader run_backtest")
     cfg = getattr(spec, "execution", None) or getattr(spec, "execution_params", None)
     result = backtest_panel(panel=panel, strategy=strategy, cfg=cfg)
     table = pd.DataFrame([result.stats])

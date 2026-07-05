@@ -26,7 +26,7 @@ Current reusable code placement:
 - optimal_trader historical replay helpers live under `quant_orchestrator/platforms/backtesting_frameworks/optimal_trader/`; live trading and broker code should stay in optimal_trader, not here.
 - Strategy-specific SMA crossover examples live in notebook-facing helpers under `quant_orchestrator/backtests/` until they prove a more durable home.
 - Strategy-specific backtesting.py ML-score helpers live under `quant_orchestrator/backtests/`.
-- Synthetic and real-quote option research helpers still exist under `quant_orchestrator/research_tools/`, but new option-equivalent backtests should start from standard `trade_windows` artifacts. The panel-weight package keeps only the generic engine and option-return primitives.
+- Synthetic and real-quote option research helpers still exist under `quant_orchestrator/research_tools/`, but new option-equivalent backtests should start from standard `trade_windows` artifacts. The legacy vectorized engine and option-return primitives now live under `quant_orchestrator/platforms/backtesting_frameworks/optimal_trader/`.
 - FlairNLP helper functions used by the current multi-ML notebook live under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`.
 
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.

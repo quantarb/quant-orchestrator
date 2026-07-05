@@ -5,7 +5,7 @@ from typing import Any, Sequence
 import pandas as pd
 
 
-PANEL_WEIGHT_THETADATA_OPTION_COLUMNS: tuple[str, ...] = (
+OPTIMAL_TRADER_THETADATA_OPTION_COLUMNS: tuple[str, ...] = (
     "snapshot_date",
     "contract_symbol",
     "expiration",
@@ -27,7 +27,7 @@ PANEL_WEIGHT_THETADATA_OPTION_COLUMNS: tuple[str, ...] = (
 )
 
 
-def read_panel_weight_thetadata_option_chain(
+def read_optimal_trader_thetadata_option_chain(
     symbol: str,
     *,
     start_date: Any = None,
@@ -36,11 +36,11 @@ def read_panel_weight_thetadata_option_chain(
     require_rich_columns: bool = False,
     fallback_legacy: bool = False,
 ) -> pd.DataFrame:
-    """Read ThetaData EOD options in the shape expected by panel-weight tests."""
+    """Read ThetaData EOD options in the shape expected by optimal_trader option tests."""
 
     from quant_warehouse.platforms.data_providers.thetadata.options import read_thetadata_eod_option_chain
 
-    requested_columns = tuple(columns) if columns is not None else PANEL_WEIGHT_THETADATA_OPTION_COLUMNS
+    requested_columns = tuple(columns) if columns is not None else OPTIMAL_TRADER_THETADATA_OPTION_COLUMNS
     return read_thetadata_eod_option_chain(
         str(symbol).upper(),
         start_date=start_date,
@@ -51,31 +51,31 @@ def read_panel_weight_thetadata_option_chain(
     )
 
 
-def panel_weight_thetadata_option_chain_coverage(symbols: Sequence[str] | None = None) -> pd.DataFrame:
+def optimal_trader_thetadata_option_chain_coverage(symbols: Sequence[str] | None = None) -> pd.DataFrame:
     from quant_warehouse.platforms.data_providers.thetadata.options import option_chain_coverage
 
     return option_chain_coverage(symbols)
 
 
-def build_panel_weight_thetadata_option_contract_features(*args: Any, **kwargs: Any) -> Any:
+def build_optimal_trader_thetadata_option_contract_features(*args: Any, **kwargs: Any) -> Any:
     from quant_warehouse.platforms.data_providers.thetadata.feature_engineering import build_option_contract_features
 
     return build_option_contract_features(*args, **kwargs)
 
 
-def panel_weight_thetadata_option_ranker_feature_columns(*args: Any, **kwargs: Any) -> Any:
+def optimal_trader_thetadata_option_ranker_feature_columns(*args: Any, **kwargs: Any) -> Any:
     from quant_warehouse.platforms.data_providers.thetadata.feature_engineering import option_ranker_feature_columns
 
     return option_ranker_feature_columns(*args, **kwargs)
 
 
-def build_panel_weight_thetadata_option_mean_variance_labels(*args: Any, **kwargs: Any) -> Any:
+def build_optimal_trader_thetadata_option_mean_variance_labels(*args: Any, **kwargs: Any) -> Any:
     from quant_warehouse.platforms.data_providers.thetadata.target_engineering import build_option_mean_variance_labels
 
     return build_option_mean_variance_labels(*args, **kwargs)
 
 
-def settle_panel_weight_thetadata_option_exit(*args: Any, **kwargs: Any) -> Any:
+def settle_optimal_trader_thetadata_option_exit(*args: Any, **kwargs: Any) -> Any:
     from quant_warehouse.platforms.data_providers.thetadata.settlement import settle_option_exit
 
     return settle_option_exit(*args, **kwargs)

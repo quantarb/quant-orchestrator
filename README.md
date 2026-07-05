@@ -105,9 +105,9 @@ Current built-in backtesting framework modules are:
 - Lean
 - Zipline Reloaded
 - NautilusTrader
-- panel-weight vectorized backtests
+- optimal_trader historical and vectorized backtests
 
-The `optimal_trader` package under `platforms/backtesting_frameworks` is a concrete compatibility/replay module, not a registered entry-point provider in `pyproject.toml`. It loads saved optimal_trader artifacts without importing live-trading code and emits the same standard strategy artifacts as the generic scored-panel replay helpers.
+The `optimal_trader` package under `platforms/backtesting_frameworks` is the home for the legacy optimal_trader backtesting port. It loads saved optimal_trader artifacts without importing live-trading code, contains the vectorized panel and synthetic option primitives from the legacy port, and emits the same standard strategy artifacts as the generic scored-panel replay helpers.
 
 Installed packages can register providers through entry points:
 
@@ -138,8 +138,7 @@ Current reusable backtesting code is intentionally concrete:
 - `zipline/data_adapter.py` builds an in-memory Zipline daily bar reader.
 - `nautilus/data_adapter.py` converts warehouse OHLCV into Nautilus bar objects.
 - `zipline/runner.py` and `nautilus/runner.py` run a precomputed long/flat signal strategy through the native engines.
-- `panel_weight/` contains vectorized shared-book and synthetic option return primitives.
-- `optimal_trader/` contains historical replay adapters for saved optimal_trader artifacts, FMP synthetic option-equivalent replay, and MoE paper-strategy replay. It must not contain live broker or Robinhood code.
+- `optimal_trader/` contains the legacy optimal_trader backtesting port: vectorized shared-book accounting, synthetic option return primitives, historical replay adapters for saved optimal_trader artifacts, FMP synthetic option-equivalent replay, and MoE paper-strategy replay. It must not contain live broker or Robinhood code.
 - `strategy_artifacts.py` defines the standard strategy artifact bundle and validation.
 - `scored_panel_replay.py` converts a daily scored panel into an action tape and trade windows through a shifted top-k rule.
 - `<framework>/reporting_adapter.py` normalizes common backtest outputs while keeping each framework's native report.

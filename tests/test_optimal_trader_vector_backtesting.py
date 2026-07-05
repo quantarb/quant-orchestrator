@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from quant_orchestrator.platforms.registry import registry
-from quant_orchestrator.platforms.backtesting_frameworks.panel_weight import (
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader import (
     ExecutionConfig,
     backtest_panel,
     build_constant_maturity_call_price_panel,
@@ -35,9 +35,9 @@ class BuyFirstSymbolStrategy:
         return weights
 
 
-def test_panel_weight_provider_is_registered() -> None:
-    provider = registry.get("backtesting_framework", "panel_weight")
-    assert provider.name == "panel_weight"
+def test_optimal_trader_provider_is_registered() -> None:
+    provider = registry.get("backtesting_framework", "optimal_trader")
+    assert provider.name == "optimal_trader"
     assert "synthetic_options" in provider.capabilities
 
 

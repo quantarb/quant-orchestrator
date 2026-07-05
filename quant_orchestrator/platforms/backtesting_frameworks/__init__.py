@@ -5,9 +5,6 @@ from quant_orchestrator.platforms.backtesting_frameworks.backtesting_py.provider
     backtesting_py_provider,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.lean.provider import lean_provider
-from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.provider import (
-    panel_weight_provider,
-)
 from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.provider import (
     optimal_trader_provider,
 )
@@ -30,7 +27,6 @@ __all__ = [
     "lean_provider",
     "nautilus_provider",
     "optimal_trader_provider",
-    "panel_weight_provider",
     "read_strategy_artifacts",
     "replay_scored_panel_top_k",
     "ScoredPanelTopKReplayConfig",
