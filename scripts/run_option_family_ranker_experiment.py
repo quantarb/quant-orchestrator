@@ -85,6 +85,8 @@ def main() -> None:
     parser.add_argument("--n-estimators", type=int, default=400)
     parser.add_argument("--random-seed", type=int, default=20260704)
     parser.add_argument("--target-col", default="rank_y", help="Numeric option label column to predict.")
+    parser.add_argument("--basket-k", type=int, default=4, help="Max option legs per basket selector.")
+    parser.add_argument("--basket-min-weight", type=float, default=0.0, help="Minimum positive score for weighted basket legs.")
     args = parser.parse_args()
 
     started = perf_counter()
@@ -122,6 +124,11 @@ def main() -> None:
         if col in option_panel.columns and pd.to_numeric(option_panel[col], errors="coerce").notna().any()
     ]
     fixed = _evaluate_selector(eval_base, score_col="fixed_near_atm_score", selector_name="fixed_near_atm", target_col=target_col)
+    oracle_baskets = _oracle_basket_metrics(
+        eval_base,
+        target_col=target_col,
+        basket_k=int(args.basket_k),
+    )
     target_suffix = _safe_score_suffix(target_col)
     option_only_score_col = "pred_option_only_rank" if target_col == "rank_y" else f"pred_option_only_{target_suffix}"
     baseline = _fit_score_and_evaluate(
@@ -132,6 +139,8 @@ def main() -> None:
         n_estimators=int(args.n_estimators),
         score_col=option_only_score_col,
         target_col=target_col,
+        basket_k=int(args.basket_k),
+        basket_min_weight=float(args.basket_min_weight),
     )
     if baseline["model"] is not None:
         _write_pickle(out_dir / "option_only_ranker.pkl", baseline["model"])
@@ -141,6 +150,11 @@ def main() -> None:
         {"feature_family": "fixed_near_atm", "selector": "fixed_near_atm", **fixed},
         {"feature_family": "option_only", "selector": "option_only_ranker", **baseline["metrics"]["selector"]},
     ]
+    basket_rows = [
+        {"feature_family": "oracle", "selector": name, **metrics}
+        for name, metrics in oracle_baskets.items()
+    ]
+    basket_rows.extend(_basket_rows("option_only", baseline["metrics"]))
     for family_index, (source, family) in enumerate(requested_families):
         family_started = perf_counter()
         family_dir = out_dir / _safe_family_dir(source, family)
@@ -168,6 +182,8 @@ def main() -> None:
             n_estimators=int(args.n_estimators),
             score_col=score_col,
             target_col=target_col,
+            basket_k=int(args.basket_k),
+            basket_min_weight=float(args.basket_min_weight),
         )
         if family_aware["model"] is not None:
             _write_pickle(family_dir / "ranker.pkl", family_aware["model"])
@@ -191,6 +207,7 @@ def main() -> None:
             "option_features": option_features,
             "family_features": family_features,
             "fixed_near_atm": fixed,
+            "oracle_baskets": oracle_baskets,
             "option_only_ranker": baseline["metrics"],
             "family_ranker": family_aware["metrics"],
             "elapsed_seconds": float(perf_counter() - family_started),
@@ -202,6 +219,7 @@ def main() -> None:
                 **family_aware["metrics"]["selector"],
             }
         )
+        basket_rows.extend(_basket_rows(f"{source}.{family}", family_aware["metrics"]))
         family_summaries.append(_flatten_family_summary(summary))
         pd.DataFrame(
             [
@@ -210,6 +228,16 @@ def main() -> None:
                 {"selector": "option_plus_family_ranker", **family_aware["metrics"]["selector"]},
             ]
         ).to_csv(family_dir / "selector_summary.csv", index=False)
+        pd.DataFrame(
+            [
+                {"selector": name, **metrics}
+                for name, metrics in {
+                    **oracle_baskets,
+                    **_model_basket_metrics("option_only_ranker", baseline["metrics"]),
+                    **_model_basket_metrics("option_plus_family_ranker", family_aware["metrics"]),
+                }.items()
+            ]
+        ).to_csv(family_dir / "basket_summary.csv", index=False)
         scored_eval.to_parquet(family_dir / "eval_scored.parquet", index=False)
         feature_metadata.to_csv(family_dir / "feature_metadata.csv", index=False)
         feature_quality.to_csv(family_dir / "feature_quality.csv", index=False)
@@ -228,11 +256,13 @@ def main() -> None:
         "option_feature_count": int(len(option_features)),
         "option_features": option_features,
         "fixed_near_atm": fixed,
+        "oracle_baskets": oracle_baskets,
         "option_only_ranker": baseline["metrics"],
         "family_rankers": family_summaries,
         "elapsed_seconds": float(perf_counter() - started),
     }
     pd.DataFrame(selector_rows).to_csv(out_dir / "selector_summary.csv", index=False)
+    pd.DataFrame(basket_rows).to_csv(out_dir / "basket_summary.csv", index=False)
     pd.DataFrame(family_summaries).to_csv(out_dir / "family_summary.csv", index=False)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     print(json.dumps(summary, indent=2, default=str))
@@ -381,6 +411,8 @@ def _write_pickle(path: Path, value: Any) -> None:
 
 def _flatten_family_summary(summary: dict[str, Any]) -> dict[str, Any]:
     selector = dict(summary["family_ranker"]["selector"])
+    top_k = dict(summary["family_ranker"].get("top_k_equal_weight_basket") or {})
+    weighted = dict(summary["family_ranker"].get("score_weighted_basket") or {})
     return {
         "feature_family": summary["feature_family"],
         "family_feature_count": summary["family_feature_count"],
@@ -399,6 +431,14 @@ def _flatten_family_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "selected_median_rank_y": selector.get("median_rank_y"),
         "selected_mean_target": selector.get("mean_target"),
         "selected_median_target": selector.get("median_target"),
+        "top_k_basket_mean_return": top_k.get("mean_return"),
+        "top_k_basket_median_return": top_k.get("median_return"),
+        "top_k_basket_win_rate": top_k.get("win_rate"),
+        "top_k_basket_avg_legs": top_k.get("avg_legs_per_trade"),
+        "weighted_basket_mean_return": weighted.get("mean_return"),
+        "weighted_basket_median_return": weighted.get("median_return"),
+        "weighted_basket_win_rate": weighted.get("win_rate"),
+        "weighted_basket_avg_legs": weighted.get("avg_legs_per_trade"),
         "elapsed_seconds": summary["elapsed_seconds"],
     }
 
@@ -444,6 +484,8 @@ def _fit_score_and_evaluate(
     n_estimators: int,
     score_col: str,
     target_col: str,
+    basket_k: int,
+    basket_min_weight: float,
 ) -> dict[str, Any]:
     from sklearn.ensemble import RandomForestRegressor
     from sklearn.impute import SimpleImputer
@@ -456,7 +498,7 @@ def _fit_score_and_evaluate(
         return {
             "model": None,
             "eval_scored": scored,
-            "metrics": {"selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col, target_col=target_col)},
+            "metrics": _empty_model_metrics(scored, score_col=score_col, target_col=target_col),
         }
     features = [col for col in numeric_features if col in train.columns and pd.to_numeric(train[col], errors="coerce").notna().any()]
     target = pd.to_numeric(train[target_col], errors="coerce")
@@ -467,7 +509,7 @@ def _fit_score_and_evaluate(
         return {
             "model": None,
             "eval_scored": scored,
-            "metrics": {"selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col, target_col=target_col)},
+            "metrics": _empty_model_metrics(scored, score_col=score_col, target_col=target_col),
         }
     model = Pipeline(
         [
@@ -504,8 +546,43 @@ def _fit_score_and_evaluate(
         "eval_mae": float(mean_absolute_error(eval_target.loc[eval_valid], eval_pred.loc[eval_valid])) if eval_valid.any() else np.nan,
         "eval_r2": float(r2_score(eval_target.loc[eval_valid], eval_pred.loc[eval_valid])) if int(eval_valid.sum()) > 1 else np.nan,
         "selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col, target_col=target_col),
+        "top_k_equal_weight_basket": _evaluate_top_k_basket(
+            scored,
+            score_col=score_col,
+            selector_name=f"{score_col}_top_{int(basket_k)}_equal_weight",
+            target_col=target_col,
+            basket_k=int(basket_k),
+        ),
+        "score_weighted_basket": _evaluate_weighted_basket(
+            scored,
+            weight_col=score_col,
+            selector_name=f"{score_col}_weighted_basket",
+            target_col=target_col,
+            basket_k=int(basket_k),
+            min_weight=float(basket_min_weight),
+        ),
     }
     return {"model": model, "eval_scored": scored, "metrics": metrics}
+
+
+def _empty_model_metrics(frame: pd.DataFrame, *, score_col: str, target_col: str) -> dict[str, Any]:
+    return {
+        "selector": _evaluate_selector(frame, score_col=score_col, selector_name=score_col, target_col=target_col),
+        "top_k_equal_weight_basket": _evaluate_top_k_basket(
+            frame,
+            score_col=score_col,
+            selector_name=f"{score_col}_top_k_equal_weight",
+            target_col=target_col,
+            basket_k=0,
+        ),
+        "score_weighted_basket": _evaluate_weighted_basket(
+            frame,
+            weight_col=score_col,
+            selector_name=f"{score_col}_weighted_basket",
+            target_col=target_col,
+            basket_k=0,
+        ),
+    }
 
 
 def _evaluate_selector(frame: pd.DataFrame, *, score_col: str, selector_name: str, target_col: str = "rank_y") -> dict[str, Any]:
@@ -541,6 +618,130 @@ def _evaluate_selector(frame: pd.DataFrame, *, score_col: str, selector_name: st
         result["target_col"] = target_col
         result["mean_target"] = float(selected[target_col].mean())
         result["median_target"] = float(selected[target_col].median())
+    return result
+
+
+def _oracle_basket_metrics(frame: pd.DataFrame, *, target_col: str, basket_k: int) -> dict[str, dict[str, Any]]:
+    metrics = {
+        f"oracle_top_{int(basket_k)}_by_option_return": _evaluate_top_k_basket(
+            frame,
+            score_col="option_return",
+            selector_name=f"oracle_top_{int(basket_k)}_by_option_return",
+            target_col=target_col,
+            basket_k=int(basket_k),
+        ),
+    }
+    if "mv_weight" in frame.columns:
+        metrics["oracle_mv_weighted_basket"] = _evaluate_weighted_basket(
+            frame,
+            weight_col="mv_weight",
+            selector_name="oracle_mv_weighted_basket",
+            target_col=target_col,
+            basket_k=int(basket_k),
+            min_weight=0.0,
+        )
+    return metrics
+
+
+def _model_basket_metrics(prefix: str, metrics: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    if "top_k_equal_weight_basket" in metrics:
+        out[f"{prefix}_top_k_equal_weight_basket"] = metrics["top_k_equal_weight_basket"]
+    if "score_weighted_basket" in metrics:
+        out[f"{prefix}_score_weighted_basket"] = metrics["score_weighted_basket"]
+    return out
+
+
+def _basket_rows(feature_family: str, metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for selector, values in _model_basket_metrics("model", metrics).items():
+        rows.append({"feature_family": feature_family, "selector": selector, **values})
+    return rows
+
+
+def _evaluate_top_k_basket(
+    frame: pd.DataFrame,
+    *,
+    score_col: str,
+    selector_name: str,
+    target_col: str,
+    basket_k: int,
+) -> dict[str, Any]:
+    if frame.empty or score_col not in frame.columns or int(basket_k) <= 0:
+        return {"selector": selector_name, "trades": 0}
+    work = frame.copy()
+    work[score_col] = pd.to_numeric(work[score_col], errors="coerce")
+    work = work.loc[work[score_col].notna()].copy()
+    if work.empty:
+        return {"selector": selector_name, "trades": 0}
+    selected = (
+        work.sort_values(["trade_id", score_col, "option_return"], ascending=[True, False, False], kind="stable")
+        .groupby("trade_id", as_index=False, sort=False)
+        .head(int(basket_k))
+        .copy()
+    )
+    selected["basket_weight"] = selected.groupby("trade_id")["trade_id"].transform(lambda values: 1.0 / float(len(values)))
+    return _summarize_basket(selected, selector_name=selector_name, target_col=target_col)
+
+
+def _evaluate_weighted_basket(
+    frame: pd.DataFrame,
+    *,
+    weight_col: str,
+    selector_name: str,
+    target_col: str,
+    basket_k: int,
+    min_weight: float = 0.0,
+) -> dict[str, Any]:
+    if frame.empty or weight_col not in frame.columns or int(basket_k) <= 0:
+        return {"selector": selector_name, "trades": 0}
+    work = frame.copy()
+    work["_raw_basket_weight"] = pd.to_numeric(work[weight_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    work = work.loc[work["_raw_basket_weight"].gt(float(min_weight))].copy()
+    if work.empty:
+        return {"selector": selector_name, "trades": 0}
+    selected = (
+        work.sort_values(["trade_id", "_raw_basket_weight", "option_return"], ascending=[True, False, False], kind="stable")
+        .groupby("trade_id", as_index=False, sort=False)
+        .head(int(basket_k))
+        .copy()
+    )
+    totals = selected.groupby("trade_id")["_raw_basket_weight"].transform("sum")
+    selected = selected.loc[totals.gt(0)].copy()
+    if selected.empty:
+        return {"selector": selector_name, "trades": 0}
+    selected["basket_weight"] = selected["_raw_basket_weight"] / totals.loc[selected.index]
+    return _summarize_basket(selected.drop(columns=["_raw_basket_weight"]), selector_name=selector_name, target_col=target_col)
+
+
+def _summarize_basket(frame: pd.DataFrame, *, selector_name: str, target_col: str) -> dict[str, Any]:
+    if frame.empty:
+        return {"selector": selector_name, "trades": 0}
+    work = frame.copy()
+    work["basket_weight"] = pd.to_numeric(work["basket_weight"], errors="coerce").fillna(0.0)
+    work["option_return"] = pd.to_numeric(work["option_return"], errors="coerce").fillna(0.0)
+    work["_weighted_return"] = work["basket_weight"] * work["option_return"]
+    trade_returns = work.groupby("trade_id", dropna=False)["_weighted_return"].sum()
+    result = {
+        "selector": selector_name,
+        "trades": int(trade_returns.shape[0]),
+        "legs": int(len(work)),
+        "avg_legs_per_trade": float(work.groupby("trade_id", dropna=False).size().mean()),
+        "mean_return": float(trade_returns.mean()),
+        "median_return": float(trade_returns.median()),
+        "win_rate": float(trade_returns.gt(0).mean()),
+    }
+    if "rank_y" in work.columns:
+        work["rank_y"] = pd.to_numeric(work["rank_y"], errors="coerce")
+        weighted_rank = (work["basket_weight"] * work["rank_y"]).groupby(work["trade_id"], dropna=False).sum()
+        result["mean_weighted_rank_y"] = float(weighted_rank.mean())
+        result["median_weighted_rank_y"] = float(weighted_rank.median())
+    if target_col in work.columns:
+        work[target_col] = pd.to_numeric(work[target_col], errors="coerce")
+        weighted_target = (work["basket_weight"] * work[target_col]).groupby(work["trade_id"], dropna=False).sum()
+        result["target_col"] = target_col
+        result["mean_weighted_target"] = float(weighted_target.mean())
+        result["median_weighted_target"] = float(weighted_target.median())
     return result
 
 
