@@ -71,6 +71,8 @@ def main() -> None:
     parser.add_argument("--n-estimators", type=int, default=200)
     parser.add_argument("--mv-risk-aversion", type=float, default=1.0)
     parser.add_argument("--mv-max-weight", type=float, default=0.35)
+    parser.add_argument("--disable-pairwise-ranker", action="store_true")
+    parser.add_argument("--pairwise-pairs-per-trade", type=int, default=20)
     parser.add_argument("--skip-panel", action="store_true")
     args = parser.parse_args()
 
@@ -130,6 +132,8 @@ def main() -> None:
             eval_start=str(args.eval_start),
             n_estimators=int(args.n_estimators),
             target_col="rank_y",
+            enable_pairwise=not bool(args.disable_pairwise_ranker),
+            pairwise_pairs_per_trade=int(args.pairwise_pairs_per_trade),
         ),
         "mv_weight": _run_family_ranker(
             panel_path=panel_path,
@@ -139,6 +143,8 @@ def main() -> None:
             eval_start=str(args.eval_start),
             n_estimators=int(args.n_estimators),
             target_col="mv_weight",
+            enable_pairwise=not bool(args.disable_pairwise_ranker),
+            pairwise_pairs_per_trade=int(args.pairwise_pairs_per_trade),
         ),
     }
     (out_dir / "ranker_stdout.json").write_text(ranker_outputs["rank_y"], encoding="utf-8")
@@ -185,6 +191,8 @@ def _run_family_ranker(
     eval_start: str,
     n_estimators: int,
     target_col: str,
+    enable_pairwise: bool,
+    pairwise_pairs_per_trade: int,
 ) -> str:
     command = [
         sys.executable,
@@ -204,7 +212,11 @@ def _run_family_ranker(
         target_col,
         "--output-dir",
         str(output_dir),
+        "--pairwise-pairs-per-trade",
+        str(pairwise_pairs_per_trade),
     ]
+    if not enable_pairwise:
+        command.append("--disable-pairwise-ranker")
     ranker = subprocess.run(command, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
     return ranker.stdout
 

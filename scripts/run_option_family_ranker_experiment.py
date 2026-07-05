@@ -87,6 +87,8 @@ def main() -> None:
     parser.add_argument("--target-col", default="rank_y", help="Numeric option label column to predict.")
     parser.add_argument("--basket-k", type=int, default=4, help="Max option legs per basket selector.")
     parser.add_argument("--basket-min-weight", type=float, default=0.0, help="Minimum positive score for weighted basket legs.")
+    parser.add_argument("--disable-pairwise-ranker", action="store_true")
+    parser.add_argument("--pairwise-pairs-per-trade", type=int, default=20)
     args = parser.parse_args()
 
     started = perf_counter()
@@ -141,15 +143,23 @@ def main() -> None:
         target_col=target_col,
         basket_k=int(args.basket_k),
         basket_min_weight=float(args.basket_min_weight),
+        enable_pairwise=not bool(args.disable_pairwise_ranker),
+        pairwise_pairs_per_trade=int(args.pairwise_pairs_per_trade),
     )
     if baseline["model"] is not None:
         _write_pickle(out_dir / "option_only_ranker.pkl", baseline["model"])
+    if baseline["pairwise_model"] is not None:
+        _write_pickle(out_dir / "option_only_pairwise_ranker.pkl", baseline["pairwise_model"])
 
     family_summaries = []
     selector_rows = [
         {"feature_family": "fixed_near_atm", "selector": "fixed_near_atm", **fixed},
         {"feature_family": "option_only", "selector": "option_only_ranker", **baseline["metrics"]["selector"]},
     ]
+    if baseline["metrics"].get("pairwise_selector"):
+        selector_rows.append(
+            {"feature_family": "option_only", "selector": "option_only_pairwise_ranker", **baseline["metrics"]["pairwise_selector"]}
+        )
     basket_rows = [
         {"feature_family": "oracle", "selector": name, **metrics}
         for name, metrics in oracle_baskets.items()
@@ -184,12 +194,23 @@ def main() -> None:
             target_col=target_col,
             basket_k=int(args.basket_k),
             basket_min_weight=float(args.basket_min_weight),
+            enable_pairwise=not bool(args.disable_pairwise_ranker),
+            pairwise_pairs_per_trade=int(args.pairwise_pairs_per_trade),
         )
         if family_aware["model"] is not None:
             _write_pickle(family_dir / "ranker.pkl", family_aware["model"])
+        if family_aware["pairwise_model"] is not None:
+            _write_pickle(family_dir / "pairwise_ranker.pkl", family_aware["pairwise_model"])
         scored_eval = family_aware["eval_scored"].copy()
         if not baseline["eval_scored"].empty and option_only_score_col in baseline["eval_scored"].columns:
             scored_eval[option_only_score_col] = baseline["eval_scored"][option_only_score_col].to_numpy()
+        baseline_pairwise_score_col = baseline["metrics"].get("pairwise_score_col")
+        if (
+            not baseline["eval_scored"].empty
+            and isinstance(baseline_pairwise_score_col, str)
+            and baseline_pairwise_score_col in baseline["eval_scored"].columns
+        ):
+            scored_eval[baseline_pairwise_score_col] = baseline["eval_scored"][baseline_pairwise_score_col].to_numpy()
         summary = {
             "option_panel": str(Path(args.option_panel).expanduser().resolve()),
             "target_col": target_col,
@@ -219,15 +240,28 @@ def main() -> None:
                 **family_aware["metrics"]["selector"],
             }
         )
+        if family_aware["metrics"].get("pairwise_selector"):
+            selector_rows.append(
+                {
+                    "feature_family": f"{source}.{family}",
+                    "selector": "option_plus_family_pairwise_ranker",
+                    **family_aware["metrics"]["pairwise_selector"],
+                }
+            )
         basket_rows.extend(_basket_rows(f"{source}.{family}", family_aware["metrics"]))
         family_summaries.append(_flatten_family_summary(summary))
-        pd.DataFrame(
-            [
-                {"selector": "fixed_near_atm", **fixed},
-                {"selector": "option_only_ranker", **baseline["metrics"]["selector"]},
-                {"selector": "option_plus_family_ranker", **family_aware["metrics"]["selector"]},
-            ]
-        ).to_csv(family_dir / "selector_summary.csv", index=False)
+        family_selector_rows = [
+            {"selector": "fixed_near_atm", **fixed},
+            {"selector": "option_only_ranker", **baseline["metrics"]["selector"]},
+            {"selector": "option_plus_family_ranker", **family_aware["metrics"]["selector"]},
+        ]
+        if baseline["metrics"].get("pairwise_selector"):
+            family_selector_rows.append({"selector": "option_only_pairwise_ranker", **baseline["metrics"]["pairwise_selector"]})
+        if family_aware["metrics"].get("pairwise_selector"):
+            family_selector_rows.append(
+                {"selector": "option_plus_family_pairwise_ranker", **family_aware["metrics"]["pairwise_selector"]}
+            )
+        pd.DataFrame(family_selector_rows).to_csv(family_dir / "selector_summary.csv", index=False)
         pd.DataFrame(
             [
                 {"selector": name, **metrics}
@@ -413,6 +447,9 @@ def _flatten_family_summary(summary: dict[str, Any]) -> dict[str, Any]:
     selector = dict(summary["family_ranker"]["selector"])
     top_k = dict(summary["family_ranker"].get("top_k_equal_weight_basket") or {})
     weighted = dict(summary["family_ranker"].get("score_weighted_basket") or {})
+    pairwise_selector = dict(summary["family_ranker"].get("pairwise_selector") or {})
+    pairwise_top_k = dict(summary["family_ranker"].get("pairwise_top_k_equal_weight_basket") or {})
+    pairwise_weighted = dict(summary["family_ranker"].get("pairwise_score_weighted_basket") or {})
     return {
         "feature_family": summary["feature_family"],
         "family_feature_count": summary["family_feature_count"],
@@ -439,6 +476,19 @@ def _flatten_family_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "weighted_basket_median_return": weighted.get("median_return"),
         "weighted_basket_win_rate": weighted.get("win_rate"),
         "weighted_basket_avg_legs": weighted.get("avg_legs_per_trade"),
+        "pairwise_train_pairs": summary["family_ranker"].get("pairwise_train_pairs"),
+        "pairwise_train_accuracy": summary["family_ranker"].get("pairwise_train_accuracy"),
+        "pairwise_selected_mean_option_return": pairwise_selector.get("mean_option_return"),
+        "pairwise_selected_median_option_return": pairwise_selector.get("median_option_return"),
+        "pairwise_selected_win_rate": pairwise_selector.get("win_rate"),
+        "pairwise_top_k_basket_mean_return": pairwise_top_k.get("mean_return"),
+        "pairwise_top_k_basket_median_return": pairwise_top_k.get("median_return"),
+        "pairwise_top_k_basket_win_rate": pairwise_top_k.get("win_rate"),
+        "pairwise_top_k_basket_avg_legs": pairwise_top_k.get("avg_legs_per_trade"),
+        "pairwise_weighted_basket_mean_return": pairwise_weighted.get("mean_return"),
+        "pairwise_weighted_basket_median_return": pairwise_weighted.get("median_return"),
+        "pairwise_weighted_basket_win_rate": pairwise_weighted.get("win_rate"),
+        "pairwise_weighted_basket_avg_legs": pairwise_weighted.get("avg_legs_per_trade"),
         "elapsed_seconds": summary["elapsed_seconds"],
     }
 
@@ -486,6 +536,8 @@ def _fit_score_and_evaluate(
     target_col: str,
     basket_k: int,
     basket_min_weight: float,
+    enable_pairwise: bool,
+    pairwise_pairs_per_trade: int,
 ) -> dict[str, Any]:
     from sklearn.ensemble import RandomForestRegressor
     from sklearn.impute import SimpleImputer
@@ -497,6 +549,7 @@ def _fit_score_and_evaluate(
         scored[score_col] = np.nan
         return {
             "model": None,
+            "pairwise_model": None,
             "eval_scored": scored,
             "metrics": _empty_model_metrics(scored, score_col=score_col, target_col=target_col),
         }
@@ -508,6 +561,7 @@ def _fit_score_and_evaluate(
         scored[score_col] = np.nan
         return {
             "model": None,
+            "pairwise_model": None,
             "eval_scored": scored,
             "metrics": _empty_model_metrics(scored, score_col=score_col, target_col=target_col),
         }
@@ -562,7 +616,25 @@ def _fit_score_and_evaluate(
             min_weight=float(basket_min_weight),
         ),
     }
-    return {"model": model, "eval_scored": scored, "metrics": metrics}
+    pairwise_model = None
+    if enable_pairwise:
+        pairwise_score_col = f"{score_col}_pairwise"
+        pairwise = _fit_pairwise_ranker(
+            train,
+            scored,
+            numeric_features=features,
+            target_col=target_col,
+            score_col=pairwise_score_col,
+            random_seed=int(random_seed) + 1009,
+            n_estimators=int(n_estimators),
+            pairs_per_trade=int(pairwise_pairs_per_trade),
+            basket_k=int(basket_k),
+            basket_min_weight=float(basket_min_weight),
+        )
+        pairwise_model = pairwise["model"]
+        scored = pairwise["eval_scored"]
+        metrics.update(pairwise["metrics"])
+    return {"model": model, "pairwise_model": pairwise_model, "eval_scored": scored, "metrics": metrics}
 
 
 def _empty_model_metrics(frame: pd.DataFrame, *, score_col: str, target_col: str) -> dict[str, Any]:
@@ -583,6 +655,162 @@ def _empty_model_metrics(frame: pd.DataFrame, *, score_col: str, target_col: str
             basket_k=0,
         ),
     }
+
+
+def _fit_pairwise_ranker(
+    train: pd.DataFrame,
+    eval_: pd.DataFrame,
+    *,
+    numeric_features: list[str],
+    target_col: str,
+    score_col: str,
+    random_seed: int,
+    n_estimators: int,
+    pairs_per_trade: int,
+    basket_k: int,
+    basket_min_weight: float,
+) -> dict[str, Any]:
+    from sklearn.ensemble import ExtraTreesClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import accuracy_score
+    from sklearn.pipeline import Pipeline
+
+    scored = eval_.copy()
+    scored[score_col] = np.nan
+    pair_frame = _build_pairwise_training_frame(
+        train,
+        numeric_features=numeric_features,
+        target_col=target_col,
+        pairs_per_trade=int(pairs_per_trade),
+        random_seed=int(random_seed),
+    )
+    if pair_frame.empty:
+        return {
+            "model": None,
+            "eval_scored": scored,
+            "metrics": {
+                "pairwise_score_col": score_col,
+                "pairwise_train_pairs": 0,
+                "pairwise_selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col, target_col=target_col),
+                "pairwise_top_k_equal_weight_basket": _evaluate_top_k_basket(
+                    scored,
+                    score_col=score_col,
+                    selector_name=f"{score_col}_top_{int(basket_k)}_equal_weight",
+                    target_col=target_col,
+                    basket_k=int(basket_k),
+                ),
+                "pairwise_score_weighted_basket": _evaluate_weighted_basket(
+                    scored,
+                    weight_col=score_col,
+                    selector_name=f"{score_col}_weighted_basket",
+                    target_col=target_col,
+                    basket_k=int(basket_k),
+                    min_weight=float(basket_min_weight),
+                ),
+            },
+        }
+    model = Pipeline(
+        [
+            ("impute", SimpleImputer(strategy="median")),
+            (
+                "clf",
+                ExtraTreesClassifier(
+                    n_estimators=max(50, min(200, int(n_estimators))),
+                    max_depth=10,
+                    min_samples_leaf=5,
+                    n_jobs=-1,
+                    random_state=int(random_seed),
+                ),
+            ),
+        ]
+    )
+    feature_cols = [col for col in pair_frame.columns if col.startswith("diff__")]
+    target = pair_frame["pairwise_label"].astype(int)
+    model.fit(pair_frame[feature_cols], target)
+    train_pred = model.predict(pair_frame[feature_cols])
+    scored[score_col] = _score_pairwise_eval(
+        model,
+        scored,
+        numeric_features=numeric_features,
+    )
+    metrics = {
+        "pairwise_score_col": score_col,
+        "pairwise_train_pairs": int(len(pair_frame)),
+        "pairwise_train_accuracy": float(accuracy_score(target, train_pred)),
+        "pairwise_selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col, target_col=target_col),
+        "pairwise_top_k_equal_weight_basket": _evaluate_top_k_basket(
+            scored,
+            score_col=score_col,
+            selector_name=f"{score_col}_top_{int(basket_k)}_equal_weight",
+            target_col=target_col,
+            basket_k=int(basket_k),
+        ),
+        "pairwise_score_weighted_basket": _evaluate_weighted_basket(
+            scored,
+            weight_col=score_col,
+            selector_name=f"{score_col}_weighted_basket",
+            target_col=target_col,
+            basket_k=int(basket_k),
+            min_weight=float(basket_min_weight),
+        ),
+    }
+    return {"model": model, "eval_scored": scored, "metrics": metrics}
+
+
+def _build_pairwise_training_frame(
+    train: pd.DataFrame,
+    *,
+    numeric_features: list[str],
+    target_col: str,
+    pairs_per_trade: int,
+    random_seed: int,
+) -> pd.DataFrame:
+    if train.empty or not numeric_features or int(pairs_per_trade) <= 0:
+        return pd.DataFrame()
+    rng = np.random.default_rng(int(random_seed))
+    rows = []
+    feature_cols = [col for col in numeric_features if col in train.columns]
+    for _trade_id, group in train.groupby("trade_id", sort=False):
+        work = group.dropna(subset=[target_col]).copy()
+        if len(work) < 2:
+            continue
+        target = pd.to_numeric(work[target_col], errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(target)
+        if int(valid.sum()) < 2 or np.nanmax(target[valid]) <= np.nanmin(target[valid]):
+            continue
+        work = work.loc[valid].reset_index(drop=True)
+        target = target[valid]
+        features = work[feature_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        max_pairs = int(min(max(1, pairs_per_trade), len(work) * (len(work) - 1) // 2))
+        made = 0
+        attempts = 0
+        while made < max_pairs and attempts < max_pairs * 20:
+            attempts += 1
+            left, right = rng.choice(len(work), size=2, replace=False)
+            if target[left] == target[right]:
+                continue
+            label = int(target[left] > target[right])
+            diff = features[left] - features[right]
+            rows.append({**{f"diff__{col}": diff[i] for i, col in enumerate(feature_cols)}, "pairwise_label": label})
+            rows.append({**{f"diff__{col}": -diff[i] for i, col in enumerate(feature_cols)}, "pairwise_label": 1 - label})
+            made += 1
+    return pd.DataFrame(rows)
+
+
+def _score_pairwise_eval(model: Any, frame: pd.DataFrame, *, numeric_features: list[str]) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype=float)
+    feature_cols = [col for col in numeric_features if col in frame.columns]
+    if not feature_cols:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    diff_cols = [f"diff__{col}" for col in feature_cols]
+    work = frame[feature_cols].apply(pd.to_numeric, errors="coerce")
+    reference = work.groupby(frame["trade_id"], sort=False).transform("median")
+    diffs = work.subtract(reference, axis="columns")
+    diffs.columns = diff_cols
+    probabilities = model.predict_proba(diffs)
+    score = probabilities[:, 0] if probabilities.shape[1] == 1 else probabilities[:, 1]
+    return pd.Series(score, index=frame.index, dtype=float)
 
 
 def _evaluate_selector(frame: pd.DataFrame, *, score_col: str, selector_name: str, target_col: str = "rank_y") -> dict[str, Any]:
@@ -649,6 +877,10 @@ def _model_basket_metrics(prefix: str, metrics: dict[str, Any]) -> dict[str, dic
         out[f"{prefix}_top_k_equal_weight_basket"] = metrics["top_k_equal_weight_basket"]
     if "score_weighted_basket" in metrics:
         out[f"{prefix}_score_weighted_basket"] = metrics["score_weighted_basket"]
+    if "pairwise_top_k_equal_weight_basket" in metrics:
+        out[f"{prefix}_pairwise_top_k_equal_weight_basket"] = metrics["pairwise_top_k_equal_weight_basket"]
+    if "pairwise_score_weighted_basket" in metrics:
+        out[f"{prefix}_pairwise_score_weighted_basket"] = metrics["pairwise_score_weighted_basket"]
     return out
 
 
