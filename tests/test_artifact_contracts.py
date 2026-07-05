@@ -8,7 +8,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.scored_panel_replay imp
     ScoredPanelTopKReplayConfig,
     replay_scored_panel_top_k,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
+from quant_orchestrator.artifact_contracts import (
     StrategyArtifactBundle,
     combine_trade_lists,
     normalize_trade_list,
@@ -20,7 +20,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts impo
 )
 
 
-def test_strategy_artifact_bundle_round_trips_core_contract(tmp_path) -> None:
+def test_artifact_contract_bundle_round_trips_core_contract(tmp_path) -> None:
     feature_panel = pd.DataFrame(
         {
             "date": [pd.Timestamp("2024-01-01")],
@@ -54,8 +54,8 @@ def test_strategy_artifact_bundle_round_trips_core_contract(tmp_path) -> None:
         }
     )
 
-    legacy_scored_path = tmp_path / "legacy_scored.csv"
-    legacy_scored_path.write_text("legacy", encoding="utf-8")
+    extra_scored_path = tmp_path / "extra_scored.csv"
+    extra_scored_path.write_text("extra", encoding="utf-8")
     paths = write_strategy_artifacts(
         StrategyArtifactBundle(
             feature_panel=feature_panel,
@@ -66,53 +66,25 @@ def test_strategy_artifact_bundle_round_trips_core_contract(tmp_path) -> None:
             strategy_name="test_strategy",
         ),
         tmp_path,
-        extra_paths={"scored_panel": legacy_scored_path},
+        extra_paths={"scored_panel": extra_scored_path},
     )
     loaded = read_strategy_artifacts(tmp_path)
     manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
 
     assert paths["manifest"].exists()
     assert manifest["artifacts"]["scored_panel"]["rows"] == 1
-    assert manifest["artifacts"]["trade_list"]["alias_of"] == "trade_windows"
-    assert manifest["artifacts"]["trade_list"]["path"] == "trade_windows.parquet"
-    assert manifest["artifacts"]["legacy_scored_panel"]["path"] == str(legacy_scored_path)
+    assert manifest["artifacts"]["trade_list"]["path"] == "trade_list.parquet"
+    assert manifest["artifacts"]["extra_scored_panel"]["path"] == str(extra_scored_path)
     assert loaded.strategy_name == "test_strategy"
     assert loaded.summary == {"total_return_pct": 1.0}
     assert loaded.manifest_path == tmp_path / "strategy_artifacts_manifest.json"
-    assert loaded.trade_windows_path == tmp_path / "trade_windows.parquet"
-    assert loaded.trade_list_path == tmp_path / "trade_windows.parquet"
+    assert loaded.trade_list_path == tmp_path / "trade_list.parquet"
     assert loaded.scored_panel["symbol"].tolist() == ["AAA"]
     assert loaded.action_tape["action"].tolist() == ["buy"]
     assert loaded.trade_list["entry_date"].tolist() == [pd.Timestamp("2024-01-02")]
-    assert loaded.trade_list is loaded.trade_windows
 
 
-def test_strategy_artifact_bundle_accepts_legacy_trade_windows_name(tmp_path) -> None:
-    legacy_trades = pd.DataFrame(
-        {
-            "trade_id": ["t1"],
-            "symbol": ["aaa"],
-            "side": ["long"],
-            "entry_date": [pd.Timestamp("2024-01-02")],
-            "exit_date": [pd.Timestamp("2024-01-03")],
-        }
-    )
-
-    write_strategy_artifacts(
-        StrategyArtifactBundle(
-            trade_windows=legacy_trades,
-            strategy_name="legacy_strategy",
-        ),
-        tmp_path,
-    )
-    loaded = read_strategy_artifacts(tmp_path)
-
-    assert loaded.trade_list is loaded.trade_windows
-    assert loaded.trade_list_path == loaded.trade_windows_path
-    assert loaded.trade_list.loc[0, "symbol"] == "AAA"
-
-
-def test_strategy_artifact_validation_rejects_missing_required_columns() -> None:
+def test_artifact_contract_validation_rejects_missing_required_columns() -> None:
     with pytest.raises(ValueError, match="missing required columns"):
         validate_strategy_artifact_frame(
             "scored_panel",
@@ -121,7 +93,7 @@ def test_strategy_artifact_validation_rejects_missing_required_columns() -> None
         )
 
 
-def test_trade_window_validation_rejects_invalid_contract_values() -> None:
+def test_trade_list_validation_rejects_invalid_contract_values() -> None:
     base = pd.DataFrame(
         {
             "trade_id": ["t1"],
@@ -135,25 +107,25 @@ def test_trade_window_validation_rejects_invalid_contract_values() -> None:
 
     with pytest.raises(ValueError, match="invalid side"):
         validate_strategy_artifact_frame(
-            "trade_windows",
+            "trade_list",
             base.assign(side=["buy"]),
             required_columns=("trade_id", "symbol", "side", "entry_date", "exit_date"),
         )
     with pytest.raises(ValueError, match="exit_date before entry_date"):
         validate_strategy_artifact_frame(
-            "trade_windows",
+            "trade_list",
             base.assign(exit_date=[pd.Timestamp("2024-01-01")]),
             required_columns=("trade_id", "symbol", "side", "entry_date", "exit_date"),
         )
     with pytest.raises(ValueError, match="negative equity_entry_notional"):
         validate_strategy_artifact_frame(
-            "trade_windows",
+            "trade_list",
             base.assign(equity_entry_notional=[-1.0]),
             required_columns=("trade_id", "symbol", "side", "entry_date", "exit_date"),
         )
 
 
-def test_scored_panel_top_k_replay_writes_strategy_contract(tmp_path) -> None:
+def test_scored_panel_top_k_replay_writes_artifact_contract(tmp_path) -> None:
     panel = pd.DataFrame(
         {
             "date": ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02", "2024-01-03", "2024-01-03"],
@@ -177,12 +149,12 @@ def test_scored_panel_top_k_replay_writes_strategy_contract(tmp_path) -> None:
     )
     loaded = read_strategy_artifacts(tmp_path)
 
-    assert result.rule_replay.trade_windows.loc[0, "symbol"] == "AAA"
-    assert result.rule_replay.trade_windows.loc[0, "ret_dec"] == pytest.approx((120.0 / 110.0) - 1.0)
+    assert result.rule_replay.trade_list.loc[0, "symbol"] == "AAA"
+    assert result.rule_replay.trade_list.loc[0, "ret_dec"] == pytest.approx((120.0 / 110.0) - 1.0)
     assert loaded.strategy_name == "unit_signal"
     assert loaded.scored_panel is not None
     assert loaded.action_tape is not None
-    assert loaded.trade_windows is not None
+    assert loaded.trade_list is not None
 
 
 def test_trade_list_helpers_load_manifest_direct_file_and_mixed_sources(tmp_path) -> None:
@@ -216,7 +188,7 @@ def test_trade_list_helpers_load_manifest_direct_file_and_mixed_sources(tmp_path
         }
     )
 
-    assert paths["trade_windows"].name == "trade_windows.parquet"
+    assert paths["trade_list"].name == "trade_list.parquet"
     assert manifest_trades["symbol"].tolist() == ["AAPL", "MSFT"]
     assert direct_trades["side"].tolist() == ["short", "long"]
     assert combined["artifact_source"].value_counts().to_dict() == {

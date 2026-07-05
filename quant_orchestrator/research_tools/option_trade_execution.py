@@ -46,12 +46,12 @@ class OptionTradeExecutor:
         self.selector_name = selector_name
         self.workers = max(1, int(workers))
 
-    def execute(self, trade_windows: pd.DataFrame) -> OptionTradeExecutionBatch:
-        if trade_windows.empty:
+    def execute(self, trade_list: pd.DataFrame) -> OptionTradeExecutionBatch:
+        if trade_list.empty:
             return OptionTradeExecutionBatch(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {})
-        if self.workers <= 1 or len(trade_windows) <= 1:
-            return self._execute_chunk(trade_windows)
-        chunks = _split_frame_for_workers(trade_windows, self.workers)
+        if self.workers <= 1 or len(trade_list) <= 1:
+            return self._execute_chunk(trade_list)
+        chunks = _split_frame_for_workers(trade_list, self.workers)
         batches: list[OptionTradeExecutionBatch] = []
         with ThreadPoolExecutor(max_workers=min(self.workers, len(chunks))) as pool:
             futures = [pool.submit(self._execute_chunk, chunk) for chunk in chunks if not chunk.empty]
@@ -59,12 +59,12 @@ class OptionTradeExecutor:
                 batches.append(future.result())
         return _merge_option_execution_batches(batches)
 
-    def _execute_chunk(self, trade_windows: pd.DataFrame) -> OptionTradeExecutionBatch:
+    def _execute_chunk(self, trade_list: pd.DataFrame) -> OptionTradeExecutionBatch:
         retriever: OptionSelectionRetriever = self.retriever_factory()
         selected_frames = []
         path_frames = []
         status_rows: list[dict[str, Any]] = []
-        for trade in trade_windows.itertuples(index=False):
+        for trade in trade_list.itertuples(index=False):
             selected, paths, status = self._execute_trade(pd.Series(trade._asdict()), retriever)
             if not selected.empty:
                 selected_frames.append(selected)
@@ -121,13 +121,13 @@ class OptionTradeExecutor:
         return priced, paths, status
 
 
-def execute_rule_trade_windows(
-    trade_windows: pd.DataFrame,
+def execute_rule_trade_list(
+    trade_list: pd.DataFrame,
     retriever: OptionSelectionRetriever,
     *,
     selector_name: str = "rule_atm_90d",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    batch = OptionTradeExecutor(lambda: retriever, selector_name=selector_name, workers=1).execute(trade_windows)
+    batch = OptionTradeExecutor(lambda: retriever, selector_name=selector_name, workers=1).execute(trade_list)
     return batch.selected_option_trades, batch.selected_option_paths, batch.trade_status
 
 

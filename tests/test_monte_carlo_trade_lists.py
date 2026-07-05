@@ -7,7 +7,7 @@ from quant_orchestrator.monte_carlo import (
     simulate_trade_list_paths,
     trade_list_return_series,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
+from quant_orchestrator.artifact_contracts import (
     write_trade_list_artifact,
 )
 

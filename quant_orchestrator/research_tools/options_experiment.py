@@ -22,7 +22,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.data_ada
 from quant_orchestrator.research_tools.option_trade_execution import (
     OptionTradeExecutionBatch,
     OptionTradeExecutor,
-    execute_rule_trade_windows,
+    execute_rule_trade_list,
 )
 from quant_orchestrator.tracking import get_tracker
 
@@ -98,7 +98,7 @@ class OptionMvBasketConfig:
 
 
 @dataclass(frozen=True)
-class OptionWindowBuildConfig:
+class OptionTradeListBuildConfig:
     variant: str = "long_short"
     top_k: int = 5
     entry_threshold: float = 0.5
@@ -156,10 +156,10 @@ class OracleOptionExperimentResult:
 
 
 @dataclass(frozen=True)
-class OptionWindowDataset:
-    windows_by_group: dict[str, pd.DataFrame]
+class OptionTradeListDataset:
+    trade_lists_by_group: dict[str, pd.DataFrame]
     source_groups: dict[str, tuple[str, ...]]
-    window_summary: pd.DataFrame
+    trade_list_summary: pd.DataFrame
     source_ranking: pd.DataFrame
 
 
@@ -182,21 +182,15 @@ class OptionExperimentArtifacts:
     config: dict[str, Any]
     analysis_markdown: str
 
-    @property
-    def trade_windows(self) -> pd.DataFrame:
-        """Legacy alias for the canonical trade-list artifact."""
-
-        return self.trade_list
-
 
 @dataclass(frozen=True)
 class OptionRuntimeEstimate:
     baseline_elapsed_seconds: float
-    baseline_trade_windows: int
+    baseline_trade_list_rows: int
     baseline_option_rows: int
-    target_trade_windows: int
+    target_trade_list_rows: int
     target_option_rows: int
-    estimated_seconds_by_windows: float
+    estimated_seconds_by_trade_list_rows: float
     estimated_seconds_by_option_rows: float
     estimated_seconds_conservative: float
     max_seconds: float
@@ -317,15 +311,6 @@ def run_trade_list_option_experiment(
     )
 
 
-def run_trade_window_option_experiment(
-    config: OracleOptionExperimentConfig,
-    trade_windows: pd.DataFrame,
-) -> OracleOptionExperimentResult:
-    """Legacy alias for :func:`run_trade_list_option_experiment`."""
-
-    return run_trade_list_option_experiment(config, trade_windows)
-
-
 def run_backtest_report_option_experiment(
     config: OracleOptionExperimentConfig,
     report: NormalizedBacktestReport,
@@ -407,7 +392,7 @@ def run_trade_list_option_execution(
     trade_status = execution_batch.trade_status
     metrics: dict[str, float] = {
         "phase_entry_selection_and_selected_pricing_seconds": float(perf_counter() - phase_started),
-        "trade_windows": float(len(normalized_trades)),
+        "trade_list_rows": float(len(normalized_trades)),
         "selected_option_trades": float(len(selected_option_trades)),
         "selected_option_paths": float(len(selected_option_paths)),
         "option_execution_workers": float(max(1, int(config.option_execution_workers))),
@@ -484,17 +469,6 @@ def run_trade_list_option_execution(
     )
 
 
-def run_trade_window_option_execution(
-    config: OracleOptionExperimentConfig,
-    trade_windows: pd.DataFrame,
-    *,
-    selector_name: str = "rule_atm_90d",
-) -> OracleOptionExperimentResult:
-    """Legacy alias for :func:`run_trade_list_option_execution`."""
-
-    return run_trade_list_option_execution(config, trade_windows, selector_name=selector_name)
-
-
 def run_backtest_report_option_execution(
     config: OracleOptionExperimentConfig,
     report: NormalizedBacktestReport,
@@ -506,7 +480,7 @@ def run_backtest_report_option_execution(
     return run_trade_list_option_execution(config, report_trade_list(report), selector_name=selector_name)
 
 
-def build_classifier_signal_trade_windows(
+def build_classifier_signal_trade_list(
     strategy_scores: pd.DataFrame,
     *,
     strategy_sources: tuple[str, ...] | None = ("ensemble_mean",),
@@ -640,14 +614,14 @@ def build_option_window_dataset(
     strategy_scores: pd.DataFrame,
     *,
     backtest_summary: pd.DataFrame | None = None,
-    config: OptionWindowBuildConfig = OptionWindowBuildConfig(),
+    config: OptionTradeListBuildConfig = OptionTradeListBuildConfig(),
     include_groups: tuple[str, ...] = ("individual_feature_families", "all_feature_families"),
-) -> OptionWindowDataset:
+) -> OptionTradeListDataset:
     """Build comparable option-trade-window datasets from classifier scores."""
 
     if strategy_scores.empty:
         empty_summary = pd.DataFrame(columns=["group", "sources", "windows", "symbols", "min_entry_date", "max_entry_date"])
-        return OptionWindowDataset({}, {}, empty_summary, pd.DataFrame())
+        return OptionTradeListDataset({}, {}, empty_summary, pd.DataFrame())
     all_sources = tuple(sorted(src for src in strategy_scores["strategy_source"].dropna().astype(str).unique() if src != "ensemble_mean"))
     ranking = (
         rank_option_window_strategy_sources(
@@ -674,10 +648,10 @@ def build_option_window_dataset(
         for name, sources in candidate_groups.items()
         if name in include_groups or (name.startswith("individual__") and "individual_feature_families" in include_groups)
     }
-    windows_by_group: dict[str, pd.DataFrame] = {}
+    trade_lists_by_group: dict[str, pd.DataFrame] = {}
     summary_rows = []
     for name, sources in source_groups.items():
-        windows = build_classifier_signal_trade_windows(
+        windows = build_classifier_signal_trade_list(
             strategy_scores,
             strategy_sources=sources,
             variant=config.variant,
@@ -687,7 +661,7 @@ def build_option_window_dataset(
             min_ae_familiarity=config.min_ae_familiarity,
             max_trades=config.max_trades,
         )
-        windows_by_group[name] = windows
+        trade_lists_by_group[name] = windows
         summary_rows.append(
             {
                 "group": name,
@@ -698,10 +672,10 @@ def build_option_window_dataset(
                 "max_entry_date": windows["entry_date"].max() if not windows.empty else pd.NaT,
             }
         )
-    return OptionWindowDataset(
-        windows_by_group=windows_by_group,
+    return OptionTradeListDataset(
+        trade_lists_by_group=trade_lists_by_group,
         source_groups=source_groups,
-        window_summary=pd.DataFrame(summary_rows),
+        trade_list_summary=pd.DataFrame(summary_rows),
         source_ranking=ranking,
     )
 
@@ -893,7 +867,7 @@ def _run_option_experiment_from_trades(
         phase_started = perf_counter()
         train_panel, eval_panel = _split_option_panel(option_panel, config.split)
     else:
-        train_trades, eval_trades = _split_trade_windows(oracle_trades, config.split)
+        train_trades, eval_trades = _split_trade_list(oracle_trades, config.split)
         train_panel = _build_option_panel(train_trades, retriever, price_exit=True)
         eval_panel = _build_option_panel(eval_trades, retriever, price_exit=False)
         phase_metrics["phase_option_panel_seconds"] = float(perf_counter() - phase_started)
@@ -1959,7 +1933,7 @@ def write_oracle_option_artifacts(
     paths = {
         "coverage": base / "coverage.parquet",
         "oracle_trades": base / "oracle_trades.parquet",
-        "trade_windows": base / "trade_windows.parquet",
+        "trade_list": base / "trade_list.parquet",
         "option_panel": base / "option_candidate_panel.parquet",
         "train_panel": base / "train_panel.parquet",
         "eval_panel": base / "eval_panel.parquet",
@@ -1974,10 +1948,9 @@ def write_oracle_option_artifacts(
         "config": base / "config.json",
         "analysis": base / "analysis.md",
     }
-    paths["trade_list"] = paths["trade_windows"]
     coverage.to_parquet(paths["coverage"], index=False)
     oracle_trades.to_parquet(paths["oracle_trades"], index=False)
-    oracle_trades.to_parquet(paths["trade_windows"], index=False)
+    oracle_trades.to_parquet(paths["trade_list"], index=False)
     option_panel.to_parquet(paths["option_panel"], index=False)
     train_panel.to_parquet(paths["train_panel"], index=False)
     eval_panel.to_parquet(paths["eval_panel"], index=False)
@@ -2015,9 +1988,7 @@ def load_option_experiment_artifacts(base_dir: str | Path) -> OptionExperimentAr
     base = Path(base_dir)
     metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8")) if (base / "metrics.json").exists() else {}
     config = json.loads((base / "config.json").read_text(encoding="utf-8")) if (base / "config.json").exists() else {}
-    trade_list_path = base / "trade_windows.parquet"
-    if not trade_list_path.exists():
-        trade_list_path = base / "oracle_trades.parquet"
+    trade_list_path = base / "trade_list.parquet"
     source_family_path = base / "source_family_summary.csv"
     feature_coverage_path = base / "feature_coverage.csv"
     selected_trades_path = base / "selected_option_trades.parquet"
@@ -2064,29 +2035,29 @@ def compare_option_experiment_artifacts(named_dirs: dict[str, str | Path]) -> pd
 def estimate_option_runtime_scaling(
     *,
     baseline_elapsed_seconds: float,
-    baseline_trade_windows: int,
+    baseline_trade_list_rows: int,
     baseline_option_rows: int,
-    target_trade_windows: int,
+    target_trade_list_rows: int,
     target_option_rows: int,
     max_seconds: float = 3600.0,
 ) -> OptionRuntimeEstimate:
     """Estimate whether a larger option experiment is runnable from a smoke run."""
 
     baseline_elapsed = max(float(baseline_elapsed_seconds), 0.0)
-    baseline_windows = max(int(baseline_trade_windows), 1)
+    baseline_trade_list_rows = max(int(baseline_trade_list_rows), 1)
     baseline_rows = max(int(baseline_option_rows), 1)
-    target_windows = max(int(target_trade_windows), 0)
+    target_trade_list_rows = max(int(target_trade_list_rows), 0)
     target_rows = max(int(target_option_rows), 0)
-    by_windows = baseline_elapsed * (target_windows / baseline_windows)
+    by_windows = baseline_elapsed * (target_trade_list_rows / baseline_trade_list_rows)
     by_rows = baseline_elapsed * (target_rows / baseline_rows)
     conservative = max(by_windows, by_rows)
     return OptionRuntimeEstimate(
         baseline_elapsed_seconds=baseline_elapsed,
-        baseline_trade_windows=baseline_windows,
+        baseline_trade_list_rows=baseline_trade_list_rows,
         baseline_option_rows=baseline_rows,
-        target_trade_windows=target_windows,
+        target_trade_list_rows=target_trade_list_rows,
         target_option_rows=target_rows,
-        estimated_seconds_by_windows=float(by_windows),
+        estimated_seconds_by_trade_list_rows=float(by_windows),
         estimated_seconds_by_option_rows=float(by_rows),
         estimated_seconds_conservative=float(conservative),
         max_seconds=float(max_seconds),
@@ -2094,13 +2065,13 @@ def estimate_option_runtime_scaling(
     )
 
 
-def _execute_rule_trade_windows(
-    trade_windows: pd.DataFrame,
+def _execute_rule_trade_list(
+    trade_list: pd.DataFrame,
     retriever: _OptionRetriever,
     *,
     selector_name: str = "rule_atm_90d",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    return execute_rule_trade_windows(trade_windows, retriever, selector_name=selector_name)
+    return execute_rule_trade_list(trade_list, retriever, selector_name=selector_name)
 
 
 def _select_rule_atm_option_entry(candidates: pd.DataFrame) -> pd.DataFrame:
@@ -2139,7 +2110,7 @@ def _build_option_panel(oracle_trades: pd.DataFrame, retriever: _OptionRetriever
     return panel
 
 
-def _split_trade_windows(oracle_trades: pd.DataFrame, split: SharedSplitConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _split_trade_list(oracle_trades: pd.DataFrame, split: SharedSplitConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     if oracle_trades.empty:
         return pd.DataFrame(), pd.DataFrame()
     dates = pd.to_datetime(oracle_trades["entry_date"], errors="coerce").dt.normalize()
@@ -2519,7 +2490,7 @@ def _source_family_diagnostics(eval_panel: pd.DataFrame, selected_by_selector: d
         work.groupby(group_cols, dropna=False)
         .agg(
             option_rows=("trade_id", "size"),
-            eval_trade_windows=("trade_id", "nunique"),
+            eval_trade_list_rows=("trade_id", "nunique"),
             symbols=("symbol", "nunique"),
             mean_candidate_return=("option_return", "mean"),
             median_candidate_return=("option_return", "median"),
@@ -2553,7 +2524,7 @@ def _source_family_diagnostics(eval_panel: pd.DataFrame, selected_by_selector: d
             payload[f"{selector}_selected_trades"] = int(selected_slice["trade_id"].nunique()) if "trade_id" in selected_slice else 0
             payload[f"{selector}_mean_return"] = float(returns.mean()) if len(returns) else np.nan
         rows.append(payload)
-    return pd.DataFrame(rows).sort_values(["eval_trade_windows", "option_rows"], ascending=[False, False]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["eval_trade_list_rows", "option_rows"], ascending=[False, False]).reset_index(drop=True)
 
 
 def _option_feature_coverage(option_panel: pd.DataFrame, *, train_panel: pd.DataFrame, eval_panel: pd.DataFrame) -> pd.DataFrame:
@@ -3242,10 +3213,6 @@ def _normalize_trade_list(frame: pd.DataFrame) -> pd.DataFrame:
     return normalize_report_trade_list(frame)
 
 
-def _normalize_trade_windows(frame: pd.DataFrame) -> pd.DataFrame:
-    return _normalize_trade_list(frame)
-
-
 def _load_price_frames(
     warehouse,
     symbols: tuple[str, ...],
@@ -3384,7 +3351,7 @@ def _build_analysis(
             source_name = getattr(row, "strategy_source", None) or getattr(row, "source_family", None) or "unknown"
             lines.append(
                 f"  - {source_name}: option_rows={int(getattr(row, 'option_rows', 0)):,}, "
-                f"eval_trade_windows={int(getattr(row, 'eval_trade_windows', 0)):,}."
+                f"eval_trade_list_rows={int(getattr(row, 'eval_trade_list_rows', 0)):,}."
             )
     lines.append("- These artifacts are experiment products, not permanent Quant Warehouse source-of-truth tables.")
     return "\n".join(lines)

@@ -12,7 +12,7 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
-from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
+from quant_orchestrator.artifact_contracts import (
     StrategyArtifactBundle,
     write_strategy_artifacts,
 )
@@ -44,7 +44,7 @@ class TradingAppRuleReplay:
     action_tape: pd.DataFrame
     executions: pd.DataFrame
     positions: pd.DataFrame
-    trade_windows: pd.DataFrame
+    trade_list: pd.DataFrame
     meta: dict[str, Any]
 
 
@@ -720,7 +720,7 @@ def replay_trading_app_top_k_rule(
         action_tape=action_tape,
         executions=executions,
         positions=positions,
-        trade_windows=trade_windows,
+        trade_list=trade_windows,
         meta=details,
     )
 
@@ -1263,7 +1263,7 @@ def run_optimal_trader_artifact_replay(config: OptimalTraderArtifactReplayConfig
         )
 
         option_execution = run_fmp_synthetic_option_trade_replay(
-            rule_replay.trade_windows,
+            rule_replay.trade_list,
             config=FmpSyntheticOptionReplayConfig(workers=max(1, int(config.option_workers))),
         )
         option_portfolio = replay_option_portfolio_from_selected_paths(
@@ -1305,7 +1305,7 @@ def run_optimal_trader_artifact_replay(config: OptimalTraderArtifactReplayConfig
         "scored_rows": int(len(scored)),
         "latest_score_validation": compare_latest_scores(scored, artifact_dir, score_col),
         "rule_meta": rule_replay.meta,
-        "trade_windows": int(len(rule_replay.trade_windows)),
+        "trade_list": int(len(rule_replay.trade_list)),
         "fmp_synthetic_options": option_summary,
         "performance": summarize_returns(rule_replay.returns, float(config.initial_balance)),
     }
@@ -1331,7 +1331,7 @@ def write_artifact_replay_outputs(result: OptimalTraderArtifactReplayResult, out
         "cash": out_dir / "cash.csv",
         "action_tape": out_dir / "action_tape.parquet",
         "positions": out_dir / "positions.parquet",
-        "trade_windows": out_dir / "trade_windows.parquet",
+        "trade_list": out_dir / "trade_list.parquet",
         "summary": out_dir / "summary.json",
         "equity_executions": out_dir / "equity_executions.csv",
     }
@@ -1359,13 +1359,13 @@ def write_artifact_replay_outputs(result: OptimalTraderArtifactReplayResult, out
     result.rule_replay.action_tape.to_parquet(paths["action_tape"], index=False)
     result.rule_replay.executions.to_csv(paths["equity_executions"], index=False)
     result.rule_replay.positions.reset_index(names="date").to_parquet(paths["positions"], index=False)
-    result.rule_replay.trade_windows.to_parquet(paths["trade_windows"], index=False)
+    result.rule_replay.trade_list.to_parquet(paths["trade_list"], index=False)
     standard_paths = write_strategy_artifacts(
         StrategyArtifactBundle(
             feature_panel=result.feature_panel,
             scored_panel=result.scored_panel,
             action_tape=result.rule_replay.action_tape,
-            trade_windows=result.rule_replay.trade_windows,
+            trade_list=result.rule_replay.trade_list,
             summary=result.summary,
             strategy_name="optimal_trader.trading_app",
         ),

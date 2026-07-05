@@ -8,8 +8,8 @@ from quant_orchestrator.research_tools.options_experiment import (
     OptionRetrievalConfig,
     OptionMvBasketConfig,
     OptopsyExecutionConfig,
-    OptionWindowBuildConfig,
-    build_classifier_signal_trade_windows,
+    OptionTradeListBuildConfig,
+    build_classifier_signal_trade_list,
     build_option_window_dataset,
     estimate_option_runtime_scaling,
     load_option_experiment_artifacts,
@@ -17,9 +17,9 @@ from quant_orchestrator.research_tools.options_experiment import (
     rank_option_window_strategy_sources,
     write_oracle_option_artifacts,
     _choose_weighted_basket_per_trade,
-    _execute_rule_trade_windows,
+    _execute_rule_trade_list,
     _OptionRetriever,
-    _normalize_trade_windows,
+    _normalize_trade_list,
     _option_feature_coverage,
     _build_portfolio_fraction_trade_log,
     _selector_summaries,
@@ -210,7 +210,7 @@ def test_selector_summaries_respect_mv_basket_limits() -> None:
     assert set(selected["model_mv_basket"]["pred_mv_weight"]) == {0.7, 0.2}
 
 
-def test_classifier_signal_trade_windows_are_event_only() -> None:
+def test_classifier_signal_trade_list_is_event_only() -> None:
     scores = pd.DataFrame(
         {
             "strategy_source": ["ensemble_mean"] * 4,
@@ -226,7 +226,7 @@ def test_classifier_signal_trade_windows_are_event_only() -> None:
         }
     )
 
-    trades = build_classifier_signal_trade_windows(
+    trades = build_classifier_signal_trade_list(
         scores,
         strategy_sources=("ensemble_mean",),
         variant="long_short",
@@ -297,12 +297,12 @@ def test_build_option_window_dataset_creates_standard_groups() -> None:
     dataset = build_option_window_dataset(
         scores,
         backtest_summary=summary,
-        config=OptionWindowBuildConfig(top_k=1, top_family_count=1, ranking_framework="zipline"),
+        config=OptionTradeListBuildConfig(top_k=1, top_family_count=1, ranking_framework="zipline"),
     )
 
-    assert set(dataset.windows_by_group) == {"individual__fmp.a", "individual__fmp.b", "all_feature_families"}
+    assert set(dataset.trade_lists_by_group) == {"individual__fmp.a", "individual__fmp.b", "all_feature_families"}
     assert dataset.source_groups["individual__fmp.a"] == ("fmp.a",)
-    assert dataset.window_summary.set_index("group").loc["all_feature_families", "sources"] == 2
+    assert dataset.trade_list_summary.set_index("group").loc["all_feature_families", "sources"] == 2
 
 
 def test_option_retriever_full_chain_actions_include_long_calls_and_short_puts_with_collateral_returns() -> None:
@@ -464,7 +464,7 @@ def test_fast_rule_execution_prices_only_selected_buy_equivalent_with_path() -> 
         }
     )
 
-    selected, paths, status = _execute_rule_trade_windows(trades, retriever)
+    selected, paths, status = _execute_rule_trade_list(trades, retriever)
 
     assert len(selected) == 1
     assert selected.loc[0, "contract_symbol"] == "AAPL_C_100"
@@ -830,7 +830,7 @@ def test_multiple_classifier_sources_trade_as_one_mean_planner_stream() -> None:
         }
     )
 
-    trades = build_classifier_signal_trade_windows(
+    trades = build_classifier_signal_trade_list(
         scores,
         strategy_sources=("fmp.a", "fmp.b"),
         variant="long_short",
@@ -846,7 +846,7 @@ def test_multiple_classifier_sources_trade_as_one_mean_planner_stream() -> None:
     assert trades["side"].tolist() == ["long", "short"]
 
 
-def test_classifier_trade_windows_require_unanimous_selected_classifier_entry_and_exit_on_any_disagreement() -> None:
+def test_classifier_trade_list_requires_unanimous_selected_classifier_entry_and_exit_on_any_disagreement() -> None:
     scores = pd.DataFrame(
         {
             "strategy_source": ["fmp.a", "fmp.b", "fmp.a", "fmp.b", "fmp.a", "fmp.b"],
@@ -865,7 +865,7 @@ def test_classifier_trade_windows_require_unanimous_selected_classifier_entry_an
         }
     )
 
-    trades = build_classifier_signal_trade_windows(
+    trades = build_classifier_signal_trade_list(
         scores,
         strategy_sources=("fmp.a", "fmp.b"),
         variant="long_short",
@@ -1158,7 +1158,7 @@ def test_source_family_diagnostics_counts_selected_rows() -> None:
     assert by_source.loc["fmp.b", "model_ranker_selected_rows"] == 1
 
 
-def test_classifier_trade_windows_require_top_k_for_option_sizing() -> None:
+def test_classifier_trade_list_requiress_top_k_for_option_sizing() -> None:
     frame = pd.DataFrame(
         {
             "strategy_source": ["fmp.a"],
@@ -1172,7 +1172,7 @@ def test_classifier_trade_windows_require_top_k_for_option_sizing() -> None:
     )
 
     with pytest.raises(KeyError, match="top_k"):
-        _normalize_trade_windows(frame)
+        _normalize_trade_list(frame)
 
 
 def test_portfolio_fraction_option_log_reserves_cash_across_trading_days() -> None:
@@ -1255,7 +1255,7 @@ def test_option_feature_coverage_reports_greeks_and_iv_rates() -> None:
     assert all_rows.loc["iv", "non_null_rate"] == pytest.approx(1.0)
 
 
-def test_standard_artifacts_round_trip_trade_windows_and_source_summary(tmp_path) -> None:
+def test_option_artifacts_round_trip_trade_list_and_source_summary(tmp_path) -> None:
     config = OracleOptionExperimentConfig(experiment_name="unit_option_artifacts", artifact_dir=None)
     expected_default = option_experiment_artifact_dir(config)
     assert str(expected_default) == "artifacts/options/unit_option_artifacts/latest"
@@ -1282,11 +1282,9 @@ def test_standard_artifacts_round_trip_trade_windows_and_source_summary(tmp_path
     )
     loaded = load_option_experiment_artifacts(tmp_path)
 
-    assert paths["trade_windows"].exists()
     assert paths["trade_list"].exists()
     assert paths["feature_coverage"].exists()
     assert loaded.trade_list.loc[0, "trade_id"] == "t1"
-    assert loaded.trade_windows is loaded.trade_list
     assert loaded.source_family_summary.loc[0, "strategy_source"] == "fmp.a"
     assert loaded.feature_coverage.loc[0, "feature"] == "delta"
 
@@ -1294,14 +1292,14 @@ def test_standard_artifacts_round_trip_trade_windows_and_source_summary(tmp_path
 def test_estimate_option_runtime_scaling_uses_conservative_budget() -> None:
     estimate = estimate_option_runtime_scaling(
         baseline_elapsed_seconds=60.0,
-        baseline_trade_windows=10,
+        baseline_trade_list_rows=10,
         baseline_option_rows=100,
-        target_trade_windows=100,
+        target_trade_list_rows=100,
         target_option_rows=500,
         max_seconds=3600.0,
     )
 
-    assert estimate.estimated_seconds_by_windows == 600.0
+    assert estimate.estimated_seconds_by_trade_list_rows == 600.0
     assert estimate.estimated_seconds_by_option_rows == 300.0
     assert estimate.estimated_seconds_conservative == 600.0
     assert estimate.runnable_within_budget

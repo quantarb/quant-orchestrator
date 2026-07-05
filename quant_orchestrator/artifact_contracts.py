@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Produced-artifact contracts shared across research and framework adapters."""
+
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,15 +15,13 @@ ARTIFACT_SCHEMA_VERSION = 1
 FEATURE_PANEL_REQUIRED_COLUMNS = ("date", "symbol")
 SCORED_PANEL_REQUIRED_COLUMNS = ("date", "symbol", "close")
 ACTION_TAPE_REQUIRED_COLUMNS = ("date", "symbol", "action", "price")
-TRADE_WINDOWS_REQUIRED_COLUMNS = ("trade_id", "symbol", "side", "entry_date", "exit_date")
-TRADE_LIST_REQUIRED_COLUMNS = TRADE_WINDOWS_REQUIRED_COLUMNS
-TRADE_WINDOW_SIDES = frozenset({"long", "short"})
-TRADE_WINDOW_NON_NEGATIVE_COLUMNS = ("equity_entry_notional",)
+TRADE_LIST_REQUIRED_COLUMNS = ("trade_id", "symbol", "side", "entry_date", "exit_date")
+TRADE_LIST_SIDES = frozenset({"long", "short"})
+TRADE_LIST_NON_NEGATIVE_COLUMNS = ("equity_entry_notional",)
 TRADE_LIST_ARTIFACT_NAME = "trade_list"
-LEGACY_TRADE_WINDOWS_ARTIFACT_NAME = "trade_windows"
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class StrategyArtifactBundle:
     feature_panel: pd.DataFrame | None = None
     scored_panel: pd.DataFrame | None = None
@@ -36,62 +36,6 @@ class StrategyArtifactBundle:
     trade_list_path: Path | None = None
     summary_path: Path | None = None
     manifest_path: Path | None = None
-
-    def __init__(
-        self,
-        *,
-        feature_panel: pd.DataFrame | None = None,
-        scored_panel: pd.DataFrame | None = None,
-        action_tape: pd.DataFrame | None = None,
-        trade_list: pd.DataFrame | None = None,
-        trade_windows: pd.DataFrame | None = None,
-        summary: Mapping[str, Any] | None = None,
-        strategy_name: str = "",
-        base_path: Path | None = None,
-        feature_panel_path: Path | None = None,
-        scored_panel_path: Path | None = None,
-        action_tape_path: Path | None = None,
-        trade_list_path: Path | None = None,
-        trade_windows_path: Path | None = None,
-        summary_path: Path | None = None,
-        manifest_path: Path | None = None,
-    ) -> None:
-        if trade_list is not None and trade_windows is not None:
-            raise ValueError("Pass either trade_list or legacy trade_windows, not both")
-        if trade_list_path is not None and trade_windows_path is not None:
-            raise ValueError("Pass either trade_list_path or legacy trade_windows_path, not both")
-        object.__setattr__(self, "feature_panel", feature_panel)
-        object.__setattr__(self, "scored_panel", scored_panel)
-        object.__setattr__(self, "action_tape", action_tape)
-        object.__setattr__(self, "trade_list", trade_list if trade_list is not None else trade_windows)
-        object.__setattr__(self, "summary", dict(summary or {}))
-        object.__setattr__(self, "strategy_name", str(strategy_name or ""))
-        object.__setattr__(self, "base_path", base_path)
-        object.__setattr__(self, "feature_panel_path", feature_panel_path)
-        object.__setattr__(self, "scored_panel_path", scored_panel_path)
-        object.__setattr__(self, "action_tape_path", action_tape_path)
-        object.__setattr__(
-            self,
-            "trade_list_path",
-            trade_list_path if trade_list_path is not None else trade_windows_path,
-        )
-        object.__setattr__(self, "summary_path", summary_path)
-        object.__setattr__(self, "manifest_path", manifest_path)
-
-    @property
-    def trade_windows(self) -> pd.DataFrame | None:
-        """Legacy alias for the canonical trade-list artifact.
-
-        The on-disk file is still named ``trade_windows.parquet`` for backward
-        compatibility with existing notebooks. New downstream code should use
-        ``trade_list``.
-        """
-
-        return self.trade_list
-
-    @property
-    def trade_windows_path(self) -> Path | None:
-        return self.trade_list_path
 
 
 def write_strategy_artifacts(
@@ -109,7 +53,7 @@ def write_strategy_artifacts(
         ("feature_panel", bundle.feature_panel, FEATURE_PANEL_REQUIRED_COLUMNS),
         ("scored_panel", bundle.scored_panel, SCORED_PANEL_REQUIRED_COLUMNS),
         ("action_tape", bundle.action_tape, ACTION_TAPE_REQUIRED_COLUMNS),
-        (LEGACY_TRADE_WINDOWS_ARTIFACT_NAME, bundle.trade_list, TRADE_LIST_REQUIRED_COLUMNS),
+        (TRADE_LIST_ARTIFACT_NAME, bundle.trade_list, TRADE_LIST_REQUIRED_COLUMNS),
     ):
         if frame is None:
             continue
@@ -122,14 +66,6 @@ def write_strategy_artifacts(
             "rows": int(len(validated)),
             "columns": list(map(str, validated.columns)),
         }
-        if name == LEGACY_TRADE_WINDOWS_ARTIFACT_NAME:
-            manifest_artifacts[TRADE_LIST_ARTIFACT_NAME] = {
-                "path": path.name,
-                "rows": int(len(validated)),
-                "columns": list(map(str, validated.columns)),
-                "alias_of": LEGACY_TRADE_WINDOWS_ARTIFACT_NAME,
-            }
-
     summary_path = out_dir / "summary.json"
     summary_path.write_text(json.dumps(dict(bundle.summary), indent=2, default=str), encoding="utf-8")
     paths["summary"] = summary_path
@@ -139,7 +75,7 @@ def write_strategy_artifacts(
         for name, path_value in extra_paths.items():
             manifest_name = str(name)
             if manifest_name in manifest_artifacts:
-                manifest_name = f"legacy_{manifest_name}"
+                manifest_name = f"extra_{manifest_name}"
             path = Path(path_value)
             paths[str(name)] = path
             manifest_artifacts[manifest_name] = {"path": str(path)}
@@ -173,13 +109,8 @@ def read_strategy_artifacts(path: str | Path) -> StrategyArtifactBundle:
         resolved_paths[name] = frame_path
         return frame_path
 
-    def read_frame(name: str, required: tuple[str, ...], *, aliases: tuple[str, ...] = ()) -> pd.DataFrame | None:
+    def read_frame(name: str, required: tuple[str, ...]) -> pd.DataFrame | None:
         frame_path = artifact_path(name)
-        if frame_path is None:
-            for alias in aliases:
-                frame_path = artifact_path(alias)
-                if frame_path is not None:
-                    break
         if frame_path is None:
             return None
         if not frame_path.exists():
@@ -192,18 +123,14 @@ def read_strategy_artifacts(path: str | Path) -> StrategyArtifactBundle:
         feature_panel=read_frame("feature_panel", FEATURE_PANEL_REQUIRED_COLUMNS),
         scored_panel=read_frame("scored_panel", SCORED_PANEL_REQUIRED_COLUMNS),
         action_tape=read_frame("action_tape", ACTION_TAPE_REQUIRED_COLUMNS),
-        trade_list=read_frame(
-            LEGACY_TRADE_WINDOWS_ARTIFACT_NAME,
-            TRADE_LIST_REQUIRED_COLUMNS,
-            aliases=(TRADE_LIST_ARTIFACT_NAME,),
-        ),
+        trade_list=read_frame(TRADE_LIST_ARTIFACT_NAME, TRADE_LIST_REQUIRED_COLUMNS),
         summary=summary,
         strategy_name=str(manifest.get("strategy_name") or ""),
         base_path=base,
         feature_panel_path=resolved_paths.get("feature_panel"),
         scored_panel_path=resolved_paths.get("scored_panel"),
         action_tape_path=resolved_paths.get("action_tape"),
-        trade_list_path=resolved_paths.get("trade_windows") or resolved_paths.get("trade_list"),
+        trade_list_path=resolved_paths.get("trade_list"),
         summary_path=summary_path,
         manifest_path=manifest_path,
     )
@@ -237,7 +164,7 @@ def validate_strategy_artifact_frame(
         out = out.loc[out["symbol"].ne("")]
     if "action" in out.columns:
         out["action"] = out["action"].astype(str).str.strip().str.lower()
-    if artifact_name in {LEGACY_TRADE_WINDOWS_ARTIFACT_NAME, TRADE_LIST_ARTIFACT_NAME}:
+    if artifact_name == TRADE_LIST_ARTIFACT_NAME:
         out = _validate_trade_list(out)
     sort_cols = [column for column in ("date", "entry_date", "symbol", "action") if column in out.columns]
     if sort_cols:
@@ -272,9 +199,8 @@ def write_trade_list_artifact(
 ) -> dict[str, Path]:
     """Write only the canonical trade-list contract.
 
-    The physical parquet remains ``trade_windows.parquet`` so all existing
-    notebooks and option replay code keep working. The manifest also advertises
-    ``trade_list`` as the canonical artifact name for new consumers.
+    The physical parquet is ``trade_list.parquet`` and the manifest exposes the
+    same canonical ``trade_list`` artifact name.
     """
 
     return write_strategy_artifacts(
@@ -295,7 +221,7 @@ def read_trade_list_artifact(path: str | Path) -> pd.DataFrame:
     if source.is_dir():
         bundle = read_strategy_artifacts(source)
         if bundle.trade_list is None:
-            raise FileNotFoundError(f"Strategy artifact manifest has no trade_list/trade_windows artifact: {source}")
+            raise FileNotFoundError(f"Strategy artifact manifest has no trade_list artifact: {source}")
         return bundle.trade_list
     if not source.exists():
         raise FileNotFoundError(f"Missing trade-list artifact: {source}")
@@ -343,7 +269,7 @@ def _validate_trade_list(frame: pd.DataFrame) -> pd.DataFrame:
     if bool(reversed_dates.any()):
         raise ValueError("trade_list contains exit_date before entry_date")
     out["side"] = out["side"].astype(str).str.strip().str.lower()
-    bad_side = out["side"].notna() & ~out["side"].isin(TRADE_WINDOW_SIDES)
+    bad_side = out["side"].notna() & ~out["side"].isin(TRADE_LIST_SIDES)
     if bool(bad_side.any()):
         invalid = sorted(out.loc[bad_side, "side"].dropna().unique().tolist())
         raise ValueError(f"trade_list contains invalid side values: {invalid}")
@@ -351,7 +277,7 @@ def _validate_trade_list(frame: pd.DataFrame) -> pd.DataFrame:
         out["trade_id"] = out["trade_id"].astype(str).str.strip()
         if bool(out["trade_id"].eq("").any()):
             raise ValueError("trade_list contains blank trade_id values")
-    for column in TRADE_WINDOW_NON_NEGATIVE_COLUMNS:
+    for column in TRADE_LIST_NON_NEGATIVE_COLUMNS:
         if column not in out.columns:
             continue
         numeric = pd.to_numeric(out[column], errors="coerce")
@@ -360,10 +286,6 @@ def _validate_trade_list(frame: pd.DataFrame) -> pd.DataFrame:
             raise ValueError(f"trade_list contains negative {column} values")
         out[column] = numeric
     return out
-
-
-def _validate_trade_windows(frame: pd.DataFrame) -> pd.DataFrame:
-    return _validate_trade_list(frame)
 
 
 def _frame_with_date_symbol_columns(frame: pd.DataFrame) -> pd.DataFrame:

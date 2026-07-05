@@ -240,15 +240,6 @@ def normalize_trade_list(frame: pd.DataFrame | None, *, require_top_k_for_classi
     return out.sort_values(["entry_date", "symbol", "side"]).reset_index(drop=True)
 
 
-def normalize_trade_windows(frame: pd.DataFrame | None, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
-    """Legacy alias for :func:`normalize_trade_list`."""
-
-    return normalize_trade_list(
-        frame,
-        require_top_k_for_classifier=require_top_k_for_classifier,
-    )
-
-
 def report_trade_list(report: NormalizedBacktestReport, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
     """Extract the canonical closed trade list from a normalized backtest report."""
 
@@ -256,16 +247,6 @@ def report_trade_list(report: NormalizedBacktestReport, *, require_top_k_for_cla
         report.trade_log,
         require_top_k_for_classifier=require_top_k_for_classifier,
     )
-
-
-def report_trade_windows(report: NormalizedBacktestReport, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
-    """Legacy alias for :func:`report_trade_list`."""
-
-    return report_trade_list(
-        report,
-        require_top_k_for_classifier=require_top_k_for_classifier,
-    )
-
 
 def build_normalized_report(
     *,

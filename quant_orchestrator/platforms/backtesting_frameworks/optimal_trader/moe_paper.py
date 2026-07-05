@@ -22,7 +22,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.artifact
     summarize_option_trade_returns,
     summarize_returns,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
+from quant_orchestrator.artifact_contracts import (
     StrategyArtifactBundle,
     write_strategy_artifacts,
 )
@@ -299,7 +299,7 @@ def replay_moe_paper_top_k_rule(
         action_tape=action_tape,
         executions=executions,
         positions=positions,
-        trade_windows=action_tape_to_trade_windows(action_tape, prices=close),
+        trade_list=action_tape_to_trade_windows(action_tape, prices=close),
         meta=details,
     )
 
@@ -335,14 +335,14 @@ def run_moe_paper_artifact_replay(config: MoePaperReplayConfig) -> MoePaperRepla
     option_execution = None
     option_portfolio = None
     option_summary: dict[str, Any] = {}
-    if bool(config.run_fmp_synthetic_options) and not rule_replay.trade_windows.empty:
+    if bool(config.run_fmp_synthetic_options) and not rule_replay.trade_list.empty:
         from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.synthetic_options import (
             FmpSyntheticOptionReplayConfig,
             run_fmp_synthetic_option_trade_replay,
         )
 
         option_execution = run_fmp_synthetic_option_trade_replay(
-            rule_replay.trade_windows,
+            rule_replay.trade_list,
             config=FmpSyntheticOptionReplayConfig(workers=max(1, int(config.option_workers))),
         )
         option_portfolio = replay_option_portfolio_from_selected_paths(
@@ -371,7 +371,7 @@ def run_moe_paper_artifact_replay(config: MoePaperReplayConfig) -> MoePaperRepla
         "top_k": int(config.top_k),
         "threshold": float(config.threshold),
         "scored_rows": int(len(scored)),
-        "trade_windows": int(len(rule_replay.trade_windows)),
+        "trade_list": int(len(rule_replay.trade_list)),
         "rule_meta": rule_replay.meta,
         "performance": summarize_returns(rule_replay.returns, float(config.initial_balance)) if len(rule_replay.returns) else {},
         "fmp_synthetic_options": option_summary,
@@ -402,7 +402,7 @@ def write_moe_paper_replay_outputs(result: MoePaperReplayResult, output_dir: str
         "cash": out_dir / "cash.csv",
         "action_tape": out_dir / "action_tape.parquet",
         "positions": out_dir / "positions.parquet",
-        "trade_windows": out_dir / "trade_windows.parquet",
+        "trade_list": out_dir / "trade_list.parquet",
         "equity_executions": out_dir / "equity_executions.csv",
         "summary": out_dir / "summary.json",
     }
@@ -413,7 +413,7 @@ def write_moe_paper_replay_outputs(result: MoePaperReplayResult, output_dir: str
     result.rule_replay.cash.rename("cash").to_csv(paths["cash"])
     result.rule_replay.action_tape.to_parquet(paths["action_tape"], index=False)
     result.rule_replay.positions.to_parquet(paths["positions"])
-    result.rule_replay.trade_windows.to_parquet(paths["trade_windows"], index=False)
+    result.rule_replay.trade_list.to_parquet(paths["trade_list"], index=False)
     result.rule_replay.executions.to_csv(paths["equity_executions"], index=False)
     (paths["summary"]).write_text(json.dumps(result.summary, indent=2, default=str), encoding="utf-8")
     if result.option_execution is not None:
@@ -433,7 +433,7 @@ def write_moe_paper_replay_outputs(result: MoePaperReplayResult, output_dir: str
             feature_panel=result.feature_panel if not result.feature_panel.empty else None,
             scored_panel=result.scored_panel,
             action_tape=result.rule_replay.action_tape,
-            trade_windows=result.rule_replay.trade_windows,
+            trade_list=result.rule_replay.trade_list,
             summary=result.summary,
             strategy_name="optimal_trader.moe_paper_trading",
         ),

@@ -7,7 +7,7 @@ from typing import Mapping
 import numpy as np
 import pandas as pd
 
-from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
+from quant_orchestrator.artifact_contracts import (
     combine_trade_lists,
     normalize_trade_list,
     read_trade_list_artifact,

@@ -7,7 +7,6 @@ from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
     normalize_equity_curve,
     normalize_trade_log,
     normalize_trade_list,
-    normalize_trade_windows,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.shared import combine_equity_curves
 
@@ -139,23 +138,6 @@ def test_normalize_trade_list_keeps_classifier_top_k_guard() -> None:
         assert "top_k" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected top_k validation error")
-
-
-def test_normalize_trade_windows_legacy_alias_still_works() -> None:
-    trades = pd.DataFrame(
-        [
-            {
-                "symbol": "AAPL",
-                "side": "long",
-                "entry_date": "2026-01-02",
-                "exit_date": "2026-01-09",
-            }
-        ]
-    )
-
-    trade_list = normalize_trade_windows(trades)
-
-    assert trade_list.loc[0, "trade_id"] == "AAPL|2026-01-02|long"
 
 
 def test_combine_equity_curves_handles_mixed_timezone_indexes() -> None:

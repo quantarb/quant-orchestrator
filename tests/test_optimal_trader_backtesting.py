@@ -130,7 +130,7 @@ def test_trading_app_rule_replay_builds_shifted_action_tape_and_trade_windows() 
             "reason": "exit_classifier_or_invalid",
         },
     ]
-    assert replay.trade_windows[["symbol", "entry_date", "exit_date", "ret_dec", "exit_reason"]].to_dict("records") == [
+    assert replay.trade_list[["symbol", "entry_date", "exit_date", "ret_dec", "exit_reason"]].to_dict("records") == [
         {
             "symbol": "AAA",
             "entry_date": pd.Timestamp("2024-01-02"),
@@ -140,7 +140,7 @@ def test_trading_app_rule_replay_builds_shifted_action_tape_and_trade_windows() 
         }
     ]
     assert replay.equity.loc[pd.Timestamp("2024-01-03")] == pytest.approx(100_000.0 * (120.0 / 110.0))
-    assert replay.trade_windows["equity_entry_notional"].iloc[0] == pytest.approx(100_000.0)
+    assert replay.trade_list["equity_entry_notional"].iloc[0] == pytest.approx(100_000.0)
 
 
 def test_moe_ranked_scores_select_top_k_by_prob_buy() -> None:
@@ -224,8 +224,8 @@ def test_moe_paper_rule_replay_uses_shifted_top_k_scores() -> None:
             "reason": "entry_moe_top_k",
         },
     ]
-    assert replay.trade_windows.loc[0, "symbol"] == "AAA"
-    assert replay.trade_windows.loc[0, "ret_dec"] == pytest.approx((120.0 / 110.0) - 1.0)
+    assert replay.trade_list.loc[0, "symbol"] == "AAA"
+    assert replay.trade_list.loc[0, "ret_dec"] == pytest.approx((120.0 / 110.0) - 1.0)
 
 
 def test_action_tape_to_trade_windows_ignores_unfunded_buys() -> None:

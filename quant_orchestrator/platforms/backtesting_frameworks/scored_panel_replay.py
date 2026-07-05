@@ -16,7 +16,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.artifact
     discrete_backtest_with_executions,
     summarize_returns,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
+from quant_orchestrator.artifact_contracts import (
     StrategyArtifactBundle,
     write_strategy_artifacts,
 )
@@ -65,7 +65,7 @@ def replay_scored_panel_top_k(
         "top_k": int(cfg.top_k),
         "scored_rows": int(len(panel)),
         "scored_symbols": int(panel.index.get_level_values("symbol").nunique()) if not panel.empty else 0,
-        "trade_windows": int(len(replay.trade_windows)),
+        "trade_list": int(len(replay.trade_list)),
         "rule_meta": replay.meta,
         "performance": summarize_returns(replay.returns, float(cfg.initial_balance)) if len(replay.returns) else {},
         "metadata": dict(cfg.metadata),
@@ -96,7 +96,7 @@ def write_scored_panel_top_k_outputs(
         StrategyArtifactBundle(
             scored_panel=result.scored_panel,
             action_tape=result.rule_replay.action_tape,
-            trade_windows=result.rule_replay.trade_windows,
+            trade_list=result.rule_replay.trade_list,
             summary=result.summary,
             strategy_name=str(result.summary.get("strategy_name") or "scored_panel_top_k"),
         ),
@@ -199,7 +199,7 @@ def _replay_top_k(
         action_tape=action_tape,
         executions=executions,
         positions=positions,
-        trade_windows=action_tape_to_trade_windows(action_tape, prices=close),
+        trade_list=action_tape_to_trade_windows(action_tape, prices=close),
         meta=details,
     )
 

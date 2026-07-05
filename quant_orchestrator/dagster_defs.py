@@ -12,13 +12,13 @@ from quant_orchestrator.research_tools import (
     OptopsyExecutionConfig,
     OptionMvBasketConfig,
     OptionRetrievalConfig,
-    OptionWindowBuildConfig,
+    OptionTradeListBuildConfig,
     OracleOptionExperimentConfig,
     SharedSplitConfig,
     build_option_window_dataset,
     estimate_option_runtime_scaling,
     run_ml_trading_experiment,
-    run_trade_window_option_experiment,
+    run_trade_list_option_experiment,
 )
 
 
@@ -51,10 +51,10 @@ ML_TRADING_EXPERIMENT_CONFIG_SCHEMA = {
     "mlflow_experiment": str,
 }
 
-OPTION_WINDOW_EXPERIMENT_CONFIG_SCHEMA = {
+OPTION_TRADE_LIST_EXPERIMENT_CONFIG_SCHEMA = {
     "experiment_name": str,
     "score_artifact_dir": str,
-    "window_group": str,
+    "trade_list_group": str,
     "symbols": str,
     "price_start": str,
     "price_end": str,
@@ -69,7 +69,7 @@ OPTION_WINDOW_EXPERIMENT_CONFIG_SCHEMA = {
     "max_candidates_per_trade": int,
     "log_mlflow": bool,
     "artifact_dir": str,
-    "target_trade_windows": int,
+    "target_trade_list_rows": int,
     "target_option_rows": int,
     "max_runtime_seconds": float,
 }
@@ -162,7 +162,7 @@ def ml_trading_experiment_job() -> None:
     run_ml_trading_experiment_scheduled()
 
 
-@op(config_schema=OPTION_WINDOW_EXPERIMENT_CONFIG_SCHEMA)
+@op(config_schema=OPTION_TRADE_LIST_EXPERIMENT_CONFIG_SCHEMA)
 def run_option_window_experiment_scheduled(context) -> str:
     config = context.op_config
     logger = get_dagster_logger()
@@ -173,7 +173,7 @@ def run_option_window_experiment_scheduled(context) -> str:
     window_dataset = build_option_window_dataset(
         scores,
         backtest_summary=backtest_summary,
-        config=OptionWindowBuildConfig(
+        config=OptionTradeListBuildConfig(
             variant=config["variant"],
             top_k=int(config["top_k"]),
             entry_threshold=float(config["entry_threshold"]),
@@ -183,9 +183,9 @@ def run_option_window_experiment_scheduled(context) -> str:
             min_signal_events=int(config["min_signal_events"]),
         ),
     )
-    window_group = config["window_group"]
-    if window_group not in window_dataset.windows_by_group:
-        raise ValueError(f"unknown window_group {window_group!r}; available={sorted(window_dataset.windows_by_group)}")
+    trade_list_group = config["trade_list_group"]
+    if trade_list_group not in window_dataset.trade_lists_by_group:
+        raise ValueError(f"unknown trade_list_group {trade_list_group!r}; available={sorted(window_dataset.trade_lists_by_group)}")
     artifact_dir = _optional(config["artifact_dir"])
     experiment_config = OracleOptionExperimentConfig(
         experiment_name=config["experiment_name"],
@@ -199,19 +199,19 @@ def run_option_window_experiment_scheduled(context) -> str:
         artifact_dir=artifact_dir,
         log_mlflow=bool(config["log_mlflow"]),
     )
-    result = run_trade_window_option_experiment(experiment_config, window_dataset.windows_by_group[window_group])
+    result = run_trade_list_option_experiment(experiment_config, window_dataset.trade_lists_by_group[trade_list_group])
     runtime_estimate = estimate_option_runtime_scaling(
         baseline_elapsed_seconds=result.elapsed_seconds,
-        baseline_trade_windows=len(result.oracle_trades),
+        baseline_trade_list_rows=len(result.oracle_trades),
         baseline_option_rows=len(result.option_panel),
-        target_trade_windows=int(config["target_trade_windows"]),
+        target_trade_list_rows=int(config["target_trade_list_rows"]),
         target_option_rows=int(config["target_option_rows"]),
         max_seconds=float(config["max_runtime_seconds"]),
     )
     logger.info(
         "Completed option window experiment %s group=%s windows=%s option_rows=%s elapsed=%.2fs chain_reads=%s cache_hits=%s target_estimate=%.2fs runnable=%s",
         result.config.experiment_name,
-        window_group,
+        trade_list_group,
         len(result.oracle_trades),
         len(result.option_panel),
         result.elapsed_seconds,
