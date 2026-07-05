@@ -66,6 +66,7 @@ OPTION_FEATURES = (
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--option-panel", default=str(DEFAULT_OPTION_PANEL))
+    parser.add_argument("--symbols", default="", help="Optional comma-separated symbol filter, e.g. NVDA,GOOG")
     parser.add_argument(
         "--feature-family",
         action="append",
@@ -88,7 +89,12 @@ def main() -> None:
     started = perf_counter()
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    option_panel = _load_option_panel(Path(args.option_panel), max_trades=int(args.max_trades))
+    requested_symbols = _parse_symbols(args.symbols)
+    option_panel = _load_option_panel(
+        Path(args.option_panel),
+        max_trades=int(args.max_trades),
+        symbols=requested_symbols,
+    )
     symbols = tuple(sorted(option_panel["symbol"].dropna().astype(str).str.upper().unique()))
     feature_panel, metadata = _build_feature_panel(
         symbols,
@@ -159,6 +165,7 @@ def main() -> None:
             scored_eval["pred_option_only_rank"] = baseline["eval_scored"]["pred_option_only_rank"].to_numpy()
         summary = {
             "option_panel": str(Path(args.option_panel).expanduser().resolve()),
+            "requested_symbols": list(requested_symbols),
             "feature_family": f"{source}.{family}",
             "symbols": int(len(symbols)),
             "option_rows": int(len(option_panel)),
@@ -197,6 +204,7 @@ def main() -> None:
         (family_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     summary = {
         "option_panel": str(Path(args.option_panel).expanduser().resolve()),
+        "requested_symbols": list(requested_symbols),
         "feature_families": [f"{source}.{family}" for source, family in requested_families],
         "symbols": int(len(symbols)),
         "option_rows": int(len(option_panel)),
@@ -217,7 +225,7 @@ def main() -> None:
     print(json.dumps(summary, indent=2, default=str))
 
 
-def _load_option_panel(path: Path, *, max_trades: int) -> pd.DataFrame:
+def _load_option_panel(path: Path, *, max_trades: int, symbols: tuple[str, ...] = ()) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing option candidate panel: {path}")
     frame = pd.read_parquet(path)
@@ -230,6 +238,11 @@ def _load_option_panel(path: Path, *, max_trades: int) -> pd.DataFrame:
     out["entry_date"] = pd.to_datetime(out["entry_date"], errors="coerce").dt.normalize()
     out["option_return"] = pd.to_numeric(out["option_return"], errors="coerce")
     out = out.dropna(subset=["trade_id", "symbol", "entry_date", "option_return"])
+    if symbols:
+        wanted = set(symbols)
+        out = out.loc[out["symbol"].isin(wanted)].copy()
+        if out.empty:
+            raise ValueError(f"option panel has no rows for requested symbols: {sorted(wanted)}")
     if "rank_y" not in out.columns:
         out["rank_y"] = out.groupby("trade_id")["option_return"].rank(method="average", pct=True, ascending=True)
     else:
@@ -250,6 +263,16 @@ def _load_option_panel(path: Path, *, max_trades: int) -> pd.DataFrame:
         trade_ids = out[["trade_id", "entry_date"]].drop_duplicates().sort_values(["entry_date", "trade_id"]).head(max_trades)["trade_id"]
         out = out.loc[out["trade_id"].isin(set(trade_ids))].copy()
     return out.reset_index(drop=True)
+
+
+def _parse_symbols(value: str) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            symbol.strip().upper()
+            for symbol in str(value or "").split(",")
+            if symbol.strip()
+        )
+    )
 
 
 def _parse_feature_family(value: str) -> tuple[str, str]:
