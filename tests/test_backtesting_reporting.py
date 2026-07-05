@@ -6,6 +6,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
     build_common_summary,
     normalize_equity_curve,
     normalize_trade_log,
+    normalize_trade_list,
     normalize_trade_windows,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.shared import combine_equity_curves
@@ -91,7 +92,7 @@ def test_normalize_trade_log_keeps_common_columns_and_notional() -> None:
     assert normalized.loc[0, "notional"] == 1500.0
 
 
-def test_normalize_trade_windows_uses_closed_trade_fields() -> None:
+def test_normalize_trade_list_uses_closed_trade_fields() -> None:
     trades = pd.DataFrame(
         [
             {
@@ -107,19 +108,19 @@ def test_normalize_trade_windows_uses_closed_trade_fields() -> None:
         ]
     )
 
-    windows = normalize_trade_windows(trades)
+    trade_list = normalize_trade_list(trades)
 
-    assert windows.loc[0, "trade_id"] == "AAPL|2026-01-02|long"
-    assert windows.loc[0, "symbol"] == "AAPL"
-    assert windows.loc[0, "side"] == "long"
-    assert windows.loc[0, "entry_date"] == pd.Timestamp("2026-01-02")
-    assert windows.loc[0, "exit_date"] == pd.Timestamp("2026-01-09")
-    assert windows.loc[0, "entry_price"] == 100.0
-    assert windows.loc[0, "exit_price"] == 110.0
-    assert windows.loc[0, "ret_dec"] == 0.10
+    assert trade_list.loc[0, "trade_id"] == "AAPL|2026-01-02|long"
+    assert trade_list.loc[0, "symbol"] == "AAPL"
+    assert trade_list.loc[0, "side"] == "long"
+    assert trade_list.loc[0, "entry_date"] == pd.Timestamp("2026-01-02")
+    assert trade_list.loc[0, "exit_date"] == pd.Timestamp("2026-01-09")
+    assert trade_list.loc[0, "entry_price"] == 100.0
+    assert trade_list.loc[0, "exit_price"] == 110.0
+    assert trade_list.loc[0, "ret_dec"] == 0.10
 
 
-def test_normalize_trade_windows_keeps_classifier_top_k_guard() -> None:
+def test_normalize_trade_list_keeps_classifier_top_k_guard() -> None:
     trades = pd.DataFrame(
         [
             {
@@ -133,11 +134,28 @@ def test_normalize_trade_windows_keeps_classifier_top_k_guard() -> None:
     )
 
     try:
-        normalize_trade_windows(trades)
+        normalize_trade_list(trades)
     except KeyError as exc:
         assert "top_k" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected top_k validation error")
+
+
+def test_normalize_trade_windows_legacy_alias_still_works() -> None:
+    trades = pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "side": "long",
+                "entry_date": "2026-01-02",
+                "exit_date": "2026-01-09",
+            }
+        ]
+    )
+
+    trade_list = normalize_trade_windows(trades)
+
+    assert trade_list.loc[0, "trade_id"] == "AAPL|2026-01-02|long"
 
 
 def test_combine_equity_curves_handles_mixed_timezone_indexes() -> None:

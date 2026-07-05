@@ -12,7 +12,7 @@ They are examples, not required paths:
 - `ml_trading/ml_filtered_sma_trading.ipynb` trains a pre-2020 CUDA cuML optimal-side classifier, injects fixed 2020+ ML predictions into `backtesting.py`, runs yearly anchored WFO over SMA variants, portfolio-optimizes profitable variants, and runs Monte Carlo on out-of-sample trade contributions.
 - `ml_trading/optimal_trader_trading_app_contract_replay.ipynb` replays saved optimal_trader trading-app artifacts historically without importing live-trading code, then writes the standard strategy artifact contract.
 - `ml_trading/optimal_trader_moe_paper_contract_replay.ipynb` replays saved MoE paper-strategy artifacts or a historical MoE feature/scored panel and writes the same contract.
-- `ml_trading/classifier_1t_options_signal_backtest.ipynb`, `ml_trading/classifier_1t_feature_family_option_windows.ipynb`, and `ml_trading/traditional_ml_synthetic_options_backtest.ipynb` are contract producers. They convert scored panels into `action_tape` and `trade_windows`; downstream option replay should consume those artifacts instead of embedding option mechanics in the notebook.
+- `ml_trading/classifier_1t_options_signal_backtest.ipynb`, `ml_trading/classifier_1t_feature_family_option_windows.ipynb`, and `ml_trading/traditional_ml_synthetic_options_backtest.ipynb` are contract producers. They convert scored panels into `action_tape` and the canonical `trade_list`; downstream option replay should consume those artifacts instead of embedding option mechanics in the notebook.
 
 The notebooks should stay focused on orchestration patterns. They should not become the place where reusable platform code lives, and the notebook directory should contain notebook files only.
 
@@ -33,7 +33,7 @@ Current reusable code placement:
 - optimal_trader historical replay helpers live under `quant_orchestrator/platforms/backtesting_frameworks/optimal_trader/`; live trading and broker code should stay in optimal_trader, not here.
 - Strategy-specific SMA crossover examples live in notebook-facing helpers under `quant_orchestrator/backtests/` until they prove a more durable home.
 - Strategy-specific backtesting.py ML-score helpers live under `quant_orchestrator/backtests/`.
-- Synthetic and real-quote option research helpers still exist under `quant_orchestrator/research_tools/`, but new option-equivalent backtests should start from standard `trade_windows` artifacts. The legacy vectorized engine and option-return primitives now live under `quant_orchestrator/platforms/backtesting_frameworks/optimal_trader/`.
+- Synthetic and real-quote option research helpers still exist under `quant_orchestrator/research_tools/`, but new option-equivalent backtests should start from standard `trade_list` artifacts. The legacy vectorized engine and option-return primitives now live under `quant_orchestrator/platforms/backtesting_frameworks/optimal_trader/`.
 - FlairNLP helper functions used by the current multi-ML notebook live under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`.
 
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.

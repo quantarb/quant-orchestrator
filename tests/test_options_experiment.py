@@ -1283,8 +1283,10 @@ def test_standard_artifacts_round_trip_trade_windows_and_source_summary(tmp_path
     loaded = load_option_experiment_artifacts(tmp_path)
 
     assert paths["trade_windows"].exists()
+    assert paths["trade_list"].exists()
     assert paths["feature_coverage"].exists()
-    assert loaded.trade_windows.loc[0, "trade_id"] == "t1"
+    assert loaded.trade_list.loc[0, "trade_id"] == "t1"
+    assert loaded.trade_windows is loaded.trade_list
     assert loaded.source_family_summary.loc[0, "strategy_source"] == "fmp.a"
     assert loaded.feature_coverage.loc[0, "feature"] == "delta"
 

@@ -161,12 +161,12 @@ def normalize_trade_log(trades: pd.DataFrame | None) -> pd.DataFrame:
     return normalized.loc[:, TRADE_COLUMNS]
 
 
-def normalize_trade_windows(frame: pd.DataFrame | None, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
-    """Normalize closed equity trade windows for downstream execution transforms.
+def normalize_trade_list(frame: pd.DataFrame | None, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
+    """Normalize a closed equity trade list for downstream consumers.
 
     This is intentionally framework-agnostic. Framework-specific adapters should
     first produce a normalized report/trade log; option execution can then use
-    these windows without knowing whether they came from Zipline,
+    this trade list without knowing whether it came from Zipline,
     backtesting.py, Nautilus, or a vectorized shared-book run.
     """
 
@@ -199,7 +199,7 @@ def normalize_trade_windows(frame: pd.DataFrame | None, *, require_top_k_for_cla
     required = {"symbol", "side", "entry_date", "exit_date"}
     missing = required - set(out.columns)
     if missing:
-        raise KeyError(f"trade windows missing required columns: {sorted(missing)}")
+        raise KeyError(f"trade list missing required columns: {sorted(missing)}")
     out["symbol"] = out["symbol"].astype(str).str.upper()
     out["side"] = out["side"].astype(str).str.lower().replace(
         {
@@ -228,10 +228,10 @@ def normalize_trade_windows(frame: pd.DataFrame | None, *, require_top_k_for_cla
     classifier_cols = {"strategy_source", "source", "family"}
     if require_top_k_for_classifier and classifier_cols.intersection(out.columns):
         if "top_k" not in out.columns:
-            raise KeyError("classifier trade windows must include top_k for option allocation sizing")
+            raise KeyError("classifier trade list must include top_k for option allocation sizing")
         top_k = pd.to_numeric(out["top_k"], errors="coerce")
         if top_k.isna().any() or top_k.le(0).any():
-            raise ValueError("classifier trade windows must include positive top_k values for option allocation sizing")
+            raise ValueError("classifier trade list must include positive top_k values for option allocation sizing")
     if "trade_id" not in out.columns:
         out["trade_id"] = out.apply(
             lambda row: f"{row['symbol']}|{pd.Timestamp(row['entry_date']).date()}|{row['side']}",
@@ -240,11 +240,29 @@ def normalize_trade_windows(frame: pd.DataFrame | None, *, require_top_k_for_cla
     return out.sort_values(["entry_date", "symbol", "side"]).reset_index(drop=True)
 
 
-def report_trade_windows(report: NormalizedBacktestReport, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
-    """Extract canonical closed trade windows from a normalized backtest report."""
+def normalize_trade_windows(frame: pd.DataFrame | None, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
+    """Legacy alias for :func:`normalize_trade_list`."""
 
-    return normalize_trade_windows(
+    return normalize_trade_list(
+        frame,
+        require_top_k_for_classifier=require_top_k_for_classifier,
+    )
+
+
+def report_trade_list(report: NormalizedBacktestReport, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
+    """Extract the canonical closed trade list from a normalized backtest report."""
+
+    return normalize_trade_list(
         report.trade_log,
+        require_top_k_for_classifier=require_top_k_for_classifier,
+    )
+
+
+def report_trade_windows(report: NormalizedBacktestReport, *, require_top_k_for_classifier: bool = True) -> pd.DataFrame:
+    """Legacy alias for :func:`report_trade_list`."""
+
+    return report_trade_list(
+        report,
         require_top_k_for_classifier=require_top_k_for_classifier,
     )
 

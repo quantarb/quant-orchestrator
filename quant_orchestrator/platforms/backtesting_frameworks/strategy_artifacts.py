@@ -21,37 +21,77 @@ TRADE_LIST_ARTIFACT_NAME = "trade_list"
 LEGACY_TRADE_WINDOWS_ARTIFACT_NAME = "trade_windows"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class StrategyArtifactBundle:
     feature_panel: pd.DataFrame | None = None
     scored_panel: pd.DataFrame | None = None
     action_tape: pd.DataFrame | None = None
-    trade_windows: pd.DataFrame | None = None
+    trade_list: pd.DataFrame | None = None
     summary: Mapping[str, Any] = field(default_factory=dict)
     strategy_name: str = ""
     base_path: Path | None = None
     feature_panel_path: Path | None = None
     scored_panel_path: Path | None = None
     action_tape_path: Path | None = None
-    trade_windows_path: Path | None = None
+    trade_list_path: Path | None = None
     summary_path: Path | None = None
     manifest_path: Path | None = None
 
+    def __init__(
+        self,
+        *,
+        feature_panel: pd.DataFrame | None = None,
+        scored_panel: pd.DataFrame | None = None,
+        action_tape: pd.DataFrame | None = None,
+        trade_list: pd.DataFrame | None = None,
+        trade_windows: pd.DataFrame | None = None,
+        summary: Mapping[str, Any] | None = None,
+        strategy_name: str = "",
+        base_path: Path | None = None,
+        feature_panel_path: Path | None = None,
+        scored_panel_path: Path | None = None,
+        action_tape_path: Path | None = None,
+        trade_list_path: Path | None = None,
+        trade_windows_path: Path | None = None,
+        summary_path: Path | None = None,
+        manifest_path: Path | None = None,
+    ) -> None:
+        if trade_list is not None and trade_windows is not None:
+            raise ValueError("Pass either trade_list or legacy trade_windows, not both")
+        if trade_list_path is not None and trade_windows_path is not None:
+            raise ValueError("Pass either trade_list_path or legacy trade_windows_path, not both")
+        object.__setattr__(self, "feature_panel", feature_panel)
+        object.__setattr__(self, "scored_panel", scored_panel)
+        object.__setattr__(self, "action_tape", action_tape)
+        object.__setattr__(self, "trade_list", trade_list if trade_list is not None else trade_windows)
+        object.__setattr__(self, "summary", dict(summary or {}))
+        object.__setattr__(self, "strategy_name", str(strategy_name or ""))
+        object.__setattr__(self, "base_path", base_path)
+        object.__setattr__(self, "feature_panel_path", feature_panel_path)
+        object.__setattr__(self, "scored_panel_path", scored_panel_path)
+        object.__setattr__(self, "action_tape_path", action_tape_path)
+        object.__setattr__(
+            self,
+            "trade_list_path",
+            trade_list_path if trade_list_path is not None else trade_windows_path,
+        )
+        object.__setattr__(self, "summary_path", summary_path)
+        object.__setattr__(self, "manifest_path", manifest_path)
+
     @property
-    def trade_list(self) -> pd.DataFrame | None:
-        """Canonical trade-list artifact.
+    def trade_windows(self) -> pd.DataFrame | None:
+        """Legacy alias for the canonical trade-list artifact.
 
         The on-disk file is still named ``trade_windows.parquet`` for backward
-        compatibility with the existing notebooks. New downstream code should
-        treat the same table as a trade list: the reusable list of closed equity
-        trades produced by any strategy, framework, notebook, or external model.
+        compatibility with existing notebooks. New downstream code should use
+        ``trade_list``.
         """
 
-        return self.trade_windows
+        return self.trade_list
 
     @property
-    def trade_list_path(self) -> Path | None:
-        return self.trade_windows_path
+    def trade_windows_path(self) -> Path | None:
+        return self.trade_list_path
 
 
 def write_strategy_artifacts(
@@ -69,7 +109,7 @@ def write_strategy_artifacts(
         ("feature_panel", bundle.feature_panel, FEATURE_PANEL_REQUIRED_COLUMNS),
         ("scored_panel", bundle.scored_panel, SCORED_PANEL_REQUIRED_COLUMNS),
         ("action_tape", bundle.action_tape, ACTION_TAPE_REQUIRED_COLUMNS),
-        (LEGACY_TRADE_WINDOWS_ARTIFACT_NAME, bundle.trade_windows, TRADE_LIST_REQUIRED_COLUMNS),
+        (LEGACY_TRADE_WINDOWS_ARTIFACT_NAME, bundle.trade_list, TRADE_LIST_REQUIRED_COLUMNS),
     ):
         if frame is None:
             continue
@@ -152,7 +192,7 @@ def read_strategy_artifacts(path: str | Path) -> StrategyArtifactBundle:
         feature_panel=read_frame("feature_panel", FEATURE_PANEL_REQUIRED_COLUMNS),
         scored_panel=read_frame("scored_panel", SCORED_PANEL_REQUIRED_COLUMNS),
         action_tape=read_frame("action_tape", ACTION_TAPE_REQUIRED_COLUMNS),
-        trade_windows=read_frame(
+        trade_list=read_frame(
             LEGACY_TRADE_WINDOWS_ARTIFACT_NAME,
             TRADE_LIST_REQUIRED_COLUMNS,
             aliases=(TRADE_LIST_ARTIFACT_NAME,),
@@ -163,7 +203,7 @@ def read_strategy_artifacts(path: str | Path) -> StrategyArtifactBundle:
         feature_panel_path=resolved_paths.get("feature_panel"),
         scored_panel_path=resolved_paths.get("scored_panel"),
         action_tape_path=resolved_paths.get("action_tape"),
-        trade_windows_path=resolved_paths.get("trade_windows"),
+        trade_list_path=resolved_paths.get("trade_windows") or resolved_paths.get("trade_list"),
         summary_path=summary_path,
         manifest_path=manifest_path,
     )
@@ -198,7 +238,7 @@ def validate_strategy_artifact_frame(
     if "action" in out.columns:
         out["action"] = out["action"].astype(str).str.strip().str.lower()
     if artifact_name in {LEGACY_TRADE_WINDOWS_ARTIFACT_NAME, TRADE_LIST_ARTIFACT_NAME}:
-        out = _validate_trade_windows(out)
+        out = _validate_trade_list(out)
     sort_cols = [column for column in ("date", "entry_date", "symbol", "action") if column in out.columns]
     if sort_cols:
         out = out.sort_values(sort_cols, kind="stable")
@@ -239,7 +279,7 @@ def write_trade_list_artifact(
 
     return write_strategy_artifacts(
         StrategyArtifactBundle(
-            trade_windows=trades,
+            trade_list=trades,
             summary=dict(summary or {}),
             strategy_name=str(strategy_name or ""),
         ),
@@ -292,34 +332,38 @@ def combine_trade_lists(
     return normalize_trade_list(pd.concat(frames, ignore_index=True, sort=False))
 
 
-def _validate_trade_windows(frame: pd.DataFrame) -> pd.DataFrame:
+def _validate_trade_list(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
     if out.empty:
         return out
     null_date = out["entry_date"].isna() | out["exit_date"].isna()
     if bool(null_date.any()):
-        raise ValueError("trade_windows contains null or invalid entry_date/exit_date")
+        raise ValueError("trade_list contains null or invalid entry_date/exit_date")
     reversed_dates = out["exit_date"].lt(out["entry_date"])
     if bool(reversed_dates.any()):
-        raise ValueError("trade_windows contains exit_date before entry_date")
+        raise ValueError("trade_list contains exit_date before entry_date")
     out["side"] = out["side"].astype(str).str.strip().str.lower()
     bad_side = out["side"].notna() & ~out["side"].isin(TRADE_WINDOW_SIDES)
     if bool(bad_side.any()):
         invalid = sorted(out.loc[bad_side, "side"].dropna().unique().tolist())
-        raise ValueError(f"trade_windows contains invalid side values: {invalid}")
+        raise ValueError(f"trade_list contains invalid side values: {invalid}")
     if "trade_id" in out.columns:
         out["trade_id"] = out["trade_id"].astype(str).str.strip()
         if bool(out["trade_id"].eq("").any()):
-            raise ValueError("trade_windows contains blank trade_id values")
+            raise ValueError("trade_list contains blank trade_id values")
     for column in TRADE_WINDOW_NON_NEGATIVE_COLUMNS:
         if column not in out.columns:
             continue
         numeric = pd.to_numeric(out[column], errors="coerce")
         invalid = numeric.notna() & numeric.lt(0.0)
         if bool(invalid.any()):
-            raise ValueError(f"trade_windows contains negative {column} values")
+            raise ValueError(f"trade_list contains negative {column} values")
         out[column] = numeric
     return out
+
+
+def _validate_trade_windows(frame: pd.DataFrame) -> pd.DataFrame:
+    return _validate_trade_list(frame)
 
 
 def _frame_with_date_symbol_columns(frame: pd.DataFrame) -> pd.DataFrame:

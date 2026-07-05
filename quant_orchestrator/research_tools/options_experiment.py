@@ -13,8 +13,8 @@ import pandas as pd
 
 from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
     NormalizedBacktestReport,
-    normalize_trade_windows as normalize_report_trade_windows,
-    report_trade_windows,
+    normalize_trade_list as normalize_report_trade_list,
+    report_trade_list,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.data_adapter import (
     settle_optimal_trader_thetadata_option_exit,
@@ -167,7 +167,7 @@ class OptionWindowDataset:
 class OptionExperimentArtifacts:
     base_dir: Path
     coverage: pd.DataFrame
-    trade_windows: pd.DataFrame
+    trade_list: pd.DataFrame
     option_panel: pd.DataFrame
     train_panel: pd.DataFrame
     eval_panel: pd.DataFrame
@@ -181,6 +181,12 @@ class OptionExperimentArtifacts:
     metrics: dict[str, Any]
     config: dict[str, Any]
     analysis_markdown: str
+
+    @property
+    def trade_windows(self) -> pd.DataFrame:
+        """Legacy alias for the canonical trade-list artifact."""
+
+        return self.trade_list
 
 
 @dataclass(frozen=True)
@@ -254,11 +260,11 @@ def run_oracle_option_experiment(config: OracleOptionExperimentConfig) -> Oracle
     )
 
 
-def run_trade_window_option_experiment(
+def run_trade_list_option_experiment(
     config: OracleOptionExperimentConfig,
-    trade_windows: pd.DataFrame,
+    trade_list: pd.DataFrame,
 ) -> OracleOptionExperimentResult:
-    """Run the option selector from externally generated equity trade windows."""
+    """Run the option selector from an externally generated equity trade list."""
 
     started = perf_counter()
     _prepare_quant_warehouse_import(config.quant_warehouse_root)
@@ -272,9 +278,9 @@ def run_trade_window_option_experiment(
         option_ranker_feature_columns,
         build_option_mean_variance_labels,
     ) = _warehouse_imports()
-    normalized_trades = _normalize_trade_windows(trade_windows)
+    normalized_trades = _normalize_trade_list(trade_list)
     if normalized_trades.empty:
-        raise ValueError("trade_windows did not contain any valid option-tradable entry/exit rows")
+        raise ValueError("trade_list did not contain any valid option-tradable entry/exit rows")
     symbols = tuple(sorted(set(normalized_trades["symbol"].astype(str).str.upper()).intersection(config.symbols or ())))
     if not symbols:
         symbols = tuple(sorted(normalized_trades["symbol"].astype(str).str.upper().unique().tolist()))
@@ -311,22 +317,31 @@ def run_trade_window_option_experiment(
     )
 
 
+def run_trade_window_option_experiment(
+    config: OracleOptionExperimentConfig,
+    trade_windows: pd.DataFrame,
+) -> OracleOptionExperimentResult:
+    """Legacy alias for :func:`run_trade_list_option_experiment`."""
+
+    return run_trade_list_option_experiment(config, trade_windows)
+
+
 def run_backtest_report_option_experiment(
     config: OracleOptionExperimentConfig,
     report: NormalizedBacktestReport,
 ) -> OracleOptionExperimentResult:
     """Run option execution from any framework's normalized backtest report."""
 
-    return run_trade_window_option_experiment(config, report_trade_windows(report))
+    return run_trade_list_option_experiment(config, report_trade_list(report))
 
 
-def run_trade_window_option_execution(
+def run_trade_list_option_execution(
     config: OracleOptionExperimentConfig,
-    trade_windows: pd.DataFrame,
+    trade_list: pd.DataFrame,
     *,
     selector_name: str = "rule_atm_90d",
 ) -> OracleOptionExperimentResult:
-    """Execute option equivalents from equity trade windows without training candidate labels.
+    """Execute option equivalents from an equity trade list without training candidate labels.
 
     This is the fast path for production-style option backtests. It loads the
     full option chain on each equity entry date, selects the contract on entry
@@ -346,9 +361,9 @@ def run_trade_window_option_execution(
         _option_ranker_feature_columns,
         _build_option_mean_variance_labels,
     ) = _warehouse_imports()
-    normalized_trades = _normalize_trade_windows(trade_windows)
+    normalized_trades = _normalize_trade_list(trade_list)
     if normalized_trades.empty:
-        raise ValueError("trade_windows did not contain any valid option-tradable entry/exit rows")
+        raise ValueError("trade_list did not contain any valid option-tradable entry/exit rows")
     symbols = tuple(sorted(set(normalized_trades["symbol"].astype(str).str.upper()).intersection(config.symbols or ())))
     if not symbols:
         symbols = tuple(sorted(normalized_trades["symbol"].astype(str).str.upper().unique().tolist()))
@@ -414,7 +429,7 @@ def run_trade_window_option_execution(
     metrics["elapsed_seconds"] = float(elapsed_seconds)
     analysis_markdown = _build_execution_analysis(
         config,
-        trade_windows=normalized_trades,
+        trade_list=normalized_trades,
         selected_option_trades=selected_option_trades,
         selector_summary=selector_summary,
         optopsy_summary=optopsy_summary,
@@ -469,6 +484,17 @@ def run_trade_window_option_execution(
     )
 
 
+def run_trade_window_option_execution(
+    config: OracleOptionExperimentConfig,
+    trade_windows: pd.DataFrame,
+    *,
+    selector_name: str = "rule_atm_90d",
+) -> OracleOptionExperimentResult:
+    """Legacy alias for :func:`run_trade_list_option_execution`."""
+
+    return run_trade_list_option_execution(config, trade_windows, selector_name=selector_name)
+
+
 def run_backtest_report_option_execution(
     config: OracleOptionExperimentConfig,
     report: NormalizedBacktestReport,
@@ -477,7 +503,7 @@ def run_backtest_report_option_execution(
 ) -> OracleOptionExperimentResult:
     """Fast option execution from any framework's normalized backtest report."""
 
-    return run_trade_window_option_execution(config, report_trade_windows(report), selector_name=selector_name)
+    return run_trade_list_option_execution(config, report_trade_list(report), selector_name=selector_name)
 
 
 def build_classifier_signal_trade_windows(
@@ -842,7 +868,7 @@ def _run_option_experiment_from_trades(
     option_ranker_feature_columns,
     build_option_mean_variance_labels,
 ) -> OracleOptionExperimentResult:
-    oracle_trades = _normalize_trade_windows(trades)
+    oracle_trades = _normalize_trade_list(trades)
     retriever = _OptionRetriever(
         config.retrieval,
         execution=config.execution,
@@ -1948,6 +1974,7 @@ def write_oracle_option_artifacts(
         "config": base / "config.json",
         "analysis": base / "analysis.md",
     }
+    paths["trade_list"] = paths["trade_windows"]
     coverage.to_parquet(paths["coverage"], index=False)
     oracle_trades.to_parquet(paths["oracle_trades"], index=False)
     oracle_trades.to_parquet(paths["trade_windows"], index=False)
@@ -1988,9 +2015,9 @@ def load_option_experiment_artifacts(base_dir: str | Path) -> OptionExperimentAr
     base = Path(base_dir)
     metrics = json.loads((base / "metrics.json").read_text(encoding="utf-8")) if (base / "metrics.json").exists() else {}
     config = json.loads((base / "config.json").read_text(encoding="utf-8")) if (base / "config.json").exists() else {}
-    trade_windows_path = base / "trade_windows.parquet"
-    if not trade_windows_path.exists():
-        trade_windows_path = base / "oracle_trades.parquet"
+    trade_list_path = base / "trade_windows.parquet"
+    if not trade_list_path.exists():
+        trade_list_path = base / "oracle_trades.parquet"
     source_family_path = base / "source_family_summary.csv"
     feature_coverage_path = base / "feature_coverage.csv"
     selected_trades_path = base / "selected_option_trades.parquet"
@@ -1998,7 +2025,7 @@ def load_option_experiment_artifacts(base_dir: str | Path) -> OptionExperimentAr
     return OptionExperimentArtifacts(
         base_dir=base,
         coverage=pd.read_parquet(base / "coverage.parquet"),
-        trade_windows=pd.read_parquet(trade_windows_path),
+        trade_list=pd.read_parquet(trade_list_path),
         option_panel=pd.read_parquet(base / "option_candidate_panel.parquet"),
         train_panel=pd.read_parquet(base / "train_panel.parquet"),
         eval_panel=pd.read_parquet(base / "eval_panel.parquet"),
@@ -3208,11 +3235,15 @@ def _split_option_panel(option_panel: pd.DataFrame, split: SharedSplitConfig) ->
 
 
 def _normalize_oracle_trades(frame: pd.DataFrame) -> pd.DataFrame:
-    return _normalize_trade_windows(frame)
+    return _normalize_trade_list(frame)
+
+
+def _normalize_trade_list(frame: pd.DataFrame) -> pd.DataFrame:
+    return normalize_report_trade_list(frame)
 
 
 def _normalize_trade_windows(frame: pd.DataFrame) -> pd.DataFrame:
-    return normalize_report_trade_windows(frame)
+    return _normalize_trade_list(frame)
 
 
 def _load_price_frames(
@@ -3260,7 +3291,7 @@ def _build_analysis(
     lines = [
         "## Written Analysis",
         "",
-        f"- Equity trade windows generated: {len(oracle_trades):,}.",
+        f"- Equity trade-list rows generated: {len(oracle_trades):,}.",
         f"- Shared split: in-sample <= {config.split.insample_end_ts.date()}, out-of-sample >= {config.split.oos_start_ts.date()}.",
         f"- Option retrieval produced {len(option_panel):,} contract rows across {option_panel['trade_id'].nunique() if not option_panel.empty else 0:,} trade windows.",
         f"- Train rows: {len(train_panel):,}; eval rows: {len(eval_panel):,}.",
@@ -3362,7 +3393,7 @@ def _build_analysis(
 def _build_execution_analysis(
     config: OracleOptionExperimentConfig,
     *,
-    trade_windows: pd.DataFrame,
+    trade_list: pd.DataFrame,
     selected_option_trades: pd.DataFrame,
     selector_summary: pd.DataFrame,
     optopsy_summary: pd.DataFrame,
@@ -3372,7 +3403,7 @@ def _build_execution_analysis(
     lines = [
         "## Written Analysis",
         "",
-        f"- Equity trade windows supplied: {len(trade_windows):,}.",
+        f"- Equity trade-list rows supplied: {len(trade_list):,}.",
         f"- Fast option execution selected/priced {len(selected_option_trades):,} option trades.",
         "- Selection mode: entry-date chain only; buy calls for long equity trades and buy puts for short equity trades.",
         "- Exit mode: selected contract path is loaded forward until the equity exit date or option expiration settlement.",

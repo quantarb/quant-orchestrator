@@ -40,6 +40,8 @@ from quant_orchestrator.research_tools.options_experiment import (
     run_backtest_report_option_execution,
     run_backtest_report_option_experiment,
     run_oracle_option_experiment,
+    run_trade_list_option_execution,
+    run_trade_list_option_experiment,
     run_trade_window_option_execution,
     run_trade_window_option_experiment,
 )
@@ -96,6 +98,8 @@ __all__ = [
     "run_backtest_report_option_execution",
     "run_backtest_report_option_experiment",
     "run_oracle_option_experiment",
+    "run_trade_list_option_execution",
+    "run_trade_list_option_experiment",
     "run_synthetic_options_backtest",
     "run_synthetic_options_backtest_experiment",
     "run_trade_window_option_execution",

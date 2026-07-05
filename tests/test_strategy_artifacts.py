@@ -44,7 +44,7 @@ def test_strategy_artifact_bundle_round_trips_core_contract(tmp_path) -> None:
             "price": [101.0],
         }
     )
-    trade_windows = pd.DataFrame(
+    trade_list = pd.DataFrame(
         {
             "trade_id": ["t1"],
             "symbol": ["aaa"],
@@ -61,7 +61,7 @@ def test_strategy_artifact_bundle_round_trips_core_contract(tmp_path) -> None:
             feature_panel=feature_panel,
             scored_panel=scored_panel,
             action_tape=action_tape,
-            trade_windows=trade_windows,
+            trade_list=trade_list,
             summary={"total_return_pct": 1.0},
             strategy_name="test_strategy",
         ),
@@ -83,8 +83,33 @@ def test_strategy_artifact_bundle_round_trips_core_contract(tmp_path) -> None:
     assert loaded.trade_list_path == tmp_path / "trade_windows.parquet"
     assert loaded.scored_panel["symbol"].tolist() == ["AAA"]
     assert loaded.action_tape["action"].tolist() == ["buy"]
-    assert loaded.trade_windows["entry_date"].tolist() == [pd.Timestamp("2024-01-02")]
+    assert loaded.trade_list["entry_date"].tolist() == [pd.Timestamp("2024-01-02")]
     assert loaded.trade_list is loaded.trade_windows
+
+
+def test_strategy_artifact_bundle_accepts_legacy_trade_windows_name(tmp_path) -> None:
+    legacy_trades = pd.DataFrame(
+        {
+            "trade_id": ["t1"],
+            "symbol": ["aaa"],
+            "side": ["long"],
+            "entry_date": [pd.Timestamp("2024-01-02")],
+            "exit_date": [pd.Timestamp("2024-01-03")],
+        }
+    )
+
+    write_strategy_artifacts(
+        StrategyArtifactBundle(
+            trade_windows=legacy_trades,
+            strategy_name="legacy_strategy",
+        ),
+        tmp_path,
+    )
+    loaded = read_strategy_artifacts(tmp_path)
+
+    assert loaded.trade_list is loaded.trade_windows
+    assert loaded.trade_list_path == loaded.trade_windows_path
+    assert loaded.trade_list.loc[0, "symbol"] == "AAA"
 
 
 def test_strategy_artifact_validation_rejects_missing_required_columns() -> None:
