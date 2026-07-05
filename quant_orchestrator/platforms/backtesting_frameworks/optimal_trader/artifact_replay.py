@@ -37,6 +37,7 @@ class TradingAppRuleReplay:
     returns: pd.Series
     cash: pd.Series
     action_tape: pd.DataFrame
+    executions: pd.DataFrame
     positions: pd.DataFrame
     trade_windows: pd.DataFrame
     meta: dict[str, Any]
@@ -49,6 +50,18 @@ class OptimalTraderArtifactReplayResult:
     rule_replay: TradingAppRuleReplay
     summary: dict[str, Any]
     option_execution: Any | None = None
+    option_portfolio: Any | None = None
+
+
+@dataclass(frozen=True)
+class OptionPortfolioReplay:
+    equity: pd.Series
+    returns: pd.Series
+    cash: pd.Series
+    active_value: pd.Series
+    capital_deployed: pd.Series
+    trade_ledger: pd.DataFrame
+    summary: dict[str, Any]
 
 
 def install_pickle_compat_modules() -> None:
@@ -677,13 +690,15 @@ def replay_trading_app_top_k_rule(
         symbols=symbols,
         top_k=top_k,
     )
-    equity, returns, cash, details = discrete_backtest(
+    equity, returns, cash, details, executions = discrete_backtest_with_executions(
         action_type=action_type,
         close=close,
+        symbol_order=symbols,
         initial_balance=initial_balance,
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
     )
+    action_tape = _merge_action_tape_executions(action_tape, executions)
     details.update(
         {
             "top_k": int(top_k),
@@ -698,6 +713,7 @@ def replay_trading_app_top_k_rule(
         returns=returns,
         cash=cash,
         action_tape=action_tape,
+        executions=executions,
         positions=positions,
         trade_windows=trade_windows,
         meta=details,
@@ -738,6 +754,44 @@ def _build_action_tape(
     return pd.DataFrame(rows)
 
 
+def _merge_action_tape_executions(action_tape: pd.DataFrame, executions: pd.DataFrame) -> pd.DataFrame:
+    if action_tape.empty:
+        return action_tape.copy()
+    out = action_tape.copy()
+    if executions.empty:
+        out["gross_notional"] = 0.0
+        out["fee"] = 0.0
+        out["net_cash_flow"] = 0.0
+        out["shares_delta"] = 0.0
+        return out
+    keys = ["date", "symbol", "action"]
+    for frame in (out, executions):
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+        frame["symbol"] = frame["symbol"].astype(str).str.upper()
+        frame["action"] = frame["action"].astype(str)
+    merged = out.merge(
+        executions[
+            [
+                "date",
+                "symbol",
+                "action",
+                "gross_notional",
+                "fee",
+                "net_cash_flow",
+                "shares_delta",
+                "shares_after",
+                "cash_after",
+                "equity_after",
+            ]
+        ],
+        on=keys,
+        how="left",
+    )
+    for col in ("gross_notional", "fee", "net_cash_flow", "shares_delta", "shares_after", "cash_after", "equity_after"):
+        merged[col] = pd.to_numeric(merged.get(col), errors="coerce").fillna(0.0)
+    return merged
+
+
 def action_tape_to_trade_windows(action_tape: pd.DataFrame, *, prices: pd.DataFrame | None = None) -> pd.DataFrame:
     if action_tape.empty:
         return pd.DataFrame(
@@ -765,6 +819,8 @@ def action_tape_to_trade_windows(action_tape: pd.DataFrame, *, prices: pd.DataFr
         symbol = str(row["symbol"])
         action = str(row.get("action", ""))
         if action == "buy":
+            if "gross_notional" in actions.columns and _nan_float(row.get("gross_notional")) <= 0.0:
+                continue
             if symbol in open_trades:
                 open_trades[symbol]["ignored_duplicate_entry"] = True
                 continue
@@ -786,6 +842,11 @@ def action_tape_to_trade_windows(action_tape: pd.DataFrame, *, prices: pd.DataFr
                 "entry_price": entry_price,
                 "exit_price": exit_price,
                 "ret_dec": float(ret_dec) if np.isfinite(ret_dec) else np.nan,
+                "equity_entry_notional": _nan_float(entry.get("gross_notional")),
+                "equity_entry_fee": _nan_float(entry.get("fee")),
+                "equity_entry_shares": _nan_float(entry.get("shares_delta")),
+                "equity_exit_notional": _nan_float(row.get("gross_notional")),
+                "equity_exit_fee": _nan_float(row.get("fee")),
                 "top_k": int(entry.get("top_k", 0)) if pd.notna(entry.get("top_k")) else 0,
                 "entry_score": _nan_float(entry.get("score")),
                 "exit_reason": row.get("reason", ""),
@@ -809,6 +870,11 @@ def action_tape_to_trade_windows(action_tape: pd.DataFrame, *, prices: pd.DataFr
                     "entry_price": entry_price,
                     "exit_price": exit_price,
                     "ret_dec": float(ret_dec) if np.isfinite(ret_dec) else np.nan,
+                    "equity_entry_notional": _nan_float(entry.get("gross_notional")),
+                    "equity_entry_fee": _nan_float(entry.get("fee")),
+                    "equity_entry_shares": _nan_float(entry.get("shares_delta")),
+                    "equity_exit_notional": np.nan,
+                    "equity_exit_fee": np.nan,
                     "top_k": int(entry.get("top_k", 0)) if pd.notna(entry.get("top_k")) else 0,
                     "entry_score": _nan_float(entry.get("score")),
                     "exit_reason": "end_of_backtest",
@@ -829,6 +895,26 @@ def discrete_backtest(
     fee_bps: float,
     slippage_bps: float,
 ) -> tuple[pd.Series, pd.Series, pd.Series, dict[str, Any]]:
+    equity, returns, cash, details, _executions = discrete_backtest_with_executions(
+        action_type=action_type,
+        close=close,
+        symbol_order=list(close.columns.astype(str)),
+        initial_balance=initial_balance,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+    return equity, returns, cash, details
+
+
+def discrete_backtest_with_executions(
+    *,
+    action_type: np.ndarray,
+    close: pd.DataFrame,
+    symbol_order: list[str],
+    initial_balance: float,
+    fee_bps: float,
+    slippage_bps: float,
+) -> tuple[pd.Series, pd.Series, pd.Series, dict[str, Any], pd.DataFrame]:
     prices = close.to_numpy(dtype=float)
     balance = float(initial_balance)
     shares = np.zeros(prices.shape[1], dtype=float)
@@ -837,16 +923,35 @@ def discrete_backtest(
     cash = np.zeros(prices.shape[0], dtype=float)
     buy_count = 0
     sell_count = 0
+    execution_rows: list[dict[str, Any]] = []
     for t in range(prices.shape[0]):
+        date = pd.Timestamp(close.index[t]).normalize()
         px = prices[t]
         actions = np.asarray(action_type[t], dtype=int)
         for j in np.where(actions == 2)[0]:
             if px[j] <= 0 or shares[j] <= 0:
                 continue
+            shares_delta = -float(shares[j])
             gross = shares[j] * px[j]
-            balance += gross - trade_cost(gross, fee_bps, slippage_bps)
+            fee = trade_cost(gross, fee_bps, slippage_bps)
+            balance += gross - fee
             shares[j] = 0.0
             sell_count += 1
+            execution_rows.append(
+                {
+                    "date": date,
+                    "symbol": symbol_order[j],
+                    "action": "sell",
+                    "price": float(px[j]),
+                    "gross_notional": float(gross),
+                    "fee": float(fee),
+                    "net_cash_flow": float(gross - fee),
+                    "shares_delta": shares_delta,
+                    "shares_after": float(shares[j]),
+                    "cash_after": float(balance),
+                    "equity_after": float(balance + np.sum(shares * px)),
+                }
+            )
         net_worth = balance + float(np.sum(shares * px))
         buy_idx = np.where(actions == 1)[0]
         day_buy_budget = max(0.0, balance)
@@ -859,16 +964,39 @@ def discrete_backtest(
             if gross <= 0:
                 continue
             fee = trade_cost(gross, fee_bps, slippage_bps)
-            shares[j] += gross / px[j]
+            shares_delta = gross / px[j]
+            shares[j] += shares_delta
             day_buy_budget -= gross + fee
             buy_count += 1
+            execution_rows.append(
+                {
+                    "date": date,
+                    "symbol": symbol_order[j],
+                    "action": "buy",
+                    "price": float(px[j]),
+                    "gross_notional": float(gross),
+                    "fee": float(fee),
+                    "net_cash_flow": float(-(gross + fee)),
+                    "shares_delta": float(shares_delta),
+                    "shares_after": float(shares[j]),
+                    "cash_after": float(day_buy_budget),
+                    "equity_after": float(day_buy_budget + np.sum(shares * px)),
+                }
+            )
         balance = day_buy_budget if day_buy_budget > 1e-9 else 0.0
         equity[t] = balance + float(np.sum(shares * px))
         cash[t] = balance
     eq = pd.Series(equity, index=close.index, name="equity")
     ret = eq.pct_change().fillna(0.0).rename("returns")
     cash_s = pd.Series(cash, index=close.index, name="cash")
-    return eq, ret, cash_s, {"executed_buy_count": buy_count, "executed_sell_count": sell_count, "cash_end": float(cash_s.iloc[-1]) if len(cash_s) else np.nan}
+    executions = pd.DataFrame(execution_rows)
+    return (
+        eq,
+        ret,
+        cash_s,
+        {"executed_buy_count": buy_count, "executed_sell_count": sell_count, "cash_end": float(cash_s.iloc[-1]) if len(cash_s) else np.nan},
+        executions,
+    )
 
 
 def summarize_returns(returns: pd.Series, initial_balance: float) -> dict[str, Any]:
@@ -899,6 +1027,136 @@ def summarize_returns(returns: pd.Series, initial_balance: float) -> dict[str, A
         "max_drawdown_pct": float((((equity / equity.cummax()) - 1.0).min()) * 100.0) if len(equity) else np.nan,
         "yearly": yearly,
     }
+
+
+def replay_option_portfolio_from_selected_paths(
+    selected_option_trades: pd.DataFrame,
+    selected_option_paths: pd.DataFrame,
+    *,
+    date_index: pd.Index,
+    initial_balance: float,
+) -> OptionPortfolioReplay:
+    dates = pd.DatetimeIndex(pd.to_datetime(date_index, errors="coerce")).normalize()
+    dates = pd.DatetimeIndex(sorted(dates[~dates.isna()].unique()))
+    if len(dates) == 0:
+        empty = pd.Series(dtype=float)
+        return OptionPortfolioReplay(empty, empty, empty, empty, empty, pd.DataFrame(), {})
+    cash_flows = pd.Series(0.0, index=dates)
+    active_value = pd.Series(0.0, index=dates)
+    capital_deployed = pd.Series(0.0, index=dates)
+    ledger_rows: list[dict[str, Any]] = []
+    if selected_option_trades is None or selected_option_trades.empty:
+        equity = pd.Series(float(initial_balance), index=dates, name="option_equity")
+        returns = equity.pct_change().fillna(0.0).rename("option_returns")
+        cash = pd.Series(float(initial_balance), index=dates, name="option_cash")
+        summary = summarize_returns(returns, float(initial_balance))
+        return OptionPortfolioReplay(equity, returns, cash, active_value, capital_deployed, pd.DataFrame(), summary)
+
+    paths = selected_option_paths.copy() if selected_option_paths is not None else pd.DataFrame()
+    if not paths.empty:
+        paths["snapshot_date"] = pd.to_datetime(paths["snapshot_date"], errors="coerce").dt.normalize()
+        paths["trade_id"] = paths["trade_id"].astype(str)
+        for col in ("mark_price", "bid", "mid"):
+            if col in paths.columns:
+                paths[col] = pd.to_numeric(paths[col], errors="coerce")
+
+    trades = selected_option_trades.copy()
+    trades["trade_id"] = trades["trade_id"].astype(str)
+    trades["entry_date"] = pd.to_datetime(trades["entry_date"], errors="coerce").dt.normalize()
+    trades["option_exit_date"] = pd.to_datetime(trades["option_exit_date"], errors="coerce").dt.normalize()
+    for _, trade in trades.iterrows():
+        trade_id = str(trade.get("trade_id"))
+        budget = _nan_float(trade.get("equity_entry_notional"))
+        entry_price = _nan_float(trade.get("entry_price"))
+        exit_price = _nan_float(trade.get("exit_price"))
+        entry_date = pd.Timestamp(trade.get("entry_date")).normalize()
+        exit_date = pd.Timestamp(trade.get("option_exit_date")).normalize()
+        if (
+            not np.isfinite(budget)
+            or budget <= 0.0
+            or not np.isfinite(entry_price)
+            or entry_price <= 0.0
+            or not np.isfinite(exit_price)
+            or pd.isna(entry_date)
+            or pd.isna(exit_date)
+        ):
+            continue
+        entry_dt = _align_to_calendar(entry_date, dates, direction="forward")
+        exit_dt = _align_to_calendar(exit_date, dates, direction="backward")
+        if entry_dt is None or exit_dt is None or exit_dt < entry_dt:
+            continue
+        units = float(budget) / float(entry_price)
+        cash_flows.loc[entry_dt] -= float(budget)
+        exit_value = float(units) * float(exit_price)
+        cash_flows.loc[exit_dt] += exit_value
+        trade_path = paths.loc[paths["trade_id"].eq(trade_id)].copy() if not paths.empty else pd.DataFrame()
+        if trade_path.empty:
+            mark_dates = pd.DatetimeIndex([entry_dt])
+            marks = pd.Series(float(entry_price), index=mark_dates)
+        else:
+            mark_col = "mark_price" if "mark_price" in trade_path.columns else "bid" if "bid" in trade_path.columns else "mid"
+            marks = (
+                trade_path.dropna(subset=["snapshot_date"])
+                .sort_values("snapshot_date")
+                .drop_duplicates("snapshot_date", keep="last")
+                .set_index("snapshot_date")[mark_col]
+                .astype(float)
+            )
+        active_dates = dates[(dates >= entry_dt) & (dates < exit_dt)]
+        if len(active_dates):
+            aligned_marks = marks.reindex(active_dates).ffill()
+            if aligned_marks.isna().all():
+                aligned_marks = pd.Series(float(entry_price), index=active_dates)
+            else:
+                aligned_marks = aligned_marks.fillna(float(entry_price))
+            active_value.loc[active_dates] += aligned_marks * float(units)
+            capital_deployed.loc[active_dates] += float(budget)
+        ledger_rows.append(
+            {
+                "trade_id": trade_id,
+                "symbol": trade.get("symbol"),
+                "entry_date": entry_dt,
+                "option_exit_date": exit_dt,
+                "equity_entry_notional": float(budget),
+                "entry_price": float(entry_price),
+                "exit_price": float(exit_price),
+                "option_units": float(units),
+                "exit_value": float(exit_value),
+                "option_pnl_dollars": float(exit_value - budget),
+                "option_return": float(exit_value / budget - 1.0),
+                "expired_before_equity_exit": bool(trade.get("expired_before_equity_exit", False)),
+            }
+        )
+    cash = (float(initial_balance) + cash_flows.cumsum()).rename("option_cash")
+    equity = (cash + active_value).rename("option_equity")
+    returns = equity.pct_change().fillna(0.0).rename("option_returns")
+    ledger = pd.DataFrame(ledger_rows)
+    summary = summarize_returns(returns, float(initial_balance))
+    summary.update(
+        {
+            "funded_option_trades": int(len(ledger)),
+            "total_premium_deployed": float(ledger["equity_entry_notional"].sum()) if not ledger.empty else 0.0,
+            "total_option_pnl_dollars": float(ledger["option_pnl_dollars"].sum()) if not ledger.empty else 0.0,
+        }
+    )
+    return OptionPortfolioReplay(
+        equity=equity,
+        returns=returns,
+        cash=cash,
+        active_value=active_value.rename("option_active_value"),
+        capital_deployed=capital_deployed.rename("option_capital_deployed"),
+        trade_ledger=ledger,
+        summary=summary,
+    )
+
+
+def _align_to_calendar(target: pd.Timestamp, dates: pd.DatetimeIndex, *, direction: str) -> pd.Timestamp | None:
+    target = pd.Timestamp(target).normalize()
+    if direction == "forward":
+        eligible = dates[dates >= target]
+        return pd.Timestamp(eligible[0]) if len(eligible) else None
+    eligible = dates[dates <= target]
+    return pd.Timestamp(eligible[-1]) if len(eligible) else None
 
 
 def compare_latest_scores(scored: pd.DataFrame, artifact_dir: Path, score_col: str) -> dict[str, Any]:
@@ -991,6 +1249,7 @@ def run_optimal_trader_artifact_replay(config: OptimalTraderArtifactReplayConfig
         slippage_bps=slippage_bps,
     )
     option_execution = None
+    option_portfolio = None
     option_summary: dict[str, Any] = {}
     if bool(config.run_fmp_synthetic_options):
         from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.synthetic_options import (
@@ -1002,6 +1261,12 @@ def run_optimal_trader_artifact_replay(config: OptimalTraderArtifactReplayConfig
             rule_replay.trade_windows,
             config=FmpSyntheticOptionReplayConfig(workers=max(1, int(config.option_workers))),
         )
+        option_portfolio = replay_option_portfolio_from_selected_paths(
+            option_execution.selected_option_trades,
+            option_execution.selected_option_paths,
+            date_index=rule_replay.equity.index,
+            initial_balance=float(config.initial_balance),
+        )
         option_return_summary = summarize_option_trade_returns(option_execution.selected_option_trades)
         option_summary = {
             "selected_option_trades": int(len(option_execution.selected_option_trades)),
@@ -1012,6 +1277,7 @@ def run_optimal_trader_artifact_replay(config: OptimalTraderArtifactReplayConfig
                 else {}
             ),
             "option_trade_returns": option_return_summary,
+            "option_portfolio": option_portfolio.summary,
             "metrics": option_execution.metrics,
         }
 
@@ -1044,6 +1310,7 @@ def run_optimal_trader_artifact_replay(config: OptimalTraderArtifactReplayConfig
         rule_replay=rule_replay,
         summary=summary,
         option_execution=option_execution,
+        option_portfolio=option_portfolio,
     )
     if out_dir is not None:
         write_artifact_replay_outputs(result, out_dir)
@@ -1061,6 +1328,7 @@ def write_artifact_replay_outputs(result: OptimalTraderArtifactReplayResult, out
         "positions": out_dir / "positions.parquet",
         "trade_windows": out_dir / "trade_windows.parquet",
         "summary": out_dir / "summary.json",
+        "equity_executions": out_dir / "equity_executions.csv",
     }
     if result.option_execution is not None:
         paths.update(
@@ -1070,16 +1338,33 @@ def write_artifact_replay_outputs(result: OptimalTraderArtifactReplayResult, out
                 "option_trade_status": out_dir / "option_trade_status.csv",
             }
         )
+    if result.option_portfolio is not None:
+        paths.update(
+            {
+                "option_equity_curve": out_dir / "option_equity_curve.csv",
+                "option_cash": out_dir / "option_cash.csv",
+                "option_active_value": out_dir / "option_active_value.csv",
+                "option_capital_deployed": out_dir / "option_capital_deployed.csv",
+                "option_portfolio_ledger": out_dir / "option_portfolio_ledger.parquet",
+            }
+        )
     result.rule_replay.equity.rename("equity").to_csv(paths["equity_curve"])
     result.rule_replay.returns.to_csv(paths["returns"])
     result.rule_replay.cash.to_csv(paths["cash"])
     result.rule_replay.action_tape.to_parquet(paths["action_tape"], index=False)
+    result.rule_replay.executions.to_csv(paths["equity_executions"], index=False)
     result.rule_replay.positions.reset_index(names="date").to_parquet(paths["positions"], index=False)
     result.rule_replay.trade_windows.to_parquet(paths["trade_windows"], index=False)
     if result.option_execution is not None:
         result.option_execution.selected_option_trades.to_parquet(paths["selected_option_trades"], index=False)
         result.option_execution.selected_option_paths.to_parquet(paths["selected_option_paths"], index=False)
         result.option_execution.trade_status.to_csv(paths["option_trade_status"], index=False)
+    if result.option_portfolio is not None:
+        result.option_portfolio.equity.to_csv(paths["option_equity_curve"])
+        result.option_portfolio.cash.to_csv(paths["option_cash"])
+        result.option_portfolio.active_value.to_csv(paths["option_active_value"])
+        result.option_portfolio.capital_deployed.to_csv(paths["option_capital_deployed"])
+        result.option_portfolio.trade_ledger.to_parquet(paths["option_portfolio_ledger"], index=False)
     paths["summary"].write_text(json.dumps(result.summary, indent=2, default=str), encoding="utf-8")
     return paths
 

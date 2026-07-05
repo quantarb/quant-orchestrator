@@ -6,6 +6,7 @@ import pytest
 from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader import (
     OptimalTraderBacktestConfig,
     action_tape_to_trade_windows,
+    replay_option_portfolio_from_selected_paths,
     replay_trading_app_top_k_rule,
     load_strategy_dataset_artifact,
     run_optimal_trader_equity_backtest,
@@ -135,6 +136,32 @@ def test_trading_app_rule_replay_builds_shifted_action_tape_and_trade_windows() 
         }
     ]
     assert replay.equity.loc[pd.Timestamp("2024-01-03")] == pytest.approx(100_000.0 * (120.0 / 110.0))
+    assert replay.trade_windows["equity_entry_notional"].iloc[0] == pytest.approx(100_000.0)
+
+
+def test_action_tape_to_trade_windows_ignores_unfunded_buys() -> None:
+    actions = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2024-01-02"),
+                "symbol": "AAA",
+                "action": "buy",
+                "price": 100.0,
+                "gross_notional": 0.0,
+            },
+            {
+                "date": pd.Timestamp("2024-01-03"),
+                "symbol": "AAA",
+                "action": "sell",
+                "price": 110.0,
+                "gross_notional": 0.0,
+            },
+        ]
+    )
+
+    windows = action_tape_to_trade_windows(actions)
+
+    assert windows.empty
 
 
 def test_action_tape_to_trade_windows_closes_open_positions_at_backtest_end() -> None:
@@ -163,6 +190,42 @@ def test_action_tape_to_trade_windows_closes_open_positions_at_backtest_end() ->
             "exit_reason": "end_of_backtest",
         }
     ]
+
+
+def test_option_portfolio_replay_uses_equity_entry_notional_as_option_budget() -> None:
+    selected = pd.DataFrame(
+        [
+            {
+                "trade_id": "t1",
+                "symbol": "AAA",
+                "entry_date": pd.Timestamp("2024-01-02"),
+                "option_exit_date": pd.Timestamp("2024-01-04"),
+                "entry_price": 10.0,
+                "exit_price": 20.0,
+                "equity_entry_notional": 100.0,
+                "expired_before_equity_exit": False,
+            }
+        ]
+    )
+    paths = pd.DataFrame(
+        [
+            {"trade_id": "t1", "snapshot_date": pd.Timestamp("2024-01-02"), "mark_price": 10.0},
+            {"trade_id": "t1", "snapshot_date": pd.Timestamp("2024-01-03"), "mark_price": 15.0},
+            {"trade_id": "t1", "snapshot_date": pd.Timestamp("2024-01-04"), "mark_price": 20.0},
+        ]
+    )
+
+    replay = replay_option_portfolio_from_selected_paths(
+        selected,
+        paths,
+        date_index=pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+        initial_balance=1_000.0,
+    )
+
+    assert replay.equity.tolist() == pytest.approx([1_000.0, 1_050.0, 1_100.0])
+    assert replay.cash.tolist() == pytest.approx([900.0, 900.0, 1_100.0])
+    assert replay.trade_ledger["option_pnl_dollars"].iloc[0] == pytest.approx(100.0)
+    assert replay.summary["total_return_pct"] == pytest.approx(10.0)
 
 
 def _strategy_frame() -> pd.DataFrame:
