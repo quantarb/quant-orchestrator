@@ -18,7 +18,7 @@ for path in (REPO_ROOT, QUANT_WAREHOUSE_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.thetadata_data_adapter import (  # noqa: E402
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.data_adapter import (  # noqa: E402
     build_optimal_trader_thetadata_option_mean_variance_labels,
     build_optimal_trader_thetadata_option_contract_features,
     read_optimal_trader_thetadata_option_chain,

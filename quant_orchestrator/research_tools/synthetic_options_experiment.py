@@ -26,7 +26,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.syntheti
     build_realized_vol_panel,
     build_synthetic_option_return_panels,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.thetadata_data_adapter import (
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.data_adapter import (
     read_optimal_trader_thetadata_option_chain,
 )
 

@@ -16,7 +16,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.reporting import (
     normalize_trade_windows as normalize_report_trade_windows,
     report_trade_windows,
 )
-from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.thetadata_data_adapter import (
+from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.data_adapter import (
     settle_optimal_trader_thetadata_option_exit,
 )
 from quant_orchestrator.research_tools.option_trade_execution import (
@@ -3454,7 +3454,7 @@ def _prepare_quant_warehouse_import(path: str | None) -> None:
 def _warehouse_imports():
     from quant_warehouse import Warehouse
     from quant_warehouse.platforms.data_providers.fmp.target_engineering import LabelBuildSpec, build_trade_results
-    from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.thetadata_data_adapter import (
+    from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader.data_adapter import (
         build_optimal_trader_thetadata_option_contract_features,
         build_optimal_trader_thetadata_option_mean_variance_labels,
         optimal_trader_thetadata_option_chain_coverage,
