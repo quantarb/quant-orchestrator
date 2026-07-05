@@ -84,6 +84,7 @@ def main() -> None:
     parser.add_argument("--end-date", default="")
     parser.add_argument("--n-estimators", type=int, default=400)
     parser.add_argument("--random-seed", type=int, default=20260704)
+    parser.add_argument("--target-col", default="rank_y", help="Numeric option label column to predict.")
     args = parser.parse_args()
 
     started = perf_counter()
@@ -95,6 +96,12 @@ def main() -> None:
         max_trades=int(args.max_trades),
         symbols=requested_symbols,
     )
+    target_col = str(args.target_col)
+    if target_col not in option_panel.columns:
+        raise ValueError(f"option panel missing target column {target_col!r}")
+    option_panel[target_col] = pd.to_numeric(option_panel[target_col], errors="coerce")
+    if option_panel[target_col].notna().sum() == 0:
+        raise ValueError(f"option panel target column {target_col!r} has no numeric values")
     symbols = tuple(sorted(option_panel["symbol"].dropna().astype(str).str.upper().unique()))
     feature_panel, metadata = _build_feature_panel(
         symbols,
@@ -114,14 +121,17 @@ def main() -> None:
         for col in OPTION_FEATURES
         if col in option_panel.columns and pd.to_numeric(option_panel[col], errors="coerce").notna().any()
     ]
-    fixed = _evaluate_selector(eval_base, score_col="fixed_near_atm_score", selector_name="fixed_near_atm")
+    fixed = _evaluate_selector(eval_base, score_col="fixed_near_atm_score", selector_name="fixed_near_atm", target_col=target_col)
+    target_suffix = _safe_score_suffix(target_col)
+    option_only_score_col = "pred_option_only_rank" if target_col == "rank_y" else f"pred_option_only_{target_suffix}"
     baseline = _fit_score_and_evaluate(
         train_base,
         eval_base,
         numeric_features=option_features,
         random_seed=int(args.random_seed),
         n_estimators=int(args.n_estimators),
-        score_col="pred_option_only_rank",
+        score_col=option_only_score_col,
+        target_col=target_col,
     )
     if baseline["model"] is not None:
         _write_pickle(out_dir / "option_only_ranker.pkl", baseline["model"])
@@ -149,7 +159,7 @@ def main() -> None:
             for col in selected_features
             if col in joined.columns and pd.to_numeric(joined[col], errors="coerce").notna().any()
         ]
-        score_col = f"pred_{_safe_family_dir(source, family)}_rank"
+        score_col = f"pred_{_safe_family_dir(source, family)}_rank" if target_col == "rank_y" else f"pred_{_safe_family_dir(source, family)}_{target_suffix}"
         family_aware = _fit_score_and_evaluate(
             train,
             eval_,
@@ -157,14 +167,16 @@ def main() -> None:
             random_seed=int(args.random_seed) + 17 + family_index,
             n_estimators=int(args.n_estimators),
             score_col=score_col,
+            target_col=target_col,
         )
         if family_aware["model"] is not None:
             _write_pickle(family_dir / "ranker.pkl", family_aware["model"])
         scored_eval = family_aware["eval_scored"].copy()
-        if not baseline["eval_scored"].empty and "pred_option_only_rank" in baseline["eval_scored"].columns:
-            scored_eval["pred_option_only_rank"] = baseline["eval_scored"]["pred_option_only_rank"].to_numpy()
+        if not baseline["eval_scored"].empty and option_only_score_col in baseline["eval_scored"].columns:
+            scored_eval[option_only_score_col] = baseline["eval_scored"][option_only_score_col].to_numpy()
         summary = {
             "option_panel": str(Path(args.option_panel).expanduser().resolve()),
+            "target_col": target_col,
             "requested_symbols": list(requested_symbols),
             "feature_family": f"{source}.{family}",
             "symbols": int(len(symbols)),
@@ -204,6 +216,7 @@ def main() -> None:
         (family_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     summary = {
         "option_panel": str(Path(args.option_panel).expanduser().resolve()),
+        "target_col": target_col,
         "requested_symbols": list(requested_symbols),
         "feature_families": [f"{source}.{family}" for source, family in requested_families],
         "symbols": int(len(symbols)),
@@ -357,6 +370,10 @@ def _safe_family_dir(source: str, family: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{source}.{family}").strip("._") or "feature_family"
 
 
+def _safe_score_suffix(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(value)).strip("_") or "target"
+
+
 def _write_pickle(path: Path, value: Any) -> None:
     with path.open("wb") as handle:
         pickle.dump(value, handle)
@@ -380,6 +397,8 @@ def _flatten_family_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "selected_win_rate": selector.get("win_rate"),
         "selected_mean_rank_y": selector.get("mean_rank_y"),
         "selected_median_rank_y": selector.get("median_rank_y"),
+        "selected_mean_target": selector.get("mean_target"),
+        "selected_median_target": selector.get("median_target"),
         "elapsed_seconds": summary["elapsed_seconds"],
     }
 
@@ -424,6 +443,7 @@ def _fit_score_and_evaluate(
     random_seed: int,
     n_estimators: int,
     score_col: str,
+    target_col: str,
 ) -> dict[str, Any]:
     from sklearn.ensemble import RandomForestRegressor
     from sklearn.impute import SimpleImputer
@@ -433,10 +453,22 @@ def _fit_score_and_evaluate(
     if train.empty or eval_.empty or not numeric_features:
         scored = eval_.copy()
         scored[score_col] = np.nan
-        return {"model": None, "eval_scored": scored, "metrics": {"selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col)}}
+        return {
+            "model": None,
+            "eval_scored": scored,
+            "metrics": {"selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col, target_col=target_col)},
+        }
     features = [col for col in numeric_features if col in train.columns and pd.to_numeric(train[col], errors="coerce").notna().any()]
-    target = pd.to_numeric(train["rank_y"], errors="coerce")
+    target = pd.to_numeric(train[target_col], errors="coerce")
     valid = target.notna()
+    if not features or int(valid.sum()) == 0:
+        scored = eval_.copy()
+        scored[score_col] = np.nan
+        return {
+            "model": None,
+            "eval_scored": scored,
+            "metrics": {"selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col, target_col=target_col)},
+        }
     model = Pipeline(
         [
             ("impute", SimpleImputer(strategy="median")),
@@ -454,31 +486,38 @@ def _fit_score_and_evaluate(
     )
     model.fit(train.loc[valid, features], target.loc[valid])
     scored = eval_.copy()
-    scored[score_col] = np.clip(model.predict(scored[features]), 0.0, 1.0)
+    predictions = model.predict(scored[features])
+    scored[score_col] = np.clip(predictions, 0.0, 1.0) if target_col == "rank_y" else np.clip(predictions, 0.0, None)
     train_pred = model.predict(train.loc[valid, features])
-    eval_target = pd.to_numeric(scored["rank_y"], errors="coerce")
+    eval_target = pd.to_numeric(scored[target_col], errors="coerce")
     eval_pred = pd.to_numeric(scored[score_col], errors="coerce")
     eval_valid = eval_target.notna() & eval_pred.notna()
     metrics = {
         "feature_count": int(len(features)),
+        "target_col": target_col,
         "train_rows": int(valid.sum()),
         "eval_rows": int(len(scored)),
+        "train_target_mean": float(target.loc[valid].mean()),
+        "eval_target_mean": float(eval_target.mean()),
         "train_mae": float(mean_absolute_error(target.loc[valid], train_pred)),
         "train_r2": float(r2_score(target.loc[valid], train_pred)) if int(valid.sum()) > 1 else np.nan,
         "eval_mae": float(mean_absolute_error(eval_target.loc[eval_valid], eval_pred.loc[eval_valid])) if eval_valid.any() else np.nan,
         "eval_r2": float(r2_score(eval_target.loc[eval_valid], eval_pred.loc[eval_valid])) if int(eval_valid.sum()) > 1 else np.nan,
-        "selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col),
+        "selector": _evaluate_selector(scored, score_col=score_col, selector_name=score_col, target_col=target_col),
     }
     return {"model": model, "eval_scored": scored, "metrics": metrics}
 
 
-def _evaluate_selector(frame: pd.DataFrame, *, score_col: str, selector_name: str) -> dict[str, Any]:
+def _evaluate_selector(frame: pd.DataFrame, *, score_col: str, selector_name: str, target_col: str = "rank_y") -> dict[str, Any]:
     if frame.empty or score_col not in frame.columns:
         return {"selector": selector_name, "trades": 0}
     work = frame.copy()
     work[score_col] = pd.to_numeric(work[score_col], errors="coerce")
     work["option_return"] = pd.to_numeric(work["option_return"], errors="coerce")
-    work["rank_y"] = pd.to_numeric(work["rank_y"], errors="coerce")
+    if "rank_y" in work.columns:
+        work["rank_y"] = pd.to_numeric(work["rank_y"], errors="coerce")
+    if target_col in work.columns:
+        work[target_col] = pd.to_numeric(work[target_col], errors="coerce")
     selected = (
         work.dropna(subset=[score_col])
         .sort_values(["trade_id", score_col], ascending=[True, False], kind="stable")
@@ -488,15 +527,21 @@ def _evaluate_selector(frame: pd.DataFrame, *, score_col: str, selector_name: st
     )
     if selected.empty:
         return {"selector": selector_name, "trades": 0}
-    return {
+    result = {
         "selector": selector_name,
         "trades": int(len(selected)),
         "mean_option_return": float(selected["option_return"].mean()),
         "median_option_return": float(selected["option_return"].median()),
         "win_rate": float(selected["option_return"].gt(0).mean()),
-        "mean_rank_y": float(selected["rank_y"].mean()),
-        "median_rank_y": float(selected["rank_y"].median()),
     }
+    if "rank_y" in selected.columns:
+        result["mean_rank_y"] = float(selected["rank_y"].mean())
+        result["median_rank_y"] = float(selected["rank_y"].median())
+    if target_col in selected.columns:
+        result["target_col"] = target_col
+        result["mean_target"] = float(selected[target_col].mean())
+        result["median_target"] = float(selected[target_col].median())
+    return result
 
 
 if __name__ == "__main__":

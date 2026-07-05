@@ -18,6 +18,7 @@ for path in (REPO_ROOT, QUANT_WAREHOUSE_ROOT):
         sys.path.insert(0, str(path))
 
 from quant_orchestrator.platforms.backtesting_frameworks.panel_weight.thetadata_data_adapter import (  # noqa: E402
+    build_panel_weight_thetadata_option_mean_variance_labels,
     build_panel_weight_thetadata_option_contract_features,
     read_panel_weight_thetadata_option_chain,
 )
@@ -68,6 +69,8 @@ def main() -> None:
     parser.add_argument("--target-dte", type=int, default=90)
     parser.add_argument("--max-candidates-per-trade", type=int, default=750)
     parser.add_argument("--n-estimators", type=int, default=200)
+    parser.add_argument("--mv-risk-aversion", type=float, default=1.0)
+    parser.add_argument("--mv-max-weight", type=float, default=0.35)
     parser.add_argument("--skip-panel", action="store_true")
     args = parser.parse_args()
 
@@ -111,25 +114,36 @@ def main() -> None:
         oracle_trades.to_parquet(trades_path, index=False)
         option_panel.to_parquet(panel_path, index=False)
 
-    command = [
-        sys.executable,
-        str(REPO_ROOT / "scripts" / "run_option_family_ranker_experiment.py"),
-        "--option-panel",
-        str(panel_path),
-        "--symbols",
-        ",".join(symbols),
-        "--all-feature-families",
-        "--train-end",
-        str(args.train_end),
-        "--eval-start",
-        str(args.eval_start),
-        "--n-estimators",
-        str(args.n_estimators),
-        "--output-dir",
-        str(out_dir / "family_rankers"),
-    ]
-    ranker = subprocess.run(command, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
-    (out_dir / "ranker_stdout.json").write_text(ranker.stdout, encoding="utf-8")
+    option_panel = add_mean_variance_oracle_labels(
+        option_panel,
+        risk_aversion=float(args.mv_risk_aversion),
+        max_weight=float(args.mv_max_weight),
+    )
+    option_panel.to_parquet(panel_path, index=False)
+
+    ranker_outputs = {
+        "rank_y": _run_family_ranker(
+            panel_path=panel_path,
+            symbols=symbols,
+            output_dir=out_dir / "family_rankers" / "rank_y",
+            train_end=str(args.train_end),
+            eval_start=str(args.eval_start),
+            n_estimators=int(args.n_estimators),
+            target_col="rank_y",
+        ),
+        "mv_weight": _run_family_ranker(
+            panel_path=panel_path,
+            symbols=symbols,
+            output_dir=out_dir / "family_rankers" / "mv_weight",
+            train_end=str(args.train_end),
+            eval_start=str(args.eval_start),
+            n_estimators=int(args.n_estimators),
+            target_col="mv_weight",
+        ),
+    }
+    (out_dir / "ranker_stdout.json").write_text(ranker_outputs["rank_y"], encoding="utf-8")
+    (out_dir / "rank_y_ranker_stdout.json").write_text(ranker_outputs["rank_y"], encoding="utf-8")
+    (out_dir / "mv_weight_ranker_stdout.json").write_text(ranker_outputs["mv_weight"], encoding="utf-8")
     summary = {
         "symbols": symbols,
         "oracle_trades": int(len(oracle_trades)),
@@ -137,6 +151,8 @@ def main() -> None:
         "option_panel": str(panel_path),
         "train_end": str(args.train_end),
         "eval_start": str(args.eval_start),
+        "mv_risk_aversion": float(args.mv_risk_aversion),
+        "mv_max_weight": float(args.mv_max_weight),
         "elapsed_seconds": float(perf_counter() - started),
     }
     if not option_panel.empty:
@@ -150,11 +166,47 @@ def main() -> None:
                 "eval_rows": int(dates.ge(pd.Timestamp(args.eval_start)).sum()),
                 "train_trades": int(option_panel.loc[dates.le(pd.Timestamp(args.train_end)), "trade_id"].nunique()),
                 "eval_trades": int(option_panel.loc[dates.ge(pd.Timestamp(args.eval_start)), "trade_id"].nunique()),
+                "mv_selected_rows": int(_column_or_default(option_panel, "mv_selected", False).fillna(False).astype(bool).sum()),
+                "mv_weight_sum": float(pd.to_numeric(_column_or_default(option_panel, "mv_weight", 0.0), errors="coerce").fillna(0.0).sum()),
             }
         )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     print(json.dumps(summary, indent=2, default=str))
-    print(ranker.stdout)
+    print(ranker_outputs["rank_y"])
+    print(ranker_outputs["mv_weight"])
+
+
+def _run_family_ranker(
+    *,
+    panel_path: Path,
+    symbols: tuple[str, ...],
+    output_dir: Path,
+    train_end: str,
+    eval_start: str,
+    n_estimators: int,
+    target_col: str,
+) -> str:
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "run_option_family_ranker_experiment.py"),
+        "--option-panel",
+        str(panel_path),
+        "--symbols",
+        ",".join(symbols),
+        "--all-feature-families",
+        "--train-end",
+        train_end,
+        "--eval-start",
+        eval_start,
+        "--n-estimators",
+        str(n_estimators),
+        "--target-col",
+        target_col,
+        "--output-dir",
+        str(output_dir),
+    ]
+    ranker = subprocess.run(command, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
+    return ranker.stdout
 
 
 def build_fast_option_candidate_panel(
@@ -187,6 +239,54 @@ def build_fast_option_candidate_panel(
     panel = panel.dropna(subset=["option_return"])
     panel["rank_y"] = panel.groupby("trade_id")["option_return"].rank(method="average", pct=True, ascending=True)
     return panel.reset_index(drop=True)
+
+
+def add_mean_variance_oracle_labels(
+    option_panel: pd.DataFrame,
+    *,
+    risk_aversion: float,
+    max_weight: float,
+) -> pd.DataFrame:
+    if option_panel.empty:
+        return option_panel.copy()
+    work = option_panel.copy()
+    work = work.drop(columns=["mv_score", "mv_rank", "mv_selected", "mv_weight", "target_value"], errors="ignore")
+    risk_terms = []
+    for col in ("spread_pct", "abs_moneyness", "dte_gap"):
+        if col not in work.columns:
+            continue
+        values = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+        scale = values.abs().median()
+        if pd.notna(scale) and float(scale) > 0:
+            values = values / float(scale)
+        risk_terms.append(values.clip(lower=0.0))
+    work["mv_risk_proxy"] = sum(risk_terms) if risk_terms else 0.0
+    labels = build_panel_weight_thetadata_option_mean_variance_labels(
+        work,
+        group_cols=("trade_id",),
+        expected_return_col="option_return",
+        risk_col="mv_risk_proxy",
+        risk_aversion=float(risk_aversion),
+        max_weight=float(max_weight),
+        long_only=True,
+    )
+    keep = ["trade_id", "contract_symbol", "mv_score", "mv_rank", "mv_selected", "mv_weight", "target_value"]
+    keep = [col for col in keep if col in labels.columns]
+    labeled = work.merge(labels[keep], on=["trade_id", "contract_symbol"], how="left")
+    for col in ("mv_score", "mv_weight", "target_value"):
+        if col in labeled.columns:
+            labeled[col] = pd.to_numeric(labeled[col], errors="coerce").fillna(0.0)
+    if "mv_rank" in labeled.columns:
+        labeled["mv_rank"] = pd.to_numeric(labeled["mv_rank"], errors="coerce")
+    if "mv_selected" in labeled.columns:
+        labeled["mv_selected"] = labeled["mv_selected"].fillna(False).astype(bool)
+    return labeled.reset_index(drop=True)
+
+
+def _column_or_default(frame: pd.DataFrame, column: str, default: Any) -> pd.Series:
+    if column in frame.columns:
+        return frame[column]
+    return pd.Series(default, index=frame.index)
 
 
 def _candidate_rows_for_trade(
