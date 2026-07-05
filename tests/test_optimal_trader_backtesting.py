@@ -5,6 +5,8 @@ import pytest
 
 from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader import (
     OptimalTraderBacktestConfig,
+    action_tape_to_trade_windows,
+    replay_trading_app_top_k_rule,
     load_strategy_dataset_artifact,
     run_optimal_trader_equity_backtest,
 )
@@ -96,6 +98,73 @@ def test_optimal_trader_data_adapter_loads_saved_strategy_dataset(tmp_path) -> N
     ]
 
 
+def test_trading_app_rule_replay_builds_shifted_action_tape_and_trade_windows() -> None:
+    panel = _scored_panel()
+
+    replay = replay_trading_app_top_k_rule(
+        panel,
+        score_col="buy_score_mean_raw_pct6",
+        top_k=1,
+        component_threshold=0.50,
+        initial_balance=100_000.0,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+    )
+
+    assert replay.action_tape[["date", "symbol", "action", "reason"]].to_dict("records") == [
+        {
+            "date": pd.Timestamp("2024-01-02"),
+            "symbol": "AAA",
+            "action": "buy",
+            "reason": "entry_top_k",
+        },
+        {
+            "date": pd.Timestamp("2024-01-03"),
+            "symbol": "AAA",
+            "action": "sell",
+            "reason": "exit_classifier_or_invalid",
+        },
+    ]
+    assert replay.trade_windows[["symbol", "entry_date", "exit_date", "ret_dec", "exit_reason"]].to_dict("records") == [
+        {
+            "symbol": "AAA",
+            "entry_date": pd.Timestamp("2024-01-02"),
+            "exit_date": pd.Timestamp("2024-01-03"),
+            "ret_dec": pytest.approx((120.0 / 110.0) - 1.0),
+            "exit_reason": "exit_classifier_or_invalid",
+        }
+    ]
+    assert replay.equity.loc[pd.Timestamp("2024-01-03")] == pytest.approx(100_000.0 * (120.0 / 110.0))
+
+
+def test_action_tape_to_trade_windows_closes_open_positions_at_backtest_end() -> None:
+    actions = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2024-01-02"),
+                "symbol": "AAA",
+                "action": "buy",
+                "price": 100.0,
+                "score": 0.9,
+                "top_k": 1,
+            }
+        ]
+    )
+    prices = pd.DataFrame({"AAA": [100.0, 110.0]}, index=pd.to_datetime(["2024-01-02", "2024-01-03"]))
+
+    windows = action_tape_to_trade_windows(actions, prices=prices)
+
+    assert windows[["symbol", "entry_date", "exit_date", "ret_dec", "exit_reason"]].to_dict("records") == [
+        {
+            "symbol": "AAA",
+            "entry_date": pd.Timestamp("2024-01-02"),
+            "exit_date": pd.Timestamp("2024-01-03"),
+            "ret_dec": pytest.approx(0.10),
+            "exit_reason": "end_of_backtest",
+        }
+    ]
+
+
 def _strategy_frame() -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     specs = [
@@ -122,3 +191,32 @@ def _strategy_frame() -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _scored_panel() -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    specs = [
+        ("2024-01-01", "AAA", 100.0, 0.90, 0.80, 0.20, 0.80),
+        ("2024-01-01", "BBB", 100.0, 0.40, 0.70, 0.30, 0.40),
+        ("2024-01-02", "AAA", 110.0, 0.95, 0.30, 0.70, 0.95),
+        ("2024-01-02", "BBB", 100.0, 0.30, 0.70, 0.30, 0.30),
+        ("2024-01-03", "AAA", 120.0, 0.95, 0.30, 0.70, 0.95),
+        ("2024-01-03", "BBB", 100.0, 0.20, 0.70, 0.30, 0.20),
+    ]
+    for date, symbol, close, score, prob_buy, prob_short, pct in specs:
+        rows.append(
+            {
+                "date": pd.Timestamp(date),
+                "symbol": symbol,
+                "close": close,
+                "buy_score_mean_raw_pct6": score,
+                "prob_buy": prob_buy,
+                "prob_short": prob_short,
+                "pred_rf_reg": pct,
+                "ae_familiarity": pct,
+                "prob_buy_pct": pct,
+                "pred_rf_reg_pct": pct,
+                "ae_familiarity_pct": pct,
+            }
+        )
+    return pd.DataFrame(rows).set_index(["date", "symbol"]).sort_index()
