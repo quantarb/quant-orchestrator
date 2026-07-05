@@ -73,20 +73,30 @@ def main() -> None:
     parser.add_argument("--mv-max-weight", type=float, default=0.35)
     parser.add_argument("--disable-pairwise-ranker", action="store_true")
     parser.add_argument("--pairwise-pairs-per-trade", type=int, default=20)
+    parser.add_argument("--progress-every", type=int, default=250)
     parser.add_argument("--skip-panel", action="store_true")
     args = parser.parse_args()
 
     started = perf_counter()
+    timings: dict[str, float] = {}
     symbols = _parse_symbols(args.symbols)
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     panel_path = out_dir / "option_candidate_panel.parquet"
     trades_path = out_dir / "oracle_trades.parquet"
+    diagnostics_path = out_dir / "option_candidate_diagnostics.csv"
 
     if args.skip_panel and panel_path.exists():
+        stage_started = perf_counter()
         option_panel = pd.read_parquet(panel_path)
         oracle_trades = pd.read_parquet(trades_path) if trades_path.exists() else pd.DataFrame()
+        timings["load_cached_panel_seconds"] = float(perf_counter() - stage_started)
+        print(
+            f"[option-selector] loaded cached panel rows={len(option_panel)} trades={len(oracle_trades)}",
+            flush=True,
+        )
     else:
+        stage_started = perf_counter()
         warehouse = Warehouse()
         price_frames = _load_price_frames(
             warehouse,
@@ -94,6 +104,13 @@ def main() -> None:
             start=str(args.start_date),
             end=str(args.end_date),
         )
+        timings["load_price_frames_seconds"] = float(perf_counter() - stage_started)
+        print(
+            f"[option-selector] loaded price frames symbols={len(price_frames)}/{len(symbols)} "
+            f"seconds={timings['load_price_frames_seconds']:.2f}",
+            flush=True,
+        )
+        stage_started = perf_counter()
         spec = LabelBuildSpec(
             k_params={"YE": list(range(int(args.k_min), int(args.k_max) + 1))},
             min_profit_pct=0.01,
@@ -107,46 +124,67 @@ def main() -> None:
         trade_result = build_trade_results(symbols, spec=spec, price_frames=price_frames)
         oracle_trades = _normalize_oracle_trades(pd.DataFrame(trade_result.completed_trades))
         oracle_trades = _with_unique_oracle_trade_ids(oracle_trades)
-        option_panel = build_fast_option_candidate_panel(
+        timings["oracle_trade_build_seconds"] = float(perf_counter() - stage_started)
+        print(
+            f"[option-selector] built oracle trades rows={len(oracle_trades)} "
+            f"seconds={timings['oracle_trade_build_seconds']:.2f}",
+            flush=True,
+        )
+        stage_started = perf_counter()
+        option_panel, diagnostics = build_fast_option_candidate_panel_with_diagnostics(
             oracle_trades,
             target_dte=int(args.target_dte),
             max_candidates_per_trade=int(args.max_candidates_per_trade),
             exit_lookback_days=7,
+            progress_every=int(args.progress_every),
         )
+        timings["option_panel_build_seconds"] = float(perf_counter() - stage_started)
+        diagnostics.to_csv(diagnostics_path, index=False)
         oracle_trades.to_parquet(trades_path, index=False)
         option_panel.to_parquet(panel_path, index=False)
+        _write_candidate_diagnostic_summary(diagnostics, out_dir / "option_candidate_diagnostics_summary.csv")
+        print(
+            f"[option-selector] built option panel rows={len(option_panel)} "
+            f"trade_windows={option_panel['trade_id'].nunique() if not option_panel.empty else 0} "
+            f"seconds={timings['option_panel_build_seconds']:.2f}",
+            flush=True,
+        )
 
+    stage_started = perf_counter()
     option_panel = add_mean_variance_oracle_labels(
         option_panel,
         risk_aversion=float(args.mv_risk_aversion),
         max_weight=float(args.mv_max_weight),
     )
     option_panel.to_parquet(panel_path, index=False)
+    timings["mean_variance_label_seconds"] = float(perf_counter() - stage_started)
+    print(
+        f"[option-selector] labeled mean-variance rows={len(option_panel)} "
+        f"seconds={timings['mean_variance_label_seconds']:.2f}",
+        flush=True,
+    )
 
-    ranker_outputs = {
-        "rank_y": _run_family_ranker(
+    ranker_outputs = {}
+    for target_col in ("rank_y", "mv_weight"):
+        stage_started = perf_counter()
+        ranker_outputs[target_col] = _run_family_ranker(
             panel_path=panel_path,
             symbols=symbols,
-            output_dir=out_dir / "family_rankers" / "rank_y",
+            output_dir=out_dir / "family_rankers" / target_col,
             train_end=str(args.train_end),
             eval_start=str(args.eval_start),
             n_estimators=int(args.n_estimators),
-            target_col="rank_y",
+            target_col=target_col,
             enable_pairwise=not bool(args.disable_pairwise_ranker),
             pairwise_pairs_per_trade=int(args.pairwise_pairs_per_trade),
-        ),
-        "mv_weight": _run_family_ranker(
-            panel_path=panel_path,
-            symbols=symbols,
-            output_dir=out_dir / "family_rankers" / "mv_weight",
-            train_end=str(args.train_end),
-            eval_start=str(args.eval_start),
-            n_estimators=int(args.n_estimators),
-            target_col="mv_weight",
-            enable_pairwise=not bool(args.disable_pairwise_ranker),
-            pairwise_pairs_per_trade=int(args.pairwise_pairs_per_trade),
-        ),
-    }
+            log_path=out_dir / f"{target_col}_ranker.log",
+        )
+        timings[f"{target_col}_ranker_seconds"] = float(perf_counter() - stage_started)
+        print(
+            f"[option-selector] completed target={target_col} "
+            f"seconds={timings[f'{target_col}_ranker_seconds']:.2f}",
+            flush=True,
+        )
     (out_dir / "ranker_stdout.json").write_text(ranker_outputs["rank_y"], encoding="utf-8")
     (out_dir / "rank_y_ranker_stdout.json").write_text(ranker_outputs["rank_y"], encoding="utf-8")
     (out_dir / "mv_weight_ranker_stdout.json").write_text(ranker_outputs["mv_weight"], encoding="utf-8")
@@ -159,6 +197,7 @@ def main() -> None:
         "eval_start": str(args.eval_start),
         "mv_risk_aversion": float(args.mv_risk_aversion),
         "mv_max_weight": float(args.mv_max_weight),
+        "timings": timings,
         "elapsed_seconds": float(perf_counter() - started),
     }
     if not option_panel.empty:
@@ -177,6 +216,7 @@ def main() -> None:
             }
         )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    (out_dir / "timings.json").write_text(json.dumps(timings, indent=2, default=str), encoding="utf-8")
     print(json.dumps(summary, indent=2, default=str))
     print(ranker_outputs["rank_y"])
     print(ranker_outputs["mv_weight"])
@@ -193,6 +233,7 @@ def _run_family_ranker(
     target_col: str,
     enable_pairwise: bool,
     pairwise_pairs_per_trade: int,
+    log_path: Path,
 ) -> str:
     command = [
         sys.executable,
@@ -217,8 +258,10 @@ def _run_family_ranker(
     ]
     if not enable_pairwise:
         command.append("--disable-pairwise-ranker")
-    ranker = subprocess.run(command, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
-    return ranker.stdout
+    print(f"[option-selector] starting ranker target={target_col} log={log_path}", flush=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        subprocess.run(command, cwd=REPO_ROOT, check=True, stdout=log, stderr=subprocess.STDOUT, text=True)
+    return log_path.read_text(encoding="utf-8")
 
 
 def build_fast_option_candidate_panel(
@@ -228,12 +271,33 @@ def build_fast_option_candidate_panel(
     max_candidates_per_trade: int,
     exit_lookback_days: int,
 ) -> pd.DataFrame:
+    panel, _diagnostics = build_fast_option_candidate_panel_with_diagnostics(
+        trades,
+        target_dte=target_dte,
+        max_candidates_per_trade=max_candidates_per_trade,
+        exit_lookback_days=exit_lookback_days,
+        progress_every=0,
+    )
+    return panel
+
+
+def build_fast_option_candidate_panel_with_diagnostics(
+    trades: pd.DataFrame,
+    *,
+    target_dte: int,
+    max_candidates_per_trade: int,
+    exit_lookback_days: int,
+    progress_every: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
+    diagnostics = []
     quote_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame] = {}
     chain_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame] = {}
     underlying_cache: dict[tuple[str, pd.Timestamp], float | None] = {}
-    for trade in trades.sort_values(["entry_date", "symbol", "side"]).to_dict("records"):
-        frame = _candidate_rows_for_trade(
+    records = trades.sort_values(["entry_date", "symbol", "side"]).to_dict("records")
+    started = perf_counter()
+    for index, trade in enumerate(records, start=1):
+        frame, diagnostic = _candidate_rows_for_trade_with_diagnostics(
             trade,
             target_dte=target_dte,
             max_candidates_per_trade=max_candidates_per_trade,
@@ -242,15 +306,24 @@ def build_fast_option_candidate_panel(
             chain_cache=chain_cache,
             underlying_cache=underlying_cache,
         )
+        diagnostics.append(diagnostic)
         if not frame.empty:
             rows.append(frame)
+        if int(progress_every) > 0 and (index % int(progress_every) == 0 or index == len(records)):
+            selected = sum(1 for item in diagnostics if item.get("status") == "ok")
+            print(
+                f"[option-selector] option panel progress {index}/{len(records)} "
+                f"selected_trades={selected} rows={sum(len(row) for row in rows)} "
+                f"elapsed={perf_counter() - started:.1f}s",
+                flush=True,
+            )
     if not rows:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(diagnostics)
     panel = pd.concat(rows, ignore_index=True)
     panel["option_return"] = pd.to_numeric(panel["option_return"], errors="coerce")
     panel = panel.dropna(subset=["option_return"])
     panel["rank_y"] = panel.groupby("trade_id")["option_return"].rank(method="average", pct=True, ascending=True)
-    return panel.reset_index(drop=True)
+    return panel.reset_index(drop=True), pd.DataFrame(diagnostics)
 
 
 def add_mean_variance_oracle_labels(
@@ -311,21 +384,58 @@ def _candidate_rows_for_trade(
     chain_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame],
     underlying_cache: dict[tuple[str, pd.Timestamp], float | None],
 ) -> pd.DataFrame:
+    frame, _diagnostic = _candidate_rows_for_trade_with_diagnostics(
+        trade,
+        target_dte=target_dte,
+        max_candidates_per_trade=max_candidates_per_trade,
+        exit_lookback_days=exit_lookback_days,
+        quote_cache=quote_cache,
+        chain_cache=chain_cache,
+        underlying_cache=underlying_cache,
+    )
+    return frame
+
+
+def _candidate_rows_for_trade_with_diagnostics(
+    trade: dict[str, Any],
+    *,
+    target_dte: int,
+    max_candidates_per_trade: int,
+    exit_lookback_days: int,
+    quote_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame],
+    chain_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame],
+    underlying_cache: dict[tuple[str, pd.Timestamp], float | None],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     symbol = str(trade["symbol"]).upper()
     side = str(trade["side"]).lower()
     entry_date = pd.Timestamp(trade["entry_date"]).normalize()
     equity_exit_date = pd.Timestamp(trade["exit_date"]).normalize()
+    diagnostic = {
+        "trade_id": trade.get("trade_id", f"{symbol}|{entry_date.date()}|{side}"),
+        "symbol": symbol,
+        "side": side,
+        "entry_date": entry_date,
+        "equity_exit_date": equity_exit_date,
+        "status": "unknown",
+        "entry_chain_rows": 0,
+        "candidate_rows": 0,
+        "priced_rows": 0,
+    }
     entry_chain = _load_day_chain(symbol, entry_date, chain_cache=chain_cache)
+    diagnostic["entry_chain_rows"] = int(len(entry_chain))
     if entry_chain.empty:
-        return pd.DataFrame()
+        diagnostic["status"] = "missing_rich_entry_chain"
+        return pd.DataFrame(), diagnostic
     spot = _chain_underlying_price(entry_chain)
     if spot is None:
-        return pd.DataFrame()
+        diagnostic["status"] = "missing_underlying_price"
+        return pd.DataFrame(), diagnostic
     candidates = entry_chain.copy()
     candidates["option_type"] = candidates["option_type"].astype(str).str.lower().str.strip()
     candidates = candidates.loc[candidates["option_type"].str.startswith(("c", "p"))].copy()
     if candidates.empty:
-        return candidates
+        diagnostic["status"] = "missing_call_put_contracts"
+        return candidates, diagnostic
     candidates["option_type"] = np.where(candidates["option_type"].str.startswith("c"), "call", "put")
     candidates = build_panel_weight_thetadata_option_contract_features(
         candidates,
@@ -334,8 +444,10 @@ def _candidate_rows_for_trade(
         compute_model_greeks=False,
     ).df
     candidates = _filter_and_rank_entry_candidates(candidates, max_candidates_per_trade=max_candidates_per_trade)
+    diagnostic["candidate_rows"] = int(len(candidates))
     if candidates.empty:
-        return candidates
+        diagnostic["status"] = "no_entry_candidates_after_filter"
+        return candidates, diagnostic
     candidates["option_action"] = np.select(
         [
             (side == "long") & candidates["option_type"].eq("call"),
@@ -347,8 +459,10 @@ def _candidate_rows_for_trade(
         default="",
     )
     candidates = candidates.loc[candidates["option_action"].ne("")].copy()
+    diagnostic["directional_candidate_rows"] = int(len(candidates))
     if candidates.empty:
-        return candidates
+        diagnostic["status"] = "no_directional_candidates"
+        return candidates, diagnostic
     priced = _price_candidate_exits(
         candidates,
         symbol=symbol,
@@ -358,8 +472,10 @@ def _candidate_rows_for_trade(
         underlying_cache=underlying_cache,
         exit_lookback_days=exit_lookback_days,
     )
+    diagnostic["priced_rows"] = int(len(priced))
     if priced.empty:
-        return priced
+        diagnostic["status"] = "no_priced_exit"
+        return priced, diagnostic
     priced.insert(0, "trade_id", trade.get("trade_id", f"{symbol}|{entry_date.date()}|{side}"))
     priced.insert(1, "symbol", symbol)
     priced.insert(2, "side", side)
@@ -371,7 +487,36 @@ def _candidate_rows_for_trade(
     for col in ("freq", "k", "entry_px", "exit_px", "ret_pct", "hold_days"):
         if col in trade:
             priced[col] = trade[col]
-    return priced.reset_index(drop=True)
+            diagnostic[col] = trade[col]
+    diagnostic["status"] = "ok"
+    return priced.reset_index(drop=True), diagnostic
+
+
+def _write_candidate_diagnostic_summary(diagnostics: pd.DataFrame, path: Path) -> None:
+    if diagnostics.empty:
+        diagnostics.to_csv(path, index=False)
+        return
+    work = diagnostics.copy()
+    rows = []
+    for (symbol, status), group in work.groupby(["symbol", "status"], dropna=False):
+        rows.append(
+            {
+                "symbol": symbol,
+                "status": status,
+                "trades": int(len(group)),
+                "entry_chain_rows": _sum_optional_numeric(group, "entry_chain_rows"),
+                "candidate_rows": _sum_optional_numeric(group, "candidate_rows"),
+                "priced_rows": _sum_optional_numeric(group, "priced_rows"),
+            }
+        )
+    summary = pd.DataFrame(rows).sort_values(["symbol", "status"]).reset_index(drop=True)
+    summary.to_csv(path, index=False)
+
+
+def _sum_optional_numeric(frame: pd.DataFrame, column: str) -> int:
+    if column not in frame.columns:
+        return 0
+    return int(pd.to_numeric(frame[column], errors="coerce").fillna(0).sum())
 
 
 def _filter_and_rank_entry_candidates(chain: pd.DataFrame, *, max_candidates_per_trade: int) -> pd.DataFrame:

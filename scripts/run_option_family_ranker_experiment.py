@@ -165,6 +165,12 @@ def main() -> None:
         for name, metrics in oracle_baskets.items()
     ]
     basket_rows.extend(_basket_rows("option_only", baseline["metrics"]))
+    print(
+        f"[option-family-ranker] target={target_col} option_rows={len(option_panel)} "
+        f"train_rows={len(train_base)} eval_rows={len(eval_base)} families={len(requested_families)} "
+        f"option_only_elapsed={perf_counter() - started:.2f}s",
+        flush=True,
+    )
     for family_index, (source, family) in enumerate(requested_families):
         family_started = perf_counter()
         family_dir = out_dir / _safe_family_dir(source, family)
@@ -276,6 +282,14 @@ def main() -> None:
         feature_metadata.to_csv(family_dir / "feature_metadata.csv", index=False)
         feature_quality.to_csv(family_dir / "feature_quality.csv", index=False)
         (family_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+        print(
+            f"[option-family-ranker] target={target_col} "
+            f"family={family_index + 1}/{len(requested_families)} {source}.{family} "
+            f"features={len(family_features)} elapsed={summary['elapsed_seconds']:.2f}s "
+            f"top_k_mean={family_aware['metrics']['top_k_equal_weight_basket'].get('mean_return')} "
+            f"pairwise_top_k_mean={family_aware['metrics'].get('pairwise_top_k_equal_weight_basket', {}).get('mean_return')}",
+            flush=True,
+        )
     summary = {
         "option_panel": str(Path(args.option_panel).expanduser().resolve()),
         "target_col": target_col,
