@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
+import numpy as np
 
 from quant_orchestrator.platforms.backtesting_frameworks.optimal_trader import (
+    build_moe_ranked_scores,
     OptimalTraderBacktestConfig,
     action_tape_to_trade_windows,
+    replay_moe_paper_top_k_rule,
     replay_option_portfolio_from_selected_paths,
     replay_trading_app_top_k_rule,
     load_strategy_dataset_artifact,
     run_optimal_trader_equity_backtest,
+    score_moe_family_panel,
 )
 from quant_orchestrator.platforms.registry import registry
 
@@ -137,6 +141,91 @@ def test_trading_app_rule_replay_builds_shifted_action_tape_and_trade_windows() 
     ]
     assert replay.equity.loc[pd.Timestamp("2024-01-03")] == pytest.approx(100_000.0 * (120.0 / 110.0))
     assert replay.trade_windows["equity_entry_notional"].iloc[0] == pytest.approx(100_000.0)
+
+
+def test_moe_ranked_scores_select_top_k_by_prob_buy() -> None:
+    latest = pd.DataFrame(
+        {"close": [100.0, 200.0, 300.0], "prob_buy": [0.7, 0.9, 0.4]},
+        index=pd.Index(["AAA", "BBB", "CCC"], name="symbol"),
+    )
+
+    ranked = build_moe_ranked_scores(latest, top_k=1, threshold=0.5)
+
+    assert ranked.index.tolist() == ["BBB", "AAA", "CCC"]
+    assert ranked["selected"].tolist() == [True, False, False]
+
+
+def test_moe_family_panel_scores_average_available_family_models() -> None:
+    panel = pd.DataFrame(
+        {
+            "date": ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
+            "symbol": ["AAA", "BBB", "AAA", "BBB"],
+            "close": [100.0, 200.0, 110.0, 190.0],
+            "family_a__x": [1.0, -1.0, 2.0, -2.0],
+            "family_b__x": [0.5, 0.5, None, None],
+        }
+    )
+    models = {
+        "family_a": _ConstantFeatureModel("family_a__x"),
+        "family_b": _ConstantFeatureModel("family_b__x"),
+    }
+    metadata = {
+        "trained_families": ["family_a", "family_b"],
+        "feature_family_weights": {"family_a": 1.0, "family_b": 1.0},
+        "feature_list_by_family": {
+            "family_a": ["family_a__x"],
+            "family_b": ["family_b__x"],
+        },
+    }
+
+    scored = score_moe_family_panel(panel, models=models, metadata=metadata)
+
+    assert scored.loc[(pd.Timestamp("2024-01-01"), "AAA"), "prob_buy"] == pytest.approx((0.75 + 0.625) / 2)
+    assert scored.loc[(pd.Timestamp("2024-01-02"), "AAA"), "prob_buy"] == pytest.approx(1.0)
+    assert scored.loc[(pd.Timestamp("2024-01-02"), "AAA"), "classifier_available_families"] == 1
+
+
+def test_moe_paper_rule_replay_uses_shifted_top_k_scores() -> None:
+    panel = pd.DataFrame(
+        {
+            "date": ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02", "2024-01-03", "2024-01-03"],
+            "symbol": ["AAA", "BBB", "AAA", "BBB", "AAA", "BBB"],
+            "close": [100.0, 100.0, 110.0, 100.0, 120.0, 90.0],
+            "prob_buy": [0.9, 0.4, 0.3, 0.8, 0.3, 0.8],
+        }
+    )
+
+    replay = replay_moe_paper_top_k_rule(
+        panel,
+        top_k=1,
+        threshold=0.5,
+        initial_balance=100_000.0,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+    )
+
+    assert replay.action_tape[["date", "symbol", "action", "reason"]].to_dict("records") == [
+        {
+            "date": pd.Timestamp("2024-01-02"),
+            "symbol": "AAA",
+            "action": "buy",
+            "reason": "entry_moe_top_k",
+        },
+        {
+            "date": pd.Timestamp("2024-01-03"),
+            "symbol": "AAA",
+            "action": "sell",
+            "reason": "exit_moe_top_k_or_invalid",
+        },
+        {
+            "date": pd.Timestamp("2024-01-03"),
+            "symbol": "BBB",
+            "action": "buy",
+            "reason": "entry_moe_top_k",
+        },
+    ]
+    assert replay.trade_windows.loc[0, "symbol"] == "AAA"
+    assert replay.trade_windows.loc[0, "ret_dec"] == pytest.approx((120.0 / 110.0) - 1.0)
 
 
 def test_action_tape_to_trade_windows_ignores_unfunded_buys() -> None:
@@ -283,3 +372,13 @@ def _scored_panel() -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows).set_index(["date", "symbol"]).sort_index()
+
+
+class _ConstantFeatureModel:
+    def __init__(self, feature: str) -> None:
+        self._used_features = [feature]
+
+    def predict_proba(self, frame: pd.DataFrame) -> np.ndarray:
+        values = pd.to_numeric(frame[self._used_features[0]], errors="coerce").fillna(0.0).clip(-2.0, 2.0)
+        prob = ((values + 2.0) / 4.0).to_numpy(dtype=float)
+        return np.column_stack([1.0 - prob, prob])

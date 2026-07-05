@@ -12,6 +12,11 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
+from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
+    StrategyArtifactBundle,
+    write_strategy_artifacts,
+)
+
 
 @dataclass(frozen=True)
 class OptimalTraderArtifactReplayConfig:
@@ -1355,6 +1360,19 @@ def write_artifact_replay_outputs(result: OptimalTraderArtifactReplayResult, out
     result.rule_replay.executions.to_csv(paths["equity_executions"], index=False)
     result.rule_replay.positions.reset_index(names="date").to_parquet(paths["positions"], index=False)
     result.rule_replay.trade_windows.to_parquet(paths["trade_windows"], index=False)
+    standard_paths = write_strategy_artifacts(
+        StrategyArtifactBundle(
+            feature_panel=result.feature_panel,
+            scored_panel=result.scored_panel,
+            action_tape=result.rule_replay.action_tape,
+            trade_windows=result.rule_replay.trade_windows,
+            summary=result.summary,
+            strategy_name="optimal_trader.trading_app",
+        ),
+        out_dir,
+        extra_paths=paths,
+    )
+    paths.update({f"standard_{key}": value for key, value in standard_paths.items()})
     if result.option_execution is not None:
         result.option_execution.selected_option_trades.to_parquet(paths["selected_option_trades"], index=False)
         result.option_execution.selected_option_paths.to_parquet(paths["selected_option_paths"], index=False)
