@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import subprocess
 import sys
@@ -31,6 +32,10 @@ from quant_warehouse.platforms.data_providers.fmp.target_engineering import (  #
 from quant_warehouse.platforms.data_providers.thetadata.settlement import (  # noqa: E402
     iter_option_exit_lookup_dates,
     option_intrinsic_value,
+)
+from quant_warehouse.platforms.data_providers.thetadata.options import (  # noqa: E402
+    THETADATA_RICH_OPTION_COLUMNS,
+    option_chain_cached_date_summary,
 )
 
 
@@ -74,7 +79,13 @@ def main() -> None:
     parser.add_argument("--disable-pairwise-ranker", action="store_true")
     parser.add_argument("--pairwise-pairs-per-trade", type=int, default=20)
     parser.add_argument("--progress-every", type=int, default=250)
-    parser.add_argument("--skip-panel", action="store_true")
+    parser.add_argument("--skip-panel", action="store_true", help="Deprecated alias for loading output-dir/option_candidate_panel.parquet.")
+    parser.add_argument("--input-panel", default="", help="Optional existing option candidate panel to train from.")
+    parser.add_argument("--input-trades", default="", help="Optional existing oracle trades parquet used only for run summaries.")
+    parser.add_argument("--panel-only", action="store_true", help="Build/cache the option panel and stop before model training.")
+    parser.add_argument("--train-only", action="store_true", help="Load an existing panel and run model training only.")
+    parser.add_argument("--panel-workers", type=int, default=1, help="Number of symbol-level workers for option panel construction.")
+    parser.add_argument("--skip-rich-preflight", action="store_true", help="Skip the lightweight rich ThetaData entry-date coverage gate.")
     args = parser.parse_args()
 
     started = perf_counter()
@@ -85,14 +96,34 @@ def main() -> None:
     panel_path = out_dir / "option_candidate_panel.parquet"
     trades_path = out_dir / "oracle_trades.parquet"
     diagnostics_path = out_dir / "option_candidate_diagnostics.csv"
+    input_panel_path = Path(args.input_panel).expanduser().resolve() if str(args.input_panel).strip() else None
+    input_trades_path = Path(args.input_trades).expanduser().resolve() if str(args.input_trades).strip() else None
 
-    if args.skip_panel and panel_path.exists():
+    should_load_panel = bool(args.train_only or args.skip_panel or input_panel_path is not None)
+    cached_panel_path = input_panel_path or panel_path
+    cached_trades_path = input_trades_path or trades_path
+    if should_load_panel:
         stage_started = perf_counter()
-        option_panel = pd.read_parquet(panel_path)
-        oracle_trades = pd.read_parquet(trades_path) if trades_path.exists() else pd.DataFrame()
+        if not cached_panel_path.exists():
+            raise FileNotFoundError(f"Missing cached option panel: {cached_panel_path}")
+        option_panel = pd.read_parquet(cached_panel_path)
+        oracle_trades = pd.read_parquet(cached_trades_path) if cached_trades_path.exists() else pd.DataFrame()
+        if symbols and "symbol" in option_panel.columns:
+            option_panel["symbol"] = option_panel["symbol"].astype(str).str.upper()
+            option_panel = option_panel.loc[option_panel["symbol"].isin(set(symbols))].copy()
+            if option_panel.empty:
+                raise ValueError(f"cached option panel has no rows for requested symbols: {list(symbols)}")
+        if symbols and not oracle_trades.empty and "symbol" in oracle_trades.columns:
+            oracle_trades["symbol"] = oracle_trades["symbol"].astype(str).str.upper()
+            oracle_trades = oracle_trades.loc[oracle_trades["symbol"].isin(set(symbols))].copy()
+        if cached_panel_path != panel_path:
+            option_panel.to_parquet(panel_path, index=False)
+            if not oracle_trades.empty:
+                oracle_trades.to_parquet(trades_path, index=False)
         timings["load_cached_panel_seconds"] = float(perf_counter() - stage_started)
         print(
-            f"[option-selector] loaded cached panel rows={len(option_panel)} trades={len(oracle_trades)}",
+            f"[option-selector] loaded cached panel rows={len(option_panel)} trades={len(oracle_trades)} "
+            f"path={cached_panel_path}",
             flush=True,
         )
     else:
@@ -130,6 +161,21 @@ def main() -> None:
             f"seconds={timings['oracle_trade_build_seconds']:.2f}",
             flush=True,
         )
+        preflight_diagnostics = pd.DataFrame()
+        if not bool(args.skip_rich_preflight):
+            stage_started = perf_counter()
+            oracle_trades, preflight_diagnostics = _apply_rich_entry_preflight(
+                oracle_trades,
+                workers=max(1, int(args.panel_workers)),
+            )
+            timings["rich_entry_preflight_seconds"] = float(perf_counter() - stage_started)
+            preflight_diagnostics.to_csv(out_dir / "rich_entry_preflight.csv", index=False)
+            print(
+                f"[option-selector] rich preflight kept_trades={len(oracle_trades)} "
+                f"missing_trades={_sum_optional_numeric(preflight_diagnostics, 'missing_trade_count')} "
+                f"seconds={timings['rich_entry_preflight_seconds']:.2f}",
+                flush=True,
+            )
         stage_started = perf_counter()
         option_panel, diagnostics = build_fast_option_candidate_panel_with_diagnostics(
             oracle_trades,
@@ -137,7 +183,12 @@ def main() -> None:
             max_candidates_per_trade=int(args.max_candidates_per_trade),
             exit_lookback_days=7,
             progress_every=int(args.progress_every),
+            workers=max(1, int(args.panel_workers)),
         )
+        if not preflight_diagnostics.empty:
+            missing_rows = _missing_rich_trade_diagnostics(preflight_diagnostics)
+            if not missing_rows.empty:
+                diagnostics = pd.concat([diagnostics, missing_rows], ignore_index=True, sort=False)
         timings["option_panel_build_seconds"] = float(perf_counter() - stage_started)
         diagnostics.to_csv(diagnostics_path, index=False)
         oracle_trades.to_parquet(trades_path, index=False)
@@ -164,6 +215,23 @@ def main() -> None:
         flush=True,
     )
 
+    if bool(args.panel_only):
+        summary = _write_run_summary(
+            out_dir=out_dir,
+            symbols=symbols,
+            oracle_trades=oracle_trades,
+            option_panel=option_panel,
+            panel_path=panel_path,
+            train_end=str(args.train_end),
+            eval_start=str(args.eval_start),
+            mv_risk_aversion=float(args.mv_risk_aversion),
+            mv_max_weight=float(args.mv_max_weight),
+            timings=timings,
+            started=started,
+        )
+        print(json.dumps(summary, indent=2, default=str))
+        return
+
     ranker_outputs = {}
     for target_col in ("rank_y", "mv_weight"):
         stage_started = perf_counter()
@@ -188,35 +256,19 @@ def main() -> None:
     (out_dir / "ranker_stdout.json").write_text(ranker_outputs["rank_y"], encoding="utf-8")
     (out_dir / "rank_y_ranker_stdout.json").write_text(ranker_outputs["rank_y"], encoding="utf-8")
     (out_dir / "mv_weight_ranker_stdout.json").write_text(ranker_outputs["mv_weight"], encoding="utf-8")
-    summary = {
-        "symbols": symbols,
-        "oracle_trades": int(len(oracle_trades)),
-        "option_rows": int(len(option_panel)),
-        "option_panel": str(panel_path),
-        "train_end": str(args.train_end),
-        "eval_start": str(args.eval_start),
-        "mv_risk_aversion": float(args.mv_risk_aversion),
-        "mv_max_weight": float(args.mv_max_weight),
-        "timings": timings,
-        "elapsed_seconds": float(perf_counter() - started),
-    }
-    if not option_panel.empty:
-        dates = pd.to_datetime(option_panel["entry_date"], errors="coerce")
-        summary.update(
-            {
-                "trade_windows": int(option_panel["trade_id"].nunique()),
-                "min_entry_date": None if dates.dropna().empty else dates.min().date().isoformat(),
-                "max_entry_date": None if dates.dropna().empty else dates.max().date().isoformat(),
-                "train_rows": int(dates.le(pd.Timestamp(args.train_end)).sum()),
-                "eval_rows": int(dates.ge(pd.Timestamp(args.eval_start)).sum()),
-                "train_trades": int(option_panel.loc[dates.le(pd.Timestamp(args.train_end)), "trade_id"].nunique()),
-                "eval_trades": int(option_panel.loc[dates.ge(pd.Timestamp(args.eval_start)), "trade_id"].nunique()),
-                "mv_selected_rows": int(_column_or_default(option_panel, "mv_selected", False).fillna(False).astype(bool).sum()),
-                "mv_weight_sum": float(pd.to_numeric(_column_or_default(option_panel, "mv_weight", 0.0), errors="coerce").fillna(0.0).sum()),
-            }
-        )
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
-    (out_dir / "timings.json").write_text(json.dumps(timings, indent=2, default=str), encoding="utf-8")
+    summary = _write_run_summary(
+        out_dir=out_dir,
+        symbols=symbols,
+        oracle_trades=oracle_trades,
+        option_panel=option_panel,
+        panel_path=panel_path,
+        train_end=str(args.train_end),
+        eval_start=str(args.eval_start),
+        mv_risk_aversion=float(args.mv_risk_aversion),
+        mv_max_weight=float(args.mv_max_weight),
+        timings=timings,
+        started=started,
+    )
     print(json.dumps(summary, indent=2, default=str))
     print(ranker_outputs["rank_y"])
     print(ranker_outputs["mv_weight"])
@@ -277,6 +329,7 @@ def build_fast_option_candidate_panel(
         max_candidates_per_trade=max_candidates_per_trade,
         exit_lookback_days=exit_lookback_days,
         progress_every=0,
+        workers=1,
     )
     return panel
 
@@ -288,13 +341,94 @@ def build_fast_option_candidate_panel_with_diagnostics(
     max_candidates_per_trade: int,
     exit_lookback_days: int,
     progress_every: int,
+    workers: int = 1,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    records = trades.sort_values(["entry_date", "symbol", "side"]).to_dict("records")
+    if int(workers) > 1 and len(records) > 1:
+        return _build_fast_option_candidate_panel_parallel(
+            records,
+            target_dte=target_dte,
+            max_candidates_per_trade=max_candidates_per_trade,
+            exit_lookback_days=exit_lookback_days,
+            progress_every=progress_every,
+            workers=workers,
+        )
+    return _build_fast_option_candidate_panel_for_records(
+        records,
+        target_dte=target_dte,
+        max_candidates_per_trade=max_candidates_per_trade,
+        exit_lookback_days=exit_lookback_days,
+        progress_every=progress_every,
+    )
+
+
+def _build_fast_option_candidate_panel_parallel(
+    records: list[dict[str, Any]],
+    *,
+    target_dte: int,
+    max_candidates_per_trade: int,
+    exit_lookback_days: int,
+    progress_every: int,
+    workers: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        by_symbol.setdefault(str(record["symbol"]).upper(), []).append(record)
+    rows = []
+    diagnostics = []
+    started = perf_counter()
+    completed = 0
+    total_records = len(records)
+    max_workers = max(1, min(int(workers), len(by_symbol)))
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _build_fast_option_candidate_panel_for_records,
+                symbol_records,
+                target_dte=target_dte,
+                max_candidates_per_trade=max_candidates_per_trade,
+                exit_lookback_days=exit_lookback_days,
+                progress_every=0,
+            ): symbol
+            for symbol, symbol_records in by_symbol.items()
+        }
+        for future in as_completed(futures):
+            symbol = futures[future]
+            panel, symbol_diagnostics = future.result()
+            if not panel.empty:
+                rows.append(panel)
+            if not symbol_diagnostics.empty:
+                diagnostics.append(symbol_diagnostics)
+            completed += len(by_symbol[symbol])
+            if int(progress_every) > 0:
+                selected = sum(
+                    int((diag["status"] == "ok").sum())
+                    for diag in diagnostics
+                    if "status" in diag.columns
+                )
+                row_count = sum(len(row) for row in rows)
+                print(
+                    f"[option-selector] option panel symbol complete {symbol} "
+                    f"progress={completed}/{total_records} selected_trades={selected} "
+                    f"rows={row_count} elapsed={perf_counter() - started:.1f}s",
+                    flush=True,
+                )
+    return _finalize_option_candidate_panel(rows, diagnostics)
+
+
+def _build_fast_option_candidate_panel_for_records(
+    records: list[dict[str, Any]],
+    *,
+    target_dte: int,
+    max_candidates_per_trade: int,
+    exit_lookback_days: int,
+    progress_every: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
     diagnostics = []
     quote_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame] = {}
     chain_cache: dict[tuple[str, pd.Timestamp], pd.DataFrame] = {}
     underlying_cache: dict[tuple[str, pd.Timestamp], float | None] = {}
-    records = trades.sort_values(["entry_date", "symbol", "side"]).to_dict("records")
     started = perf_counter()
     for index, trade in enumerate(records, start=1):
         frame, diagnostic = _candidate_rows_for_trade_with_diagnostics(
@@ -317,13 +451,25 @@ def build_fast_option_candidate_panel_with_diagnostics(
                 f"elapsed={perf_counter() - started:.1f}s",
                 flush=True,
             )
+    return _finalize_option_candidate_panel(rows, [pd.DataFrame(diagnostics)])
+
+
+def _finalize_option_candidate_panel(
+    rows: list[pd.DataFrame],
+    diagnostic_frames: list[pd.DataFrame],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    diagnostics = (
+        pd.concat([frame for frame in diagnostic_frames if not frame.empty], ignore_index=True, sort=False)
+        if diagnostic_frames
+        else pd.DataFrame()
+    )
     if not rows:
-        return pd.DataFrame(), pd.DataFrame(diagnostics)
+        return pd.DataFrame(), diagnostics
     panel = pd.concat(rows, ignore_index=True)
     panel["option_return"] = pd.to_numeric(panel["option_return"], errors="coerce")
     panel = panel.dropna(subset=["option_return"])
     panel["rank_y"] = panel.groupby("trade_id")["option_return"].rank(method="average", pct=True, ascending=True)
-    return panel.reset_index(drop=True), pd.DataFrame(diagnostics)
+    return panel.reset_index(drop=True), diagnostics
 
 
 def add_mean_variance_oracle_labels(
@@ -366,6 +512,148 @@ def add_mean_variance_oracle_labels(
     if "mv_selected" in labeled.columns:
         labeled["mv_selected"] = labeled["mv_selected"].fillna(False).astype(bool)
     return labeled.reset_index(drop=True)
+
+
+def _apply_rich_entry_preflight(
+    trades: pd.DataFrame,
+    *,
+    workers: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if trades.empty:
+        return trades.copy(), pd.DataFrame()
+    work = trades.copy()
+    work["_entry_date_norm"] = pd.to_datetime(work["entry_date"], errors="coerce").dt.normalize()
+    work["symbol"] = work["symbol"].astype(str).str.upper()
+    work = work.dropna(subset=["_entry_date_norm"])
+    if work.empty:
+        return work.drop(columns=["_entry_date_norm"], errors="ignore"), pd.DataFrame()
+
+    symbol_ranges = []
+    for symbol, group in work.groupby("symbol", sort=True):
+        dates = group["_entry_date_norm"].dropna()
+        if dates.empty:
+            continue
+        symbol_ranges.append((str(symbol), pd.Timestamp(dates.min()), pd.Timestamp(dates.max())))
+
+    cached_dates_by_symbol: dict[str, set[pd.Timestamp]] = {}
+    row_counts_by_symbol: dict[str, int] = {}
+    max_workers = max(1, min(int(workers), len(symbol_ranges) or 1))
+    if max_workers == 1:
+        for symbol, start_date, end_date in symbol_ranges:
+            cached_dates, row_count = _rich_cached_dates_for_symbol(symbol, start_date, end_date)
+            cached_dates_by_symbol[symbol] = cached_dates
+            row_counts_by_symbol[symbol] = row_count
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_rich_cached_dates_for_symbol, symbol, start_date, end_date): symbol
+                for symbol, start_date, end_date in symbol_ranges
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                cached_dates, row_count = future.result()
+                cached_dates_by_symbol[symbol] = cached_dates
+                row_counts_by_symbol[symbol] = row_count
+
+    has_rich = work.apply(
+        lambda row: pd.Timestamp(row["_entry_date_norm"]).normalize()
+        in cached_dates_by_symbol.get(str(row["symbol"]).upper(), set()),
+        axis=1,
+    )
+    kept = work.loc[has_rich].drop(columns=["_entry_date_norm"], errors="ignore").reset_index(drop=True)
+    missing = work.loc[~has_rich].copy()
+    if missing.empty:
+        return kept, pd.DataFrame()
+
+    diagnostics = pd.DataFrame(
+        {
+            "trade_id": missing.get("trade_id", pd.Series(index=missing.index, dtype=object)),
+            "symbol": missing["symbol"].astype(str).str.upper(),
+            "side": missing.get("side", pd.Series(index=missing.index, dtype=object)),
+            "entry_date": missing["_entry_date_norm"],
+            "equity_exit_date": pd.to_datetime(missing.get("exit_date"), errors="coerce").dt.normalize()
+            if "exit_date" in missing.columns
+            else pd.NaT,
+            "status": "missing_rich_entry_chain",
+            "entry_chain_rows": 0,
+            "candidate_rows": 0,
+            "priced_rows": 0,
+            "missing_trade_count": 1,
+            "preflight": True,
+        }
+    )
+    diagnostics["symbol_cached_rich_rows"] = diagnostics["symbol"].map(row_counts_by_symbol).fillna(0).astype(int)
+    return kept, diagnostics.reset_index(drop=True)
+
+
+def _rich_cached_dates_for_symbol(
+    symbol: str,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> tuple[set[pd.Timestamp], int]:
+    try:
+        cached_dates, row_count = option_chain_cached_date_summary(
+            str(symbol).upper(),
+            start_date=start_date,
+            end_date=end_date,
+            required_columns=THETADATA_RICH_OPTION_COLUMNS,
+        )
+    except Exception as exc:  # Keep preflight as a gate, not a hard failure path.
+        print(f"[option-selector] rich preflight error symbol={symbol}: {exc}", flush=True)
+        return set(), 0
+    return {pd.Timestamp(value).normalize() for value in cached_dates}, int(row_count)
+
+
+def _missing_rich_trade_diagnostics(preflight_diagnostics: pd.DataFrame) -> pd.DataFrame:
+    if preflight_diagnostics.empty:
+        return pd.DataFrame()
+    return preflight_diagnostics.copy()
+
+
+def _write_run_summary(
+    *,
+    out_dir: Path,
+    symbols: tuple[str, ...],
+    oracle_trades: pd.DataFrame,
+    option_panel: pd.DataFrame,
+    panel_path: Path,
+    train_end: str,
+    eval_start: str,
+    mv_risk_aversion: float,
+    mv_max_weight: float,
+    timings: dict[str, float],
+    started: float,
+) -> dict[str, Any]:
+    summary = {
+        "symbols": symbols,
+        "oracle_trades": int(len(oracle_trades)),
+        "option_rows": int(len(option_panel)),
+        "option_panel": str(panel_path),
+        "train_end": str(train_end),
+        "eval_start": str(eval_start),
+        "mv_risk_aversion": float(mv_risk_aversion),
+        "mv_max_weight": float(mv_max_weight),
+        "timings": timings,
+        "elapsed_seconds": float(perf_counter() - started),
+    }
+    if not option_panel.empty:
+        dates = pd.to_datetime(option_panel["entry_date"], errors="coerce")
+        summary.update(
+            {
+                "trade_windows": int(option_panel["trade_id"].nunique()),
+                "min_entry_date": None if dates.dropna().empty else dates.min().date().isoformat(),
+                "max_entry_date": None if dates.dropna().empty else dates.max().date().isoformat(),
+                "train_rows": int(dates.le(pd.Timestamp(train_end)).sum()),
+                "eval_rows": int(dates.ge(pd.Timestamp(eval_start)).sum()),
+                "train_trades": int(option_panel.loc[dates.le(pd.Timestamp(train_end)), "trade_id"].nunique()),
+                "eval_trades": int(option_panel.loc[dates.ge(pd.Timestamp(eval_start)), "trade_id"].nunique()),
+                "mv_selected_rows": int(_column_or_default(option_panel, "mv_selected", False).fillna(False).astype(bool).sum()),
+                "mv_weight_sum": float(pd.to_numeric(_column_or_default(option_panel, "mv_weight", 0.0), errors="coerce").fillna(0.0).sum()),
+            }
+        )
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    (out_dir / "timings.json").write_text(json.dumps(timings, indent=2, default=str), encoding="utf-8")
+    return summary
 
 
 def _column_or_default(frame: pd.DataFrame, column: str, default: Any) -> pd.Series:
