@@ -16,12 +16,19 @@ They are examples, not required paths:
 
 The notebooks should stay focused on orchestration patterns. They should not become the place where reusable platform code lives, and the notebook directory should contain notebook files only.
 
+The durable boundary is the produced artifact, not the ingredients used to create it. A strategy may come from a native backtesting framework, a notebook, saved optimal_trader models, or an external research artifact. Quant Orchestrator should not require those producers to share one input pipeline. It should require the reusable outputs to follow stable contracts:
+
+- `trade_list`: the canonical list of closed equity trades consumed by Monte Carlo, walk-forward summaries, equity-curve analysis, option-equivalent replay, and trade mixing/ensembling. The current backward-compatible file name is `trade_windows.parquet`, and manifests expose it as both `trade_windows` and `trade_list`.
+- `scored_panel`: an optional upstream artifact for strategies that naturally produce full-universe daily scores before translating them into trades.
+- `action_tape`: an optional execution-intent artifact for strategies that need entry/exit auditability before they become closed trades.
+- ML notebooks should standardize produced model outputs and prediction tables only when they are reused downstream. They should not be forced into the strategy artifact contract until they emit a tradable `scored_panel` or `trade_list`.
+
 Current reusable code placement:
 
 - Framework-specific data adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/data_adapter.py`.
 - Framework-specific reporting adapters live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/reporting_adapter.py`.
 - Framework-specific reusable signal runners live under `quant_orchestrator/platforms/backtesting_frameworks/<framework>/runner.py` when they exist. Current runners exist for Zipline Reloaded and NautilusTrader.
-- Standard strategy artifact helpers live in `quant_orchestrator/platforms/backtesting_frameworks/strategy_artifacts.py`.
+- Standard produced-artifact helpers live in `quant_orchestrator/platforms/backtesting_frameworks/strategy_artifacts.py`. New downstream consumers should prefer `read_trade_list_artifact`, `write_trade_list_artifact`, `normalize_trade_list`, and `combine_trade_lists` when they only need closed trades.
 - Generic scored-panel top-k replay lives in `quant_orchestrator/platforms/backtesting_frameworks/scored_panel_replay.py`.
 - optimal_trader historical replay helpers live under `quant_orchestrator/platforms/backtesting_frameworks/optimal_trader/`; live trading and broker code should stay in optimal_trader, not here.
 - Strategy-specific SMA crossover examples live in notebook-facing helpers under `quant_orchestrator/backtests/` until they prove a more durable home.

@@ -14,8 +14,11 @@ FEATURE_PANEL_REQUIRED_COLUMNS = ("date", "symbol")
 SCORED_PANEL_REQUIRED_COLUMNS = ("date", "symbol", "close")
 ACTION_TAPE_REQUIRED_COLUMNS = ("date", "symbol", "action", "price")
 TRADE_WINDOWS_REQUIRED_COLUMNS = ("trade_id", "symbol", "side", "entry_date", "exit_date")
+TRADE_LIST_REQUIRED_COLUMNS = TRADE_WINDOWS_REQUIRED_COLUMNS
 TRADE_WINDOW_SIDES = frozenset({"long", "short"})
 TRADE_WINDOW_NON_NEGATIVE_COLUMNS = ("equity_entry_notional",)
+TRADE_LIST_ARTIFACT_NAME = "trade_list"
+LEGACY_TRADE_WINDOWS_ARTIFACT_NAME = "trade_windows"
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,22 @@ class StrategyArtifactBundle:
     summary_path: Path | None = None
     manifest_path: Path | None = None
 
+    @property
+    def trade_list(self) -> pd.DataFrame | None:
+        """Canonical trade-list artifact.
+
+        The on-disk file is still named ``trade_windows.parquet`` for backward
+        compatibility with the existing notebooks. New downstream code should
+        treat the same table as a trade list: the reusable list of closed equity
+        trades produced by any strategy, framework, notebook, or external model.
+        """
+
+        return self.trade_windows
+
+    @property
+    def trade_list_path(self) -> Path | None:
+        return self.trade_windows_path
+
 
 def write_strategy_artifacts(
     bundle: StrategyArtifactBundle,
@@ -50,7 +69,7 @@ def write_strategy_artifacts(
         ("feature_panel", bundle.feature_panel, FEATURE_PANEL_REQUIRED_COLUMNS),
         ("scored_panel", bundle.scored_panel, SCORED_PANEL_REQUIRED_COLUMNS),
         ("action_tape", bundle.action_tape, ACTION_TAPE_REQUIRED_COLUMNS),
-        ("trade_windows", bundle.trade_windows, TRADE_WINDOWS_REQUIRED_COLUMNS),
+        (LEGACY_TRADE_WINDOWS_ARTIFACT_NAME, bundle.trade_windows, TRADE_LIST_REQUIRED_COLUMNS),
     ):
         if frame is None:
             continue
@@ -63,6 +82,13 @@ def write_strategy_artifacts(
             "rows": int(len(validated)),
             "columns": list(map(str, validated.columns)),
         }
+        if name == LEGACY_TRADE_WINDOWS_ARTIFACT_NAME:
+            manifest_artifacts[TRADE_LIST_ARTIFACT_NAME] = {
+                "path": path.name,
+                "rows": int(len(validated)),
+                "columns": list(map(str, validated.columns)),
+                "alias_of": LEGACY_TRADE_WINDOWS_ARTIFACT_NAME,
+            }
 
     summary_path = out_dir / "summary.json"
     summary_path.write_text(json.dumps(dict(bundle.summary), indent=2, default=str), encoding="utf-8")
@@ -107,8 +133,13 @@ def read_strategy_artifacts(path: str | Path) -> StrategyArtifactBundle:
         resolved_paths[name] = frame_path
         return frame_path
 
-    def read_frame(name: str, required: tuple[str, ...]) -> pd.DataFrame | None:
+    def read_frame(name: str, required: tuple[str, ...], *, aliases: tuple[str, ...] = ()) -> pd.DataFrame | None:
         frame_path = artifact_path(name)
+        if frame_path is None:
+            for alias in aliases:
+                frame_path = artifact_path(alias)
+                if frame_path is not None:
+                    break
         if frame_path is None:
             return None
         if not frame_path.exists():
@@ -121,7 +152,11 @@ def read_strategy_artifacts(path: str | Path) -> StrategyArtifactBundle:
         feature_panel=read_frame("feature_panel", FEATURE_PANEL_REQUIRED_COLUMNS),
         scored_panel=read_frame("scored_panel", SCORED_PANEL_REQUIRED_COLUMNS),
         action_tape=read_frame("action_tape", ACTION_TAPE_REQUIRED_COLUMNS),
-        trade_windows=read_frame("trade_windows", TRADE_WINDOWS_REQUIRED_COLUMNS),
+        trade_windows=read_frame(
+            LEGACY_TRADE_WINDOWS_ARTIFACT_NAME,
+            TRADE_LIST_REQUIRED_COLUMNS,
+            aliases=(TRADE_LIST_ARTIFACT_NAME,),
+        ),
         summary=summary,
         strategy_name=str(manifest.get("strategy_name") or ""),
         base_path=base,
@@ -162,12 +197,99 @@ def validate_strategy_artifact_frame(
         out = out.loc[out["symbol"].ne("")]
     if "action" in out.columns:
         out["action"] = out["action"].astype(str).str.strip().str.lower()
-    if artifact_name == "trade_windows":
+    if artifact_name in {LEGACY_TRADE_WINDOWS_ARTIFACT_NAME, TRADE_LIST_ARTIFACT_NAME}:
         out = _validate_trade_windows(out)
     sort_cols = [column for column in ("date", "entry_date", "symbol", "action") if column in out.columns]
     if sort_cols:
         out = out.sort_values(sort_cols, kind="stable")
     return out.reset_index(drop=True)
+
+
+def normalize_trade_list(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a reusable list of closed equity trades.
+
+    This is the standard downstream handoff for Monte Carlo, option-equivalent
+    replay, equity-curve analysis, and ensemble/mixing experiments. Producers
+    are intentionally unconstrained: a notebook, native backtesting framework,
+    saved optimal_trader artifact, or external system may create this table as
+    long as the emitted artifact satisfies this schema.
+    """
+
+    return validate_strategy_artifact_frame(
+        TRADE_LIST_ARTIFACT_NAME,
+        frame,
+        required_columns=TRADE_LIST_REQUIRED_COLUMNS,
+    )
+
+
+def write_trade_list_artifact(
+    trades: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    strategy_name: str = "",
+    summary: Mapping[str, Any] | None = None,
+    extra_paths: Mapping[str, str | Path] | None = None,
+) -> dict[str, Path]:
+    """Write only the canonical trade-list contract.
+
+    The physical parquet remains ``trade_windows.parquet`` so all existing
+    notebooks and option replay code keep working. The manifest also advertises
+    ``trade_list`` as the canonical artifact name for new consumers.
+    """
+
+    return write_strategy_artifacts(
+        StrategyArtifactBundle(
+            trade_windows=trades,
+            summary=dict(summary or {}),
+            strategy_name=str(strategy_name or ""),
+        ),
+        output_dir,
+        extra_paths=extra_paths,
+    )
+
+
+def read_trade_list_artifact(path: str | Path) -> pd.DataFrame:
+    """Load a trade list from a manifest directory or a direct dataframe file."""
+
+    source = Path(path).expanduser().resolve()
+    if source.is_dir():
+        bundle = read_strategy_artifacts(source)
+        if bundle.trade_list is None:
+            raise FileNotFoundError(f"Strategy artifact manifest has no trade_list/trade_windows artifact: {source}")
+        return bundle.trade_list
+    if not source.exists():
+        raise FileNotFoundError(f"Missing trade-list artifact: {source}")
+    if source.suffix.lower() in {".parquet", ".pq"}:
+        frame = pd.read_parquet(source)
+    elif source.suffix.lower() == ".csv":
+        frame = pd.read_csv(source)
+    elif source.suffix.lower() in {".pkl", ".pickle"}:
+        frame = pd.read_pickle(source)
+    else:
+        raise ValueError(f"Unsupported trade-list artifact format: {source.suffix}")
+    return normalize_trade_list(frame)
+
+
+def combine_trade_lists(
+    sources: Mapping[str, pd.DataFrame | str | Path],
+    *,
+    source_column: str = "artifact_source",
+) -> pd.DataFrame:
+    """Load and stack multiple trade-list artifacts with source attribution."""
+
+    frames: list[pd.DataFrame] = []
+    for source_name, source in sources.items():
+        if isinstance(source, pd.DataFrame):
+            frame = normalize_trade_list(source)
+        else:
+            frame = read_trade_list_artifact(source)
+        frame = frame.copy()
+        if source_column not in frame.columns:
+            frame[source_column] = str(source_name)
+        frames.append(frame)
+    if not frames:
+        return normalize_trade_list(pd.DataFrame(columns=TRADE_LIST_REQUIRED_COLUMNS))
+    return normalize_trade_list(pd.concat(frames, ignore_index=True, sort=False))
 
 
 def _validate_trade_windows(frame: pd.DataFrame) -> pd.DataFrame:

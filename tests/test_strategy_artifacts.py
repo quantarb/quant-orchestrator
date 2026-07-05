@@ -10,8 +10,12 @@ from quant_orchestrator.platforms.backtesting_frameworks.scored_panel_replay imp
 )
 from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
     StrategyArtifactBundle,
+    combine_trade_lists,
+    normalize_trade_list,
+    read_trade_list_artifact,
     read_strategy_artifacts,
     validate_strategy_artifact_frame,
+    write_trade_list_artifact,
     write_strategy_artifacts,
 )
 
@@ -69,14 +73,18 @@ def test_strategy_artifact_bundle_round_trips_core_contract(tmp_path) -> None:
 
     assert paths["manifest"].exists()
     assert manifest["artifacts"]["scored_panel"]["rows"] == 1
+    assert manifest["artifacts"]["trade_list"]["alias_of"] == "trade_windows"
+    assert manifest["artifacts"]["trade_list"]["path"] == "trade_windows.parquet"
     assert manifest["artifacts"]["legacy_scored_panel"]["path"] == str(legacy_scored_path)
     assert loaded.strategy_name == "test_strategy"
     assert loaded.summary == {"total_return_pct": 1.0}
     assert loaded.manifest_path == tmp_path / "strategy_artifacts_manifest.json"
     assert loaded.trade_windows_path == tmp_path / "trade_windows.parquet"
+    assert loaded.trade_list_path == tmp_path / "trade_windows.parquet"
     assert loaded.scored_panel["symbol"].tolist() == ["AAA"]
     assert loaded.action_tape["action"].tolist() == ["buy"]
     assert loaded.trade_windows["entry_date"].tolist() == [pd.Timestamp("2024-01-02")]
+    assert loaded.trade_list is loaded.trade_windows
 
 
 def test_strategy_artifact_validation_rejects_missing_required_columns() -> None:
@@ -150,3 +158,44 @@ def test_scored_panel_top_k_replay_writes_strategy_contract(tmp_path) -> None:
     assert loaded.scored_panel is not None
     assert loaded.action_tape is not None
     assert loaded.trade_windows is not None
+
+
+def test_trade_list_helpers_load_manifest_direct_file_and_mixed_sources(tmp_path) -> None:
+    trades = pd.DataFrame(
+        {
+            "trade_id": ["b", "a"],
+            "symbol": ["msft", "aapl"],
+            "side": ["LONG", "short"],
+            "entry_date": ["2024-01-03", "2024-01-02"],
+            "exit_date": ["2024-01-10", "2024-01-09"],
+            "equity_entry_notional": [200.0, 100.0],
+        }
+    )
+
+    paths = write_trade_list_artifact(
+        trades,
+        tmp_path / "manifest_source",
+        strategy_name="unit_trades",
+        summary={"producer": "unit"},
+    )
+    direct_path = tmp_path / "direct.parquet"
+    normalize_trade_list(trades).to_parquet(direct_path, index=False)
+
+    manifest_trades = read_trade_list_artifact(tmp_path / "manifest_source")
+    direct_trades = read_trade_list_artifact(direct_path)
+    combined = combine_trade_lists(
+        {
+            "manifest": tmp_path / "manifest_source",
+            "direct": direct_path,
+            "memory": trades,
+        }
+    )
+
+    assert paths["trade_windows"].name == "trade_windows.parquet"
+    assert manifest_trades["symbol"].tolist() == ["AAPL", "MSFT"]
+    assert direct_trades["side"].tolist() == ["short", "long"]
+    assert combined["artifact_source"].value_counts().to_dict() == {
+        "direct": 2,
+        "manifest": 2,
+        "memory": 2,
+    }

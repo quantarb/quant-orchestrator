@@ -16,8 +16,12 @@ from quant_orchestrator.platforms.backtesting_frameworks.scored_panel_replay imp
 )
 from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
     StrategyArtifactBundle,
+    combine_trade_lists,
+    normalize_trade_list,
+    read_trade_list_artifact,
     read_strategy_artifacts,
     validate_strategy_artifact_frame,
+    write_trade_list_artifact,
     write_strategy_artifacts,
 )
 from quant_orchestrator.platforms.backtesting_frameworks.zipline.provider import zipline_provider
@@ -27,12 +31,16 @@ __all__ = [
     "lean_provider",
     "nautilus_provider",
     "optimal_trader_provider",
+    "combine_trade_lists",
+    "normalize_trade_list",
     "read_strategy_artifacts",
+    "read_trade_list_artifact",
     "replay_scored_panel_top_k",
     "ScoredPanelTopKReplayConfig",
     "ScoredPanelTopKReplayResult",
     "StrategyArtifactBundle",
     "validate_strategy_artifact_frame",
+    "write_trade_list_artifact",
     "write_strategy_artifacts",
     "write_scored_panel_top_k_outputs",
     "zipline_provider",

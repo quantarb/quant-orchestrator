@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 import pandas as pd
+
+from quant_orchestrator.platforms.backtesting_frameworks.strategy_artifacts import (
+    combine_trade_lists,
+    normalize_trade_list,
+    read_trade_list_artifact,
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,87 @@ def simulate_return_paths(
         ]
     )
     return MonteCarloResult(paths=paths, summary=summary)
+
+
+def trade_list_return_series(
+    trades: pd.DataFrame,
+    *,
+    return_column: str | None = None,
+    capital_column: str | None = None,
+) -> pd.Series:
+    """Extract realized returns from a standard trade-list artifact."""
+
+    normalized = normalize_trade_list(trades)
+    if normalized.empty:
+        raise ValueError("Trade-list Monte Carlo requires at least one trade")
+
+    candidates = [return_column] if return_column else []
+    candidates.extend(
+        [
+            "portfolio_return_contribution",
+            "ret_dec",
+            "return_pct",
+            "option_return",
+        ]
+    )
+    for column in candidates:
+        if not column or column not in normalized.columns:
+            continue
+        returns = pd.to_numeric(normalized[column], errors="coerce")
+        returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+        if returns.empty:
+            continue
+        if column == "return_pct" and returns.abs().gt(10).any():
+            returns = returns / 100.0
+        return returns.rename("trade_return")
+
+    pnl = pd.to_numeric(normalized.get("pnl"), errors="coerce")
+    if capital_column and capital_column in normalized.columns:
+        capital = pd.to_numeric(normalized[capital_column], errors="coerce")
+    elif "equity_entry_notional" in normalized.columns:
+        capital = pd.to_numeric(normalized["equity_entry_notional"], errors="coerce")
+    elif "notional" in normalized.columns:
+        capital = pd.to_numeric(normalized["notional"], errors="coerce")
+    else:
+        capital = pd.Series(np.nan, index=normalized.index)
+    returns = (pnl / capital).replace([np.inf, -np.inf], np.nan).dropna()
+    if returns.empty:
+        raise ValueError(
+            "Trade-list Monte Carlo requires a return column or pnl plus notional/equity_entry_notional"
+        )
+    return returns.rename("trade_return")
+
+
+def simulate_trade_list_paths(
+    trade_lists: pd.DataFrame | str | Path | Mapping[str, pd.DataFrame | str | Path],
+    *,
+    return_column: str | None = None,
+    capital_column: str | None = None,
+    iterations: int = 1_000,
+    horizon: int | None = None,
+    seed: int = 1337,
+    block_size: int = 1,
+) -> MonteCarloResult:
+    """Run Monte Carlo directly from one or more standard trade-list artifacts."""
+
+    if isinstance(trade_lists, Mapping):
+        trades = combine_trade_lists(trade_lists)
+    elif isinstance(trade_lists, pd.DataFrame):
+        trades = normalize_trade_list(trade_lists)
+    else:
+        trades = read_trade_list_artifact(trade_lists)
+    returns = trade_list_return_series(
+        trades,
+        return_column=return_column,
+        capital_column=capital_column,
+    )
+    return simulate_return_paths(
+        returns,
+        iterations=iterations,
+        horizon=horizon,
+        seed=seed,
+        block_size=block_size,
+    )
 
 
 def _sample_path(
