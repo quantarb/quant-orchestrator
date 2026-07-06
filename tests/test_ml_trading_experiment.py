@@ -28,19 +28,23 @@ from quant_orchestrator.research_tools.ml_trading_experiment import (
     _apply_feature_representation,
     _filter_selected_strategy_sources,
     _normalized_feature_representations,
+    _refresh_phase_summary,
     _score_family_models,
     _run_symbol_rule_diagnostics,
     _single_symbol_positions,
+    _train_family_models,
     _write_trained_model_artifacts,
 )
 
 
 class _ConstantClassifier:
+    encoder = type("_Encoder", (), {"classes_": np.asarray(["oracle_long", "oracle_short"], dtype=object)})()
+
     def predict_proba_frame(self, frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
         return pd.DataFrame(
             {
-                "prob__bullish": np.full(len(frame), 0.75),
-                "prob__bearish": np.full(len(frame), 0.25),
+                "prob__oracle_long": np.full(len(frame), 0.75),
+                "prob__oracle_short": np.full(len(frame), 0.25),
             },
             index=frame.index,
         )
@@ -55,6 +59,76 @@ def test_ml_trading_experiment_config_defaults_to_fast_1t_smoke() -> None:
     assert config.log_mlflow is True
     assert config.mlflow_experiment == "ml_trading"
     assert config.target_label_mode == "oracle_only"
+    assert config.fit_all_available_data is False
+    assert config.refresh_missing_fmp_data is False
+
+
+def test_train_family_models_can_fit_all_available_rows(monkeypatch) -> None:
+    dates = pd.date_range("2020-01-01", periods=6)
+    feature_panel = pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 6,
+            "date": dates,
+            "feature_a": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        }
+    )
+    feature_metadata = pd.DataFrame(
+        [{"source": "fmp", "family": "unit", "feature": "feature_a"}]
+    )
+    labels = pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 6,
+            "date": dates,
+            "collapsed_label": ["oracle_long", "oracle_short"] * 3,
+            "label_source": ["unit"] * 6,
+        }
+    )
+    fit_rows = []
+
+    def _fake_fit(cls, frame, *, features, target_col, random_state, params):
+        fit_rows.append(len(frame))
+        return _ConstantClassifier()
+
+    monkeypatch.setattr(
+        "quant_orchestrator.research_tools.ml_trading_experiment.RapidsRandomForestClassifier.fit",
+        classmethod(_fake_fit),
+    )
+
+    results, _models = _train_family_models(
+        MLTradingExperimentConfig(
+            log_mlflow=False,
+            min_train_rows_per_family=1,
+            fit_all_available_data=True,
+        ),
+        feature_panel,
+        feature_metadata,
+        labels,
+        train_end=pd.Timestamp("2020-01-03"),
+        oos_start=pd.Timestamp("2020-01-04"),
+        fit_all_available_data=True,
+    )
+
+    row = results.iloc[0]
+    assert fit_rows == [6]
+    assert row["status"] == "ok"
+    assert row["training_window"] == "all_available"
+    assert row["train_rows"] == 6
+    assert row["oos_rows"] == 0
+
+
+def test_refresh_phase_summary_flattens_quant_warehouse_backfill_counts() -> None:
+    summary = {
+        "equity_prices": {"updated": 2, "empty": 1, "skipped_fresh": 3, "error": 0, "total": 6},
+        "macro": {"status": "skipped_complete"},
+        "include_prices": True,
+    }
+
+    flattened = _refresh_phase_summary(summary)
+
+    assert flattened["equity_prices_updated"] == 2
+    assert flattened["equity_prices_total"] == 6
+    assert flattened["macro_status"] == "skipped_complete"
+    assert flattened["include_prices"] is True
 
 
 def test_filter_selected_strategy_sources_keeps_only_requested_feature_families() -> None:

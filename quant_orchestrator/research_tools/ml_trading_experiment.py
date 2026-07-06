@@ -58,6 +58,14 @@ class MLTradingExperimentConfig:
     train_end: str = "2019-12-31"
     oos_start: str = "2020-01-01"
     score_start: str | None = None
+    fit_all_available_data: bool = False
+    refresh_missing_fmp_data: bool = False
+    refresh_missing_fmp_include_macro: bool | None = None
+    refresh_missing_fmp_include_prices: bool = True
+    refresh_missing_fmp_force_macro: bool = False
+    refresh_missing_fmp_staleness_days: int = 90
+    refresh_missing_fmp_skip_recent_hours: float = 24.0
+    refresh_missing_fmp_max_workers: int = 8
     top_k_values: tuple[int, ...] = (5, 10, 20, 40)
     entry_threshold: float = 0.50
     exit_threshold: float = 0.50
@@ -175,6 +183,7 @@ def run_ml_trading_experiment(
         build_oracle_trade_target_panel,
         cap_features_by_quality,
         load_fmp_event_pairs,
+        backfill_missing_fmp_historical,
         screen_fmp_equity_universe,
     ) = _warehouse_imports()
     mark_phase("setup")
@@ -201,6 +210,22 @@ def run_ml_trading_experiment(
             for frequency in config.oracle_frequencies
         },
     )
+
+    if config.refresh_missing_fmp_data:
+        refresh_summary = backfill_missing_fmp_historical(
+            warehouse=warehouse,
+            equity_provider=config.provider,
+            etf_provider=config.provider,
+            include_macro=config.refresh_missing_fmp_include_macro,
+            include_prices=config.refresh_missing_fmp_include_prices,
+            force_macro=config.refresh_missing_fmp_force_macro,
+            staleness_days=config.refresh_missing_fmp_staleness_days,
+            skip_recent_hours=config.refresh_missing_fmp_skip_recent_hours,
+            max_workers=config.refresh_missing_fmp_max_workers,
+        )
+        mark_phase("refresh_missing_fmp_data", **_refresh_phase_summary(refresh_summary))
+    else:
+        mark_phase("refresh_missing_fmp_data", skipped=True)
 
     if config.symbols:
         symbols = tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in config.symbols if str(symbol).strip()))
@@ -293,6 +318,7 @@ def run_ml_trading_experiment(
         label_rows,
         train_end=train_end,
         oos_start=oos_start,
+        fit_all_available_data=config.fit_all_available_data,
     )
     mark_phase("train_family_models", trained_models=int((model_results["status"] == "ok").sum()) if "status" in model_results else len(model_results))
     strategy_scores, mean_scores = _score_family_models(
@@ -739,6 +765,7 @@ def _train_family_models(
     *,
     train_end: pd.Timestamp,
     oos_start: pd.Timestamp,
+    fit_all_available_data: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     model_rows = []
     models = {}
@@ -762,8 +789,14 @@ def _train_family_models(
                 {"source": source, "family": family, "status": "skipped_empty", "features": len(features), "rows": 0}
             )
             continue
-        train = family_frame.loc[pd.to_datetime(family_frame["date"]).le(train_end)].copy()
-        oos = family_frame.loc[pd.to_datetime(family_frame["date"]).ge(oos_start)].copy()
+        if fit_all_available_data:
+            train = family_frame.copy()
+            oos = family_frame.iloc[0:0].copy()
+            training_window = "all_available"
+        else:
+            train = family_frame.loc[pd.to_datetime(family_frame["date"]).le(train_end)].copy()
+            oos = family_frame.loc[pd.to_datetime(family_frame["date"]).ge(oos_start)].copy()
+            training_window = "split"
         if len(train) < config.min_train_rows_per_family or train["collapsed_label"].nunique() < config.min_classes_per_family:
             model_rows.append(
                 {
@@ -774,6 +807,7 @@ def _train_family_models(
                     "rows": len(family_frame),
                     "train_rows": len(train),
                     "oos_rows": len(oos),
+                    "training_window": training_window,
                     "train_classes": train["collapsed_label"].nunique(),
                 }
             )
@@ -801,6 +835,7 @@ def _train_family_models(
                         "rows": len(family_frame),
                         "train_rows": len(train),
                         "oos_rows": len(oos),
+                        "training_window": training_window,
                     }
                 )
                 continue
@@ -865,6 +900,7 @@ def _train_family_models(
                     "rows": len(family_frame),
                     "train_rows": len(train_rep),
                     "oos_rows": len(oos_rep),
+                    "training_window": training_window,
                     "classes": family_frame["collapsed_label"].nunique(),
                     "classifier_fit_seconds": classifier_fit_seconds,
                     "ae_fit_seconds": ae_fit_seconds,
@@ -1596,6 +1632,18 @@ def _build_analysis(
     eligible_symbols: int,
 ) -> str:
     cap_text = _market_cap_text(config.min_market_cap)
+    if config.fit_all_available_data:
+        training_text = (
+            f"Training window: all available labeled rows from {config.start_date} "
+            f"through the latest stored data; no train/test split is held out."
+        )
+        score_text = "Ensemble prediction rows"
+    else:
+        training_text = (
+            f"Training window: all available rows through {config.train_end}. "
+            f"Out-of-sample model and trading window starts {config.oos_start}."
+        )
+        score_text = "Ensemble OOS prediction rows"
     lines = [
         "## Written Analysis",
         "",
@@ -1603,10 +1651,10 @@ def _build_analysis(
         f"- Mode: `{config.mode}`.",
         f"- Feature representations: {list(config.feature_representations)}.",
         f"- Universe: {len(symbols)} FMP {cap_text}+ symbols; {len(event_symbols)} had event coverage; universe_source={universe_source}; eligible_symbols={eligible_symbols}.",
-        f"- Training window: all available rows through {config.train_end}. Out-of-sample model and trading window starts {config.oos_start}.",
+        f"- {training_text}",
         f"- Trained feature-family models: {int((model_results['status'] == 'ok').sum()) if 'status' in model_results else len(model_results)}.",
         f"- Strategy sources traded: {strategy_scores['strategy_source'].nunique() if not strategy_scores.empty else 0} total.",
-        f"- Ensemble OOS prediction rows: {len(mean_scores):,} across {mean_scores['symbol'].nunique() if not mean_scores.empty else 0} symbols and {mean_scores['date'].nunique() if not mean_scores.empty else 0} dates.",
+        f"- {score_text}: {len(mean_scores):,} across {mean_scores['symbol'].nunique() if not mean_scores.empty else 0} symbols and {mean_scores['date'].nunique() if not mean_scores.empty else 0} dates.",
         f"- Event load seconds: {event_load_seconds:.3f}; oracle seconds: {oracle_seconds:.3f}; oracle metadata rows: {oracle_metadata_rows}.",
         f"- Feature timings: {feature_timings}.",
         f"- Strategy variants: long_only, short_only, long_short with top_k={list(config.top_k_values)}.",
@@ -1823,6 +1871,20 @@ def _market_cap_text(value: int) -> str:
     return str(value)
 
 
+def _refresh_phase_summary(summary: dict[str, object]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for key, value in dict(summary or {}).items():
+        if isinstance(value, dict):
+            for metric in ("updated", "empty", "skipped_fresh", "error", "total"):
+                if metric in value:
+                    out[f"{key}_{metric}"] = value[metric]
+            if value.get("status"):
+                out[f"{key}_status"] = value.get("status")
+        elif key in {"started_at", "finished_at", "equity_provider", "etf_provider", "include_prices"}:
+            out[key] = value
+    return out
+
+
 def _prepare_quant_warehouse_import(path: str | None) -> None:
     if not path:
         return
@@ -1837,6 +1899,7 @@ def _prepare_quant_warehouse_import(path: str | None) -> None:
 
 
 def _warehouse_imports():
+    from quant_warehouse.migrate.backfill_missing_fmp import backfill_missing_fmp_historical
     from quant_warehouse.platforms.data_providers.fmp.target_engineering.event_pairs import EventPairStore
     from quant_warehouse.research_tools import (
         BinaryTargetConfig,
@@ -1860,5 +1923,6 @@ def _warehouse_imports():
         build_oracle_trade_target_panel,
         cap_features_by_quality,
         load_fmp_event_pairs,
+        backfill_missing_fmp_historical,
         screen_fmp_equity_universe,
     )
