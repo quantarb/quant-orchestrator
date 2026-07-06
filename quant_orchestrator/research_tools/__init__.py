@@ -19,6 +19,11 @@ from quant_orchestrator.research_tools.option_trade_execution import (
     OptionTradeExecutionBatch,
     OptionTradeExecutor,
 )
+from quant_orchestrator.research_tools.option_family_ranker import (
+    OptionFamilyRankerConfig,
+    OptionFamilyRankerResult,
+    run_option_family_ranker_experiment,
+)
 from quant_orchestrator.research_tools.options_experiment import (
     OptopsyExecutionConfig,
     OptionExperimentArtifacts,
@@ -61,6 +66,8 @@ __all__ = [
     "MLTradingExperimentResult",
     "OptopsyExecutionConfig",
     "OptionExperimentArtifacts",
+    "OptionFamilyRankerConfig",
+    "OptionFamilyRankerResult",
     "OptionMvBasketConfig",
     "OptionRetrievalConfig",
     "OptionRuntimeEstimate",
@@ -93,6 +100,7 @@ __all__ = [
     "rank_option_window_strategy_sources",
     "read_backtest_panel",
     "run_ml_trading_experiment",
+    "run_option_family_ranker_experiment",
     "run_backtest_report_option_execution",
     "run_backtest_report_option_experiment",
     "run_oracle_option_experiment",
