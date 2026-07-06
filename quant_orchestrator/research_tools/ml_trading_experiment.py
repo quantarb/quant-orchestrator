@@ -96,7 +96,7 @@ class MLTradingExperimentConfig:
             "n_streams": 8,
         }
     )
-    ae_config: LatentAutoencoderConfig = field(default_factory=LatentAutoencoderConfig)
+    ae_config: LatentAutoencoderConfig | None = None
     quant_warehouse_root: str | None = "/home/jlee153232/PycharmProjects/quant-warehouse"
     log_mlflow: bool = True
     mlflow_experiment: str = "ml_trading"
@@ -783,8 +783,9 @@ def _train_family_models(
         ae_metadata = {}
         needs_autoencoder = config.mode == "classifier_ae" or any(rep in {"ae_only", "raw_plus_ae"} for rep in representations)
         if needs_autoencoder:
+            ae_config = config.ae_config or LatentAutoencoderConfig()
             ae_started = perf_counter()
-            autoencoder = LatentAutoencoderIndex.fit(train, features=features, config=config.ae_config)
+            autoencoder = LatentAutoencoderIndex.fit(train, features=features, config=ae_config)
             ae_fit_seconds = perf_counter() - ae_started
             ae_metadata = {} if autoencoder is None else autoencoder.metadata()
         for representation in representations:
@@ -1622,9 +1623,10 @@ def _build_analysis(
                 f"- AE-derived classifier features are Orchestrator experiment features only; mean raw_features={raw_feature_mean:.1f}, mean ae_features={ae_feature_mean:.1f}."
             )
     if config.mode == "classifier_ae":
+        ae_config = config.ae_config or LatentAutoencoderConfig()
         lines.extend(
             [
-                f"- AE epochs={config.ae_config.epochs}; familiarity mode=latent nearest-neighbor reciprocal distance; metric={config.ae_config.nn_metric}; train-distance percentile={config.ae_config.familiarity_quantile}.",
+                f"- AE epochs={ae_config.epochs}; familiarity mode=latent nearest-neighbor reciprocal distance; metric={ae_config.nn_metric}; train-distance percentile={ae_config.familiarity_quantile}.",
                 f"- Total indexed training latent rows: {int(model_results.get('ae_latent_index_rows', pd.Series(dtype=float)).fillna(0).sum()):,}.",
             ]
         )

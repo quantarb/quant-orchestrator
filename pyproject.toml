@@ -27,17 +27,15 @@ ml = [
 ]
 cuda = [
     "torch>=2.5",
-    "cupy-cuda13x>=14",
-    "cuml-cu13>=26.6,<27",
+    "cupy-cuda12x!=14.0.0,>=14,<15",
+    "cudf-cu12>=26.4,<27",
+    "cuml-cu12>=26.4,<27",
 ]
 backtesting = [
     "backtesting>=0.3.3",
     "lean>=1.0.0",
     "zipline-reloaded==3.1.1",
     "nautilus-trader==1.228.0",
-]
-options = [
-    "optopsy>=2.3,<3",
 ]
 dev = [
     "pytest>=8.0",
@@ -50,11 +48,11 @@ all = [
     "flair>=0.15,<0.16",
     "sentence-transformers>=3",
     "torch>=2.5",
-    "cupy-cuda13x>=14",
-    "cuml-cu13>=26.6,<27",
+    "cupy-cuda12x!=14.0.0,>=14,<15",
+    "cudf-cu12>=26.4,<27",
+    "cuml-cu12>=26.4,<27",
     "zipline-reloaded==3.1.1",
     "nautilus-trader==1.228.0",
-    "optopsy>=2.3,<3",
 ]
 
 [project.scripts]
