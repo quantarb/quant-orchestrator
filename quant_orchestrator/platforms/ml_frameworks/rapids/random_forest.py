@@ -18,6 +18,32 @@ DEFAULT_RF_PARAMS = {
 }
 
 
+def rapids_gpu_info() -> dict[str, object]:
+    """Import RAPIDS and return the active CUDA device metadata.
+
+    This intentionally raises if RAPIDS/CUDA is unavailable. The live trading
+    MoE path should fail fast instead of silently falling back to CPU training.
+    """
+
+    import cudf
+    import cupy as cp
+    import cuml
+
+    device_id = int(cp.cuda.runtime.getDevice())
+    props = cp.cuda.runtime.getDeviceProperties(device_id)
+    name = props.get("name", b"")
+    if isinstance(name, bytes):
+        name = name.decode("utf-8", errors="replace")
+    return {
+        "backend": "rapids_cuml_gpu",
+        "device_id": device_id,
+        "device_name": str(name),
+        "cudf_version": getattr(cudf, "__version__", ""),
+        "cuml_version": getattr(cuml, "__version__", ""),
+        "cupy_version": getattr(cp, "__version__", ""),
+    }
+
+
 @dataclass
 class RapidsRandomForestClassifier:
     """Small adapter around cuML RandomForestClassifier for notebook experiments."""
@@ -25,6 +51,7 @@ class RapidsRandomForestClassifier:
     params: dict
     model: object
     encoder: LabelEncoder
+    gpu_info: dict[str, object]
 
     @classmethod
     def fit(
@@ -39,13 +66,14 @@ class RapidsRandomForestClassifier:
         import cudf
         from cuml.ensemble import RandomForestClassifier as CuRandomForestClassifier
 
+        gpu_info = rapids_gpu_info()
         feature_list = list(features)
         model_params = {**DEFAULT_RF_PARAMS, **dict(params or {}), "random_state": random_state}
         encoder = LabelEncoder()
         y = encoder.fit_transform(frame[target_col].astype(str))
         model = CuRandomForestClassifier(**model_params)
         model.fit(cudf.from_pandas(frame[feature_list].astype("float32")), cudf.Series(y.astype("int32")))
-        return cls(params=model_params, model=model, encoder=encoder)
+        return cls(params=model_params, model=model, encoder=encoder, gpu_info=gpu_info)
 
     def predict_proba_frame(self, frame: pd.DataFrame, features: Iterable[str]) -> pd.DataFrame:
         import cupy as cp

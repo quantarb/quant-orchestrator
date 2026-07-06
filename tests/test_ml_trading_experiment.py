@@ -39,6 +39,14 @@ from quant_orchestrator.research_tools.ml_trading_experiment import (
 
 class _ConstantClassifier:
     encoder = type("_Encoder", (), {"classes_": np.asarray(["oracle_long", "oracle_short"], dtype=object)})()
+    gpu_info = {
+        "backend": "rapids_cuml_gpu",
+        "device_id": 0,
+        "device_name": "unit-test-gpu",
+        "cudf_version": "test",
+        "cuml_version": "test",
+        "cupy_version": "test",
+    }
 
     def predict_proba_frame(self, frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
         return pd.DataFrame(
@@ -114,6 +122,8 @@ def test_train_family_models_can_fit_all_available_rows(monkeypatch) -> None:
     assert row["training_window"] == "all_available"
     assert row["train_rows"] == 6
     assert row["oos_rows"] == 0
+    assert row["classifier_backend"] == "rapids_cuml_gpu"
+    assert row["gpu_device_name"] == "unit-test-gpu"
 
 
 def test_refresh_phase_summary_flattens_quant_warehouse_backfill_counts() -> None:

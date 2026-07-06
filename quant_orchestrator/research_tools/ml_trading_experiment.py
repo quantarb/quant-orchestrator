@@ -26,6 +26,7 @@ from quant_orchestrator.platforms.backtesting_frameworks.zipline.shared_book imp
     run_zipline_shared_book_summary_jobs,
 )
 from quant_orchestrator.platforms.ml_frameworks.rapids import RapidsRandomForestClassifier
+from quant_orchestrator.platforms.ml_frameworks.rapids.random_forest import rapids_gpu_info
 from quant_orchestrator.platforms.ml_frameworks.torch_autoencoder import (
     LatentAutoencoderConfig,
     LatentAutoencoderIndex,
@@ -187,6 +188,8 @@ def run_ml_trading_experiment(
         screen_fmp_equity_universe,
     ) = _warehouse_imports()
     mark_phase("setup")
+    gpu_info = rapids_gpu_info()
+    mark_phase("rapids_gpu_preflight", **gpu_info)
 
     train_end = pd.Timestamp(config.train_end)
     oos_start = pd.Timestamp(config.oos_start)
@@ -211,22 +214,6 @@ def run_ml_trading_experiment(
         },
     )
 
-    if config.refresh_missing_fmp_data:
-        refresh_summary = backfill_missing_fmp_historical(
-            warehouse=warehouse,
-            equity_provider=config.provider,
-            etf_provider=config.provider,
-            include_macro=config.refresh_missing_fmp_include_macro,
-            include_prices=config.refresh_missing_fmp_include_prices,
-            force_macro=config.refresh_missing_fmp_force_macro,
-            staleness_days=config.refresh_missing_fmp_staleness_days,
-            skip_recent_hours=config.refresh_missing_fmp_skip_recent_hours,
-            max_workers=config.refresh_missing_fmp_max_workers,
-        )
-        mark_phase("refresh_missing_fmp_data", **_refresh_phase_summary(refresh_summary))
-    else:
-        mark_phase("refresh_missing_fmp_data", skipped=True)
-
     if config.symbols:
         symbols = tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in config.symbols if str(symbol).strip()))
         _raw_universe = pd.DataFrame({"symbol": symbols})
@@ -238,6 +225,23 @@ def run_ml_trading_experiment(
             warehouse=warehouse,
         )
     mark_phase("screen_universe", symbols=len(symbols))
+
+    if config.refresh_missing_fmp_data:
+        refresh_summary = backfill_missing_fmp_historical(
+            warehouse=warehouse,
+            equity_provider=config.provider,
+            etf_provider=config.provider,
+            equity_symbols=symbols,
+            include_macro=config.refresh_missing_fmp_include_macro,
+            include_prices=config.refresh_missing_fmp_include_prices,
+            force_macro=config.refresh_missing_fmp_force_macro,
+            staleness_days=config.refresh_missing_fmp_staleness_days,
+            skip_recent_hours=config.refresh_missing_fmp_skip_recent_hours,
+            max_workers=config.refresh_missing_fmp_max_workers,
+        )
+        mark_phase("refresh_missing_fmp_data", **_refresh_phase_summary(refresh_summary))
+    else:
+        mark_phase("refresh_missing_fmp_data", skipped=True)
     raw_feature_panel, raw_feature_metadata, _feature_diagnostics, feature_timings = (
         build_fundamental_feature_panel(symbols, feature_config, warehouse=warehouse)
     )
@@ -903,6 +907,12 @@ def _train_family_models(
                     "training_window": training_window,
                     "classes": family_frame["collapsed_label"].nunique(),
                     "classifier_fit_seconds": classifier_fit_seconds,
+                    "classifier_backend": classifier.gpu_info.get("backend", "rapids_cuml_gpu"),
+                    "gpu_device_id": classifier.gpu_info.get("device_id"),
+                    "gpu_device_name": classifier.gpu_info.get("device_name"),
+                    "cudf_version": classifier.gpu_info.get("cudf_version"),
+                    "cuml_version": classifier.gpu_info.get("cuml_version"),
+                    "cupy_version": classifier.gpu_info.get("cupy_version"),
                     "ae_fit_seconds": ae_fit_seconds,
                     **ae_metadata,
                     **{f"train_{k}": v for k, v in train_scores.items()},
