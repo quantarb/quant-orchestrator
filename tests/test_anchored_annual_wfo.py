@@ -8,6 +8,7 @@ from quant_warehouse.lineage import build_dataset_lineage_manifest, write_datase
 
 from quant_orchestrator.research_tools.anchored_annual_wfo import (
     AnchoredAnnualWFOConfig,
+    evaluate_annual_oos_scores,
     run_anchored_annual_wfo,
 )
 from quant_orchestrator.research_tools.family_score_pipeline import FeatureFamilyBatch, FamilyScoreStore
@@ -76,6 +77,12 @@ def test_annual_wfo_uses_prior_rows_bounds_oos_and_restarts(tmp_path):
     assert set(scores_2021["date"]) == {pd.Timestamp("2021-01-02")}
     assert first.peak_unified_memory_rss_mb == 125.5
     assert first.folds["peak_unified_memory_rss_mb"].tolist() == [120.0, 125.5]
+    assert first.annual_metrics[["test_year", "model_id"]].values.tolist() == [
+        [2020, "test.unit"]
+    ]
+    assert first.annual_metrics.iloc[0]["classification_balanced_accuracy"] == 1.0
+    assert first.annual_metrics.iloc[0]["top_k_balanced_precision"] == 0.5
+    assert (tmp_path / "wfo/annual_wfo_metrics.parquet").is_file()
 
     second = run_anchored_annual_wfo(
         batches,
@@ -86,4 +93,33 @@ def test_annual_wfo_uses_prior_rows_bounds_oos_and_restarts(tmp_path):
     )
 
     assert second.folds["resumed"].all()
+    assert second.annual_metrics.equals(first.annual_metrics)
     assert factory_calls == ["called", "called"]
+
+
+def test_annual_oos_metrics_are_daily_cross_sectional_and_side_balanced():
+    scores = pd.DataFrame(
+        {
+            "model_id": "family.one",
+            "symbol": ["A", "B", "C", "D"],
+            "date": pd.to_datetime(["2024-01-02"] * 4),
+            "long_score": [0.9, 0.8, 0.2, 0.1],
+            "short_score": [0.1, 0.2, 0.8, 0.9],
+        }
+    )
+    labels = pd.DataFrame(
+        {
+            "symbol": ["A", "B", "C", "D"],
+            "date": pd.to_datetime(["2024-01-02"] * 4),
+            "collapsed_label": ["oracle_long", "oracle_short", "oracle_short", "oracle_long"],
+        }
+    )
+
+    metrics = evaluate_annual_oos_scores(scores, labels, test_year=2024, top_k=2).iloc[0]
+
+    assert metrics["ranking_days"] == 1
+    assert metrics["top_k_long_rows"] == 2
+    assert metrics["top_k_short_rows"] == 2
+    assert metrics["top_k_long_precision"] == 0.5
+    assert metrics["top_k_short_precision"] == 0.5
+    assert metrics["classification_balanced_accuracy"] == 0.5

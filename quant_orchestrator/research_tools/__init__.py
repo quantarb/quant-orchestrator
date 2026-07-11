@@ -31,6 +31,7 @@ from quant_orchestrator.research_tools.family_score_pipeline import (
 from quant_orchestrator.research_tools.anchored_annual_wfo import (
     AnchoredAnnualWFOConfig,
     AnchoredAnnualWFOResult,
+    evaluate_annual_oos_scores,
     process_peak_rss_mb,
     run_anchored_annual_wfo,
 )
@@ -126,6 +127,7 @@ __all__ = [
     "build_strategy_score_frame",
     "compare_option_experiment_artifacts",
     "estimate_option_runtime_scaling",
+    "evaluate_annual_oos_scores",
     "classification_probability_diagnostics",
     "expected_calibration_error",
     "load_latest_mlflow_experiment_artifacts",
