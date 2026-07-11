@@ -35,5 +35,6 @@ Current reusable code placement:
 - Strategy-specific backtesting.py ML-score helpers live under `quant_orchestrator/backtests/`.
 - Synthetic and real-quote option research helpers still exist under `quant_orchestrator/research_tools/`, but new option-equivalent backtests should start from standard `trade_list` artifacts. The optimal_trader vectorized engine and option-return primitives live under `quant_orchestrator/platforms/backtesting_frameworks/optimal_trader/`.
 - FlairNLP helper functions used by the current multi-ML notebook live under `quant_orchestrator/platforms/ml_frameworks/flair/shared.py`.
+- Reusable classifier-family scores are produced by `research_tools.family_score_pipeline`. Its streaming runner trains, scores, persists, and releases one raw feature-family model at a time. Strategies can use `FamilyScoreStore.read_scores` to select model/date subsets and `build_score_ensemble` to create a mean ensemble without retraining or loading model objects.
 
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.

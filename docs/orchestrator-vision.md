@@ -146,6 +146,8 @@ Current examples:
 - PyTorch uses CUDA auto-detection for tensor models.
 - FlairNLP can be used for native multitask learning. Current helper functions for the notebook live under `quant_orchestrator.platforms.ml_frameworks.flair.shared`.
 
+Reusable raw classifier-family training uses a bounded lifecycle: load one feature family, train its classifier, materialize standardized score partitions, persist the native model, and release CPU/GPU memory before loading the next family. The score artifact—not a process-wide model dictionary—is the reusable handoff into ensembles, meta-models, and trading strategies. Autoencoder representations remain a separate optional experiment path and are not part of the raw classifier configuration.
+
 ML outputs should remain native unless there is a clear reason to normalize them. A common metrics table is useful for comparison, but the platform should still store framework-specific reports and artifacts.
 
 ## Intended Workflow Examples
