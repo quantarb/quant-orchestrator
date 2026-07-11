@@ -17,6 +17,7 @@ from quant_warehouse import Warehouse
 from quant_warehouse.research_tools.feature_family_eval import (
     FamilyEvaluationConfig,
     build_fundamental_feature_panel,
+    build_technical_feature_panel,
     cap_features_by_quality,
 )
 
@@ -80,6 +81,7 @@ class OptionFamilyRankerConfig:
     basket_min_weight: float = 0.0
     disable_pairwise_ranker: bool = True
     pairwise_pairs_per_trade: int = 20
+    max_candidates_per_trade: int = 64
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,7 @@ def run_option_family_ranker_experiment(config: OptionFamilyRankerConfig) -> Opt
         basket_min_weight=float(config.basket_min_weight),
         disable_pairwise_ranker=bool(config.disable_pairwise_ranker),
         pairwise_pairs_per_trade=int(config.pairwise_pairs_per_trade),
+        max_candidates_per_trade=int(config.max_candidates_per_trade),
     )
     return _run_option_family_ranker_args(args, config=config)
 
@@ -147,6 +150,7 @@ def main() -> None:
     parser.add_argument("--disable-pairwise-ranker", dest="disable_pairwise_ranker", action="store_true", default=True)
     parser.add_argument("--enable-pairwise-ranker", dest="disable_pairwise_ranker", action="store_false")
     parser.add_argument("--pairwise-pairs-per-trade", type=int, default=20)
+    parser.add_argument("--max-candidates-per-trade", type=int, default=64)
     args = parser.parse_args()
     config = OptionFamilyRankerConfig(
         option_panel=args.option_panel,
@@ -169,6 +173,7 @@ def main() -> None:
         basket_min_weight=float(args.basket_min_weight),
         disable_pairwise_ranker=bool(args.disable_pairwise_ranker),
         pairwise_pairs_per_trade=int(args.pairwise_pairs_per_trade),
+        max_candidates_per_trade=int(args.max_candidates_per_trade),
     )
     result = run_option_family_ranker_experiment(config)
     print(json.dumps(result.summary, indent=2, default=str))
@@ -183,6 +188,7 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
         Path(args.option_panel),
         max_trades=int(args.max_trades),
         symbols=requested_symbols,
+        max_candidates_per_trade=int(args.max_candidates_per_trade),
     )
     target_col = str(args.target_col)
     option_panel = _filter_oracle_entry_options(option_panel, target_col=target_col)
@@ -192,11 +198,14 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
     if option_panel[target_col].notna().sum() == 0:
         raise ValueError(f"option panel target column {target_col!r} has no numeric values")
     symbols = tuple(sorted(option_panel["symbol"].dropna().astype(str).str.upper().unique()))
+    requested_source_names = tuple(args.feature_family or ("fmp.fmp_daily_mcap_yield",))
     feature_panel, metadata = _build_feature_panel(
         symbols,
         start_date=str(args.start_date),
         end_date=str(args.end_date) or None,
         min_market_cap=int(args.min_market_cap),
+        strategy_sources=requested_source_names,
+        observation_dates=option_panel[["symbol", "entry_date"]].rename(columns={"entry_date": "date"}),
     )
     requested_families = _requested_feature_families(
         metadata,
@@ -402,10 +411,31 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
     )
 
 
-def _load_option_panel(path: Path, *, max_trades: int, symbols: tuple[str, ...] = ()) -> pd.DataFrame:
+def _load_option_panel(
+    path: Path,
+    *,
+    max_trades: int,
+    symbols: tuple[str, ...] = (),
+    max_candidates_per_trade: int = 64,
+) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing option candidate panel: {path}")
-    frame = pd.read_parquet(path)
+    import pyarrow.parquet as pq
+
+    available = set(pq.ParquetFile(path).schema.names)
+    projected = list(
+        dict.fromkeys(
+            [
+                "trade_id", "symbol", "entry_date", "option_return", "rank_y",
+                "equity_signal_side", "side", "option_type", "option_action",
+                "expiration", "snapshot_date", "fixed_near_atm_score",
+                *OPTION_FEATURES,
+            ]
+        )
+    )
+    columns = [column for column in projected if column in available]
+    filters = [("symbol", "in", list(symbols))] if symbols else None
+    frame = pd.read_parquet(path, columns=columns, filters=filters)
     required = {"trade_id", "symbol", "entry_date", "option_return"}
     missing = required.difference(frame.columns)
     if missing:
@@ -437,6 +467,15 @@ def _load_option_panel(path: Path, *, max_trades: int, symbols: tuple[str, ...] 
                     values = values / float(scale)
                 score_terms.append(values.fillna(values.max()))
         out["fixed_near_atm_score"] = -sum(score_terms) if score_terms else np.nan
+    if int(max_candidates_per_trade) > 0:
+        order_columns = ["trade_id", "fixed_near_atm_score"]
+        ascending = [True, False]
+        out = (
+            out.sort_values(order_columns, ascending=ascending, kind="stable")
+            .groupby("trade_id", sort=False, as_index=False)
+            .head(int(max_candidates_per_trade))
+            .copy()
+        )
     if max_trades > 0:
         trade_ids = out[["trade_id", "entry_date"]].drop_duplicates().sort_values(["entry_date", "trade_id"]).head(max_trades)["trade_id"]
         out = out.loc[out["trade_id"].isin(set(trade_ids))].copy()
@@ -556,6 +595,8 @@ def _build_feature_panel(
     start_date: str,
     end_date: str | None,
     min_market_cap: int,
+    strategy_sources: tuple[str, ...],
+    observation_dates: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     warehouse = Warehouse()
     config = FamilyEvaluationConfig(
@@ -563,7 +604,36 @@ def _build_feature_panel(
         start_date=start_date,
         end_date=end_date,
     )
-    panel, metadata, _diagnostics, _timings = build_fundamental_feature_panel(symbols, config, warehouse=warehouse)
+    technical = tuple(source for source in strategy_sources if source.startswith("fmp.technical_"))
+    fundamental = tuple(source for source in strategy_sources if source not in technical)
+    panels: list[pd.DataFrame] = []
+    metadata_frames: list[pd.DataFrame] = []
+    if fundamental:
+        panel, metadata, _diagnostics, _timings = build_fundamental_feature_panel(
+            symbols,
+            config,
+            warehouse=warehouse,
+            strategy_sources=fundamental,
+            observation_dates=observation_dates,
+        )
+        panels.append(panel)
+        metadata_frames.append(metadata)
+    if technical:
+        panel, metadata, _diagnostics, _timings = build_technical_feature_panel(
+            symbols,
+            config,
+            warehouse=warehouse,
+            strategy_sources=technical,
+            observation_dates=observation_dates,
+        )
+        panels.append(panel)
+        metadata_frames.append(metadata)
+    if not panels:
+        raise ValueError("At least one option ranker feature family is required")
+    panel = panels[0]
+    for other in panels[1:]:
+        panel = panel.merge(other, on=["symbol", "date"], how="outer", validate="one_to_one")
+    metadata = pd.concat(metadata_frames, ignore_index=True).drop_duplicates()
     out = panel.copy()
     out["symbol"] = out["symbol"].astype(str).str.upper()
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()

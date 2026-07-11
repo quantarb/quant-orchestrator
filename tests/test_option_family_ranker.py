@@ -8,8 +8,43 @@ from quant_orchestrator.research_tools.option_family_ranker import (
     _filter_entry_date_tradable_options,
     _filter_oracle_entry_options,
     _join_family_features,
+    _load_option_panel,
     _training_and_scoring_frames,
 )
+
+
+def test_option_panel_load_projects_filters_and_caps_candidates(tmp_path) -> None:
+    rows = []
+    for symbol in ("AAPL", "MSFT"):
+        for index in range(5):
+            rows.append(
+                {
+                    "trade_id": f"{symbol}-trade",
+                    "symbol": symbol,
+                    "entry_date": "2026-01-02",
+                    "expiration": "2026-03-20",
+                    "snapshot_date": "2026-01-02",
+                    "option_return": float(index),
+                    "fixed_near_atm_score": float(index),
+                    "side": "buy",
+                    "option_type": "call",
+                    "unused_large_column": "x" * 100,
+                }
+            )
+    path = tmp_path / "options.parquet"
+    pd.DataFrame(rows).to_parquet(path, index=False)
+
+    loaded = _load_option_panel(
+        path,
+        max_trades=0,
+        symbols=("AAPL",),
+        max_candidates_per_trade=2,
+    )
+
+    assert set(loaded["symbol"]) == {"AAPL"}
+    assert len(loaded) == 2
+    assert "unused_large_column" not in loaded.columns
+    assert loaded["option_return"].tolist() == [4.0, 3.0]
 
 
 def test_filter_oracle_entry_options_keeps_buy_calls_for_longs_and_buy_puts_for_shorts() -> None:
