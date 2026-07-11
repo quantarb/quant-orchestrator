@@ -28,6 +28,12 @@ from quant_orchestrator.research_tools.family_score_pipeline import (
     release_training_memory,
     train_and_materialize_family_scores,
 )
+from quant_orchestrator.research_tools.attribution import (
+    DEFAULT_ATTRIBUTION_DIMENSIONS,
+    attach_security_context,
+    attribute_model_scores,
+    attribute_strategy_returns,
+)
 from quant_orchestrator.research_tools.option_trade_execution import (
     OptionTradeExecutionBatch,
     OptionTradeExecutor,
@@ -79,6 +85,7 @@ __all__ = [
     "MLTradingExperimentResult",
     "SCORE_COLUMNS",
     "FamilyClassifierConfig",
+    "DEFAULT_ATTRIBUTION_DIMENSIONS",
     "FamilyScoreRunResult",
     "FamilyScoreStore",
     "FeatureFamilyBatch",
@@ -102,6 +109,9 @@ __all__ = [
     "SyntheticOptionsBacktestConfig",
     "SyntheticOptionsBacktestResult",
     "build_classifier_signal_trade_list",
+    "attach_security_context",
+    "attribute_model_scores",
+    "attribute_strategy_returns",
     "build_score_ensemble",
     "build_option_window_dataset",
     "build_family_prediction_frame",
