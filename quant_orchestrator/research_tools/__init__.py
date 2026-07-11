@@ -34,6 +34,7 @@ from quant_orchestrator.research_tools.anchored_annual_wfo import (
     evaluate_annual_oos_scores,
     process_peak_rss_mb,
     run_anchored_annual_wfo,
+    summarize_yearly_stability,
 )
 from quant_orchestrator.research_tools.attribution import (
     DEFAULT_ATTRIBUTION_DIMENSIONS,
@@ -145,6 +146,7 @@ __all__ = [
     "release_training_memory",
     "run_ml_trading_experiment",
     "run_anchored_annual_wfo",
+    "summarize_yearly_stability",
     "run_option_family_ranker_experiment",
     "run_backtest_report_option_execution",
     "run_backtest_report_option_experiment",

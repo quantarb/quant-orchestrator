@@ -51,6 +51,7 @@ class AnchoredAnnualWFOResult:
     output_dir: Path
     folds: pd.DataFrame
     annual_metrics: pd.DataFrame
+    yearly_stability: pd.DataFrame
     checkpoint_path: Path
     elapsed_seconds: float
     peak_unified_memory_rss_mb: float
@@ -91,7 +92,11 @@ def run_anchored_annual_wfo(
         fold_id = str(test_year)
         fold_dir = output_dir / f"test_year={test_year}"
         manifest_path = fold_dir / "family_score_manifest.json"
-        if config.restart and completed.get(fold_id, {}).get("status") == "complete" and manifest_path.is_file():
+        if (
+            config.restart
+            and completed.get(fold_id, {}).get("status") == "complete"
+            and manifest_path.is_file()
+        ):
             row = dict(completed[fold_id])
             row["resumed"] = True
             fold_rows.append(row)
@@ -112,7 +117,9 @@ def run_anchored_annual_wfo(
         score_start = pd.Timestamp(year=test_year, month=1, day=1)
         score_end = pd.Timestamp(year=test_year, month=12, day=31)
         if callable(progress_logger):
-            progress_logger(f"[annual-wfo] starting test_year={test_year} train_end={train_end.date()}")
+            progress_logger(
+                f"[annual-wfo] starting test_year={test_year} train_end={train_end.date()}"
+            )
         fold_started = perf_counter()
         result = train_and_materialize_family_scores(
             _bounded_batches(batch_factory(), end=score_end),
@@ -125,7 +132,8 @@ def run_anchored_annual_wfo(
                 min_classes=config.min_classes,
                 random_seed=config.random_seed,
                 target_col=config.target_col,
-                model_params=config.model_params or FamilyClassifierConfig(
+                model_params=config.model_params
+                or FamilyClassifierConfig(
                     train_end=str(train_end.date()), score_start=str(score_start.date())
                 ).model_params,
                 run_diagnostics=config.run_diagnostics,
@@ -164,22 +172,65 @@ def run_anchored_annual_wfo(
         )
         _write_checkpoint(checkpoint_path, config, completed)
 
-    folds = pd.DataFrame(fold_rows).sort_values("test_year").reset_index(drop=True) if fold_rows else pd.DataFrame()
+    folds = (
+        pd.DataFrame(fold_rows).sort_values("test_year").reset_index(drop=True)
+        if fold_rows
+        else pd.DataFrame()
+    )
     annual_metrics = (
-        pd.concat(metric_frames, ignore_index=True).sort_values(["test_year", "model_id"]).reset_index(drop=True)
+        pd.concat(metric_frames, ignore_index=True)
+        .sort_values(["test_year", "model_id"])
+        .reset_index(drop=True)
         if metric_frames and any(not frame.empty for frame in metric_frames)
         else pd.DataFrame()
     )
+    yearly_stability = summarize_yearly_stability(annual_metrics)
     folds.to_parquet(output_dir / "annual_wfo_folds.parquet", index=False)
     annual_metrics.to_parquet(output_dir / "annual_wfo_metrics.parquet", index=False)
+    yearly_stability.to_parquet(output_dir / "annual_wfo_yearly_stability.parquet", index=False)
     return AnchoredAnnualWFOResult(
         output_dir=output_dir,
         folds=folds,
         annual_metrics=annual_metrics,
+        yearly_stability=yearly_stability,
         checkpoint_path=checkpoint_path,
         elapsed_seconds=perf_counter() - started,
         peak_unified_memory_rss_mb=peak_unified_memory_rss_mb,
     )
+
+
+def summarize_yearly_stability(annual_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Summarize dispersion and worst-year values across annual OOS folds."""
+
+    if annual_metrics.empty:
+        return pd.DataFrame(columns=["model_id", "oos_years", "first_test_year", "last_test_year"])
+    required = {"model_id", "test_year"}
+    missing = required.difference(annual_metrics.columns)
+    if missing:
+        raise KeyError(f"annual metrics missing columns: {sorted(missing)}")
+    metric_columns = [
+        column
+        for column in annual_metrics.columns
+        if column.startswith(("classification_", "top_k_"))
+        and column not in {"top_k_long_rows", "top_k_short_rows"}
+        and pd.api.types.is_numeric_dtype(annual_metrics[column])
+    ]
+    rows: list[dict[str, Any]] = []
+    for model_id, frame in annual_metrics.groupby("model_id", sort=True):
+        years = pd.to_numeric(frame["test_year"], errors="coerce").dropna().astype(int)
+        row: dict[str, Any] = {
+            "model_id": str(model_id),
+            "oos_years": int(years.nunique()),
+            "first_test_year": int(years.min()),
+            "last_test_year": int(years.max()),
+        }
+        for column in metric_columns:
+            values = pd.to_numeric(frame[column], errors="coerce").dropna()
+            row[f"{column}_mean"] = float(values.mean()) if not values.empty else float("nan")
+            row[f"{column}_std"] = float(values.std(ddof=0)) if not values.empty else float("nan")
+            row[f"{column}_worst"] = float(values.min()) if not values.empty else float("nan")
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def evaluate_annual_oos_scores(
@@ -239,9 +290,15 @@ def evaluate_annual_oos_scores(
                 "ranking_days": int(model_frame["date"].nunique()),
                 "top_k_long_rows": int(len(long_selected)),
                 "top_k_short_rows": int(len(short_selected)),
-                "top_k_long_precision": float(long_correct.mean()) if len(long_correct) else float("nan"),
-                "top_k_short_precision": float(short_correct.mean()) if len(short_correct) else float("nan"),
-                "top_k_balanced_precision": float((long_correct.mean() + short_correct.mean()) / 2.0)
+                "top_k_long_precision": float(long_correct.mean())
+                if len(long_correct)
+                else float("nan"),
+                "top_k_short_precision": float(short_correct.mean())
+                if len(short_correct)
+                else float("nan"),
+                "top_k_balanced_precision": float(
+                    (long_correct.mean() + short_correct.mean()) / 2.0
+                )
                 if len(long_correct) and len(short_correct)
                 else float("nan"),
             }
@@ -256,7 +313,9 @@ def _daily_top_k(frame: pd.DataFrame, score_col: str, top_k: int) -> pd.DataFram
     return ranked.groupby("date", sort=False).head(int(top_k))
 
 
-def _bounded_batches(batches: Iterable[FeatureFamilyBatch], *, end: pd.Timestamp) -> Iterable[FeatureFamilyBatch]:
+def _bounded_batches(
+    batches: Iterable[FeatureFamilyBatch], *, end: pd.Timestamp
+) -> Iterable[FeatureFamilyBatch]:
     for batch in batches:
         dates = pd.to_datetime(batch.frame["date"], errors="coerce")
         yield replace(batch, frame=batch.frame.loc[dates.le(end)].copy())
@@ -283,7 +342,9 @@ def _fold_row(
         "train_end": str(train_end.date()),
         "status": "complete",
         "models_requested": int(len(result.model_results)),
-        "models_trained": int(result.model_results.get("status", pd.Series(dtype=str)).eq("ok").sum()),
+        "models_trained": int(
+            result.model_results.get("status", pd.Series(dtype=str)).eq("ok").sum()
+        ),
         "score_rows": int(result.score_rows),
         "elapsed_seconds": float(seconds),
         "peak_unified_memory_rss_mb": float(peak_unified_memory_rss_mb),

@@ -4,12 +4,14 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import pytest
 from quant_warehouse.lineage import build_dataset_lineage_manifest, write_dataset_lineage_manifest
 
 from quant_orchestrator.research_tools.anchored_annual_wfo import (
     AnchoredAnnualWFOConfig,
     evaluate_annual_oos_scores,
     run_anchored_annual_wfo,
+    summarize_yearly_stability,
 )
 from quant_orchestrator.research_tools.family_score_pipeline import (
     FeatureFamilyBatch,
@@ -104,6 +106,7 @@ def test_annual_wfo_uses_prior_rows_bounds_oos_and_restarts(tmp_path):
     assert first.annual_metrics.iloc[0]["classification_balanced_accuracy"] == 1.0
     assert first.annual_metrics.iloc[0]["top_k_balanced_precision"] == 0.5
     assert (tmp_path / "wfo/annual_wfo_metrics.parquet").is_file()
+    assert (tmp_path / "wfo/annual_wfo_yearly_stability.parquet").is_file()
 
     second = run_anchored_annual_wfo(
         batches,
@@ -115,6 +118,7 @@ def test_annual_wfo_uses_prior_rows_bounds_oos_and_restarts(tmp_path):
 
     assert second.folds["resumed"].all()
     assert second.annual_metrics.equals(first.annual_metrics)
+    assert second.yearly_stability.equals(first.yearly_stability)
     assert factory_calls == ["called", "called"]
 
 
@@ -197,3 +201,27 @@ def test_annual_wfo_fits_feature_selection_on_prior_year_training_rows(tmp_path)
     )
 
     assert fitted_features == [["available_in_train"]]
+
+
+def test_summarize_yearly_stability_reports_dispersion_and_worst_year():
+    annual = pd.DataFrame(
+        {
+            "test_year": [2022, 2023, 2022],
+            "model_id": ["fundamental.quality", "fundamental.quality", "macro.rates"],
+            "top_k": [20, 20, 20],
+            "top_k_balanced_precision": [0.60, 0.40, 0.55],
+            "classification_balanced_accuracy": [0.52, 0.48, 0.51],
+            "top_k_long_rows": [100, 100, 100],
+        }
+    )
+
+    stability = summarize_yearly_stability(annual).set_index("model_id")
+
+    quality = stability.loc["fundamental.quality"]
+    assert quality["oos_years"] == 2
+    assert quality["first_test_year"] == 2022
+    assert quality["last_test_year"] == 2023
+    assert quality["top_k_balanced_precision_mean"] == pytest.approx(0.50)
+    assert quality["top_k_balanced_precision_std"] == pytest.approx(0.10)
+    assert quality["top_k_balanced_precision_worst"] == pytest.approx(0.40)
+    assert "top_k_long_rows_mean" not in stability.columns
