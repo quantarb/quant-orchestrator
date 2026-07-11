@@ -67,7 +67,8 @@ class OptionFamilyRankerConfig:
     output_dir: str | Path = "artifacts/option_family_ranker/per_family"
     train_end: str = "2020-12-31"
     eval_start: str = "2021-01-01"
-    max_family_features: int = 25
+    train_on_all_data: bool = True
+    max_family_features: int = 0
     max_trades: int = 0
     min_market_cap: int = 1_000_000_000_000
     start_date: str = "1900-01-01"
@@ -77,7 +78,7 @@ class OptionFamilyRankerConfig:
     target_col: str = "rank_y"
     basket_k: int = 4
     basket_min_weight: float = 0.0
-    disable_pairwise_ranker: bool = False
+    disable_pairwise_ranker: bool = True
     pairwise_pairs_per_trade: int = 20
 
 
@@ -100,6 +101,7 @@ def run_option_family_ranker_experiment(config: OptionFamilyRankerConfig) -> Opt
         output_dir=str(config.output_dir),
         train_end=str(config.train_end),
         eval_start=str(config.eval_start),
+        train_on_all_data=bool(config.train_on_all_data),
         max_family_features=int(config.max_family_features),
         max_trades=int(config.max_trades),
         min_market_cap=int(config.min_market_cap),
@@ -130,6 +132,8 @@ def main() -> None:
     parser.add_argument("--output-dir", default="artifacts/option_family_ranker/per_family")
     parser.add_argument("--train-end", default="2020-12-31")
     parser.add_argument("--eval-start", default="2021-01-01")
+    parser.add_argument("--train-on-all-data", dest="train_on_all_data", action="store_true", default=True)
+    parser.add_argument("--reserve-eval-window", dest="train_on_all_data", action="store_false")
     parser.add_argument("--max-family-features", type=int, default=25)
     parser.add_argument("--max-trades", type=int, default=0)
     parser.add_argument("--min-market-cap", type=int, default=1_000_000_000_000)
@@ -140,7 +144,8 @@ def main() -> None:
     parser.add_argument("--target-col", default="rank_y", help="Numeric option label column to predict.")
     parser.add_argument("--basket-k", type=int, default=4, help="Max option legs per basket selector.")
     parser.add_argument("--basket-min-weight", type=float, default=0.0, help="Minimum positive score for weighted basket legs.")
-    parser.add_argument("--disable-pairwise-ranker", action="store_true")
+    parser.add_argument("--disable-pairwise-ranker", dest="disable_pairwise_ranker", action="store_true", default=True)
+    parser.add_argument("--enable-pairwise-ranker", dest="disable_pairwise_ranker", action="store_false")
     parser.add_argument("--pairwise-pairs-per-trade", type=int, default=20)
     args = parser.parse_args()
     config = OptionFamilyRankerConfig(
@@ -151,6 +156,7 @@ def main() -> None:
         output_dir=args.output_dir,
         train_end=args.train_end,
         eval_start=args.eval_start,
+        train_on_all_data=bool(args.train_on_all_data),
         max_family_features=int(args.max_family_features),
         max_trades=int(args.max_trades),
         min_market_cap=int(args.min_market_cap),
@@ -179,6 +185,7 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
         symbols=requested_symbols,
     )
     target_col = str(args.target_col)
+    option_panel = _filter_oracle_entry_options(option_panel, target_col=target_col)
     if target_col not in option_panel.columns:
         raise ValueError(f"option panel missing target column {target_col!r}")
     option_panel[target_col] = pd.to_numeric(option_panel[target_col], errors="coerce")
@@ -197,56 +204,39 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
         include_all=bool(args.all_feature_families),
     )
 
-    train_base, eval_base = _split_by_entry_date(option_panel, train_end=str(args.train_end), eval_start=str(args.eval_start))
+    train_base, score_base, reserved_eval_rows, evaluation_mode = _training_and_scoring_frames(
+        option_panel,
+        train_end=str(args.train_end),
+        eval_start=str(args.eval_start),
+        train_on_all_data=bool(args.train_on_all_data),
+    )
     option_features = [
         col
         for col in OPTION_FEATURES
         if col in option_panel.columns and pd.to_numeric(option_panel[col], errors="coerce").notna().any()
     ]
-    fixed = _evaluate_selector(eval_base, score_col="fixed_near_atm_score", selector_name="fixed_near_atm", target_col=target_col)
+    fixed = _evaluate_selector(score_base, score_col="fixed_near_atm_score", selector_name="fixed_near_atm", target_col=target_col)
     oracle_baskets = _oracle_basket_metrics(
-        eval_base,
+        score_base,
         target_col=target_col,
         basket_k=int(args.basket_k),
     )
     target_suffix = _safe_score_suffix(target_col)
-    option_only_score_col = "pred_option_only_rank" if target_col == "rank_y" else f"pred_option_only_{target_suffix}"
-    baseline = _fit_score_and_evaluate(
-        train_base,
-        eval_base,
-        numeric_features=option_features,
-        random_seed=int(args.random_seed),
-        n_estimators=int(args.n_estimators),
-        score_col=option_only_score_col,
-        target_col=target_col,
-        basket_k=int(args.basket_k),
-        basket_min_weight=float(args.basket_min_weight),
-        enable_pairwise=not bool(args.disable_pairwise_ranker),
-        pairwise_pairs_per_trade=int(args.pairwise_pairs_per_trade),
-    )
-    if baseline["model"] is not None:
-        _write_pickle(out_dir / "option_only_ranker.pkl", baseline["model"])
-    if baseline["pairwise_model"] is not None:
-        _write_pickle(out_dir / "option_only_pairwise_ranker.pkl", baseline["pairwise_model"])
 
     family_summaries = []
     selector_rows = [
         {"feature_family": "fixed_near_atm", "selector": "fixed_near_atm", **fixed},
-        {"feature_family": "option_only", "selector": "option_only_ranker", **baseline["metrics"]["selector"]},
     ]
-    if baseline["metrics"].get("pairwise_selector"):
-        selector_rows.append(
-            {"feature_family": "option_only", "selector": "option_only_pairwise_ranker", **baseline["metrics"]["pairwise_selector"]}
-        )
     basket_rows = [
         {"feature_family": "oracle", "selector": name, **metrics}
         for name, metrics in oracle_baskets.items()
     ]
-    basket_rows.extend(_basket_rows("option_only", baseline["metrics"]))
     print(
         f"[option-family-ranker] target={target_col} option_rows={len(option_panel)} "
-        f"train_rows={len(train_base)} eval_rows={len(eval_base)} families={len(requested_families)} "
-        f"option_only_elapsed={perf_counter() - started:.2f}s",
+        f"train_rows={len(train_base)} score_rows={len(score_base)} reserved_eval_rows={reserved_eval_rows} "
+        f"families={len(requested_families)} "
+        f"model=RandomForestRegressor pairwise_enabled={not bool(args.disable_pairwise_ranker)} "
+        f"oracle_directional_filter=long_calls_short_puts elapsed={perf_counter() - started:.2f}s",
         flush=True,
     )
     for family_index, (source, family) in enumerate(requested_families):
@@ -258,10 +248,15 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
             metadata,
             source=source,
             family=family,
-            max_features=int(args.max_family_features),
+            max_features=(None if int(args.max_family_features) <= 0 else int(args.max_family_features)),
         )
         joined = _join_family_features(option_panel, feature_panel, selected_features)
-        train, eval_ = _split_by_entry_date(joined, train_end=str(args.train_end), eval_start=str(args.eval_start))
+        train, score_frame, family_reserved_eval_rows, family_evaluation_mode = _training_and_scoring_frames(
+            joined,
+            train_end=str(args.train_end),
+            eval_start=str(args.eval_start),
+            train_on_all_data=bool(args.train_on_all_data),
+        )
         family_features = [
             col
             for col in selected_features
@@ -270,7 +265,7 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
         score_col = f"pred_{_safe_family_dir(source, family)}_rank" if target_col == "rank_y" else f"pred_{_safe_family_dir(source, family)}_{target_suffix}"
         family_aware = _fit_score_and_evaluate(
             train,
-            eval_,
+            score_frame,
             numeric_features=[*option_features, *family_features],
             random_seed=int(args.random_seed) + 17 + family_index,
             n_estimators=int(args.n_estimators),
@@ -286,34 +281,32 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
         if family_aware["pairwise_model"] is not None:
             _write_pickle(family_dir / "pairwise_ranker.pkl", family_aware["pairwise_model"])
         scored_eval = family_aware["eval_scored"].copy()
-        if not baseline["eval_scored"].empty and option_only_score_col in baseline["eval_scored"].columns:
-            scored_eval[option_only_score_col] = baseline["eval_scored"][option_only_score_col].to_numpy()
-        baseline_pairwise_score_col = baseline["metrics"].get("pairwise_score_col")
-        if (
-            not baseline["eval_scored"].empty
-            and isinstance(baseline_pairwise_score_col, str)
-            and baseline_pairwise_score_col in baseline["eval_scored"].columns
-        ):
-            scored_eval[baseline_pairwise_score_col] = baseline["eval_scored"][baseline_pairwise_score_col].to_numpy()
         summary = {
             "option_panel": str(Path(args.option_panel).expanduser().resolve()),
             "target_col": target_col,
+            "oracle_option_filter": "long_call_short_put",
+            "ranker_model_type": "sklearn.ensemble.RandomForestRegressor",
+            "pairwise_model_enabled": not bool(args.disable_pairwise_ranker),
+            "train_on_all_data": bool(args.train_on_all_data),
+            "evaluation_mode": family_evaluation_mode,
+            "reserved_eval_rows": int(family_reserved_eval_rows),
             "requested_symbols": list(requested_symbols),
             "feature_family": f"{source}.{family}",
             "symbols": int(len(symbols)),
             "option_rows": int(len(option_panel)),
             "joined_rows": int(len(joined)),
             "train_rows": int(len(train)),
-            "eval_rows": int(len(eval_)),
+            "eval_rows": int(len(score_frame)),
+            "score_rows": int(len(score_frame)),
             "train_trades": int(train["trade_id"].nunique()) if not train.empty else 0,
-            "eval_trades": int(eval_["trade_id"].nunique()) if not eval_.empty else 0,
+            "eval_trades": int(score_frame["trade_id"].nunique()) if not score_frame.empty else 0,
+            "score_trades": int(score_frame["trade_id"].nunique()) if not score_frame.empty else 0,
             "option_feature_count": int(len(option_features)),
             "family_feature_count": int(len(family_features)),
             "option_features": option_features,
             "family_features": family_features,
             "fixed_near_atm": fixed,
             "oracle_baskets": oracle_baskets,
-            "option_only_ranker": baseline["metrics"],
             "family_ranker": family_aware["metrics"],
             "elapsed_seconds": float(perf_counter() - family_started),
         }
@@ -336,11 +329,8 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
         family_summaries.append(_flatten_family_summary(summary))
         family_selector_rows = [
             {"selector": "fixed_near_atm", **fixed},
-            {"selector": "option_only_ranker", **baseline["metrics"]["selector"]},
             {"selector": "option_plus_family_ranker", **family_aware["metrics"]["selector"]},
         ]
-        if baseline["metrics"].get("pairwise_selector"):
-            family_selector_rows.append({"selector": "option_only_pairwise_ranker", **baseline["metrics"]["pairwise_selector"]})
         if family_aware["metrics"].get("pairwise_selector"):
             family_selector_rows.append(
                 {"selector": "option_plus_family_pairwise_ranker", **family_aware["metrics"]["pairwise_selector"]}
@@ -351,7 +341,6 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
                 {"selector": name, **metrics}
                 for name, metrics in {
                     **oracle_baskets,
-                    **_model_basket_metrics("option_only_ranker", baseline["metrics"]),
                     **_model_basket_metrics("option_plus_family_ranker", family_aware["metrics"]),
                 }.items()
             ]
@@ -363,6 +352,7 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
         print(
             f"[option-family-ranker] target={target_col} "
             f"family={family_index + 1}/{len(requested_families)} {source}.{family} "
+            f"model=RandomForestRegressor pairwise_enabled={not bool(args.disable_pairwise_ranker)} "
             f"features={len(family_features)} elapsed={summary['elapsed_seconds']:.2f}s "
             f"top_k_mean={family_aware['metrics']['top_k_equal_weight_basket'].get('mean_return')} "
             f"pairwise_top_k_mean={family_aware['metrics'].get('pairwise_top_k_equal_weight_basket', {}).get('mean_return')}",
@@ -372,19 +362,26 @@ def _run_option_family_ranker_args(args: SimpleNamespace, *, config: OptionFamil
         "option_panel": str(Path(args.option_panel).expanduser().resolve()),
         "config": asdict(config),
         "target_col": target_col,
+        "oracle_option_filter": "long_call_short_put",
+        "ranker_model_type": "sklearn.ensemble.RandomForestRegressor",
+        "pairwise_model_enabled": not bool(args.disable_pairwise_ranker),
+        "train_on_all_data": bool(args.train_on_all_data),
+        "evaluation_mode": evaluation_mode,
+        "reserved_eval_rows": int(reserved_eval_rows),
         "requested_symbols": list(requested_symbols),
         "feature_families": [f"{source}.{family}" for source, family in requested_families],
         "symbols": int(len(symbols)),
         "option_rows": int(len(option_panel)),
         "train_rows": int(len(train_base)),
-        "eval_rows": int(len(eval_base)),
+        "eval_rows": int(len(score_base)),
+        "score_rows": int(len(score_base)),
         "train_trades": int(train_base["trade_id"].nunique()) if not train_base.empty else 0,
-        "eval_trades": int(eval_base["trade_id"].nunique()) if not eval_base.empty else 0,
+        "eval_trades": int(score_base["trade_id"].nunique()) if not score_base.empty else 0,
+        "score_trades": int(score_base["trade_id"].nunique()) if not score_base.empty else 0,
         "option_feature_count": int(len(option_features)),
         "option_features": option_features,
         "fixed_near_atm": fixed,
         "oracle_baskets": oracle_baskets,
-        "option_only_ranker": baseline["metrics"],
         "family_rankers": family_summaries,
         "elapsed_seconds": float(perf_counter() - started),
     }
@@ -418,6 +415,7 @@ def _load_option_panel(path: Path, *, max_trades: int, symbols: tuple[str, ...] 
     out["entry_date"] = pd.to_datetime(out["entry_date"], errors="coerce").dt.normalize()
     out["option_return"] = pd.to_numeric(out["option_return"], errors="coerce")
     out = out.dropna(subset=["trade_id", "symbol", "entry_date", "option_return"])
+    out = _filter_entry_date_tradable_options(out)
     if symbols:
         wanted = set(symbols)
         out = out.loc[out["symbol"].isin(wanted)].copy()
@@ -442,6 +440,67 @@ def _load_option_panel(path: Path, *, max_trades: int, symbols: tuple[str, ...] 
     if max_trades > 0:
         trade_ids = out[["trade_id", "entry_date"]].drop_duplicates().sort_values(["entry_date", "trade_id"]).head(max_trades)["trade_id"]
         out = out.loc[out["trade_id"].isin(set(trade_ids))].copy()
+    return out.reset_index(drop=True)
+
+
+def _filter_oracle_entry_options(frame: pd.DataFrame, *, target_col: str = "rank_y") -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    side_col = "equity_signal_side" if "equity_signal_side" in frame.columns else "side" if "side" in frame.columns else None
+    if side_col is None:
+        raise ValueError("option panel must include 'equity_signal_side' or 'side' to filter oracle-entry calls/puts")
+    if "option_type" not in frame.columns:
+        raise ValueError("option panel must include 'option_type' to filter oracle-entry calls/puts")
+
+    out = frame.copy()
+    side = out[side_col].astype(str).str.lower().str.strip()
+    option_type = out["option_type"].astype(str).str.lower().str.strip()
+    normalized_side = pd.Series(np.nan, index=out.index, dtype=object)
+    normalized_side.loc[side.isin({"long", "buy", "bull", "bullish", "oracle_long", "oracle_buy"})] = "long"
+    normalized_side.loc[side.isin({"short", "sell", "bear", "bearish", "oracle_short", "oracle_sell"})] = "short"
+    normalized_option_type = pd.Series(np.nan, index=out.index, dtype=object)
+    normalized_option_type.loc[option_type.str.startswith("c", na=False)] = "call"
+    normalized_option_type.loc[option_type.str.startswith("p", na=False)] = "put"
+
+    keep = ((normalized_side == "long") & (normalized_option_type == "call")) | (
+        (normalized_side == "short") & (normalized_option_type == "put")
+    )
+    if "option_action" in out.columns:
+        action = out["option_action"].astype(str).str.lower().str.strip()
+        keep &= ((normalized_side == "long") & action.eq("buy_call")) | (
+            (normalized_side == "short") & action.eq("buy_put")
+        )
+    out = out.loc[keep].copy()
+    if out.empty:
+        raise ValueError("oracle option filter removed all rows; expected long/buy call rows and short/sell put rows")
+    if target_col == "rank_y" and "option_return" in out.columns:
+        out["rank_y"] = (
+            out.groupby("trade_id")["option_return"]
+            .rank(method="average", pct=True, ascending=True)
+            .astype(float)
+        )
+    return out.reset_index(drop=True)
+
+
+def _filter_entry_date_tradable_options(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    if "expiration" not in frame.columns:
+        raise ValueError("option panel must include 'expiration' so training only uses contracts tradable on entry_date")
+    out = frame.copy()
+    entry_dates = pd.to_datetime(out["entry_date"], errors="coerce").dt.normalize()
+    expirations = pd.to_datetime(out["expiration"], errors="coerce").dt.normalize()
+    keep = entry_dates.notna() & expirations.notna() & expirations.ge(entry_dates)
+
+    for date_col in ("snapshot_date", "quote_date", "option_date", "as_of_date"):
+        if date_col not in out.columns:
+            continue
+        option_dates = pd.to_datetime(out[date_col], errors="coerce").dt.normalize()
+        keep &= option_dates.notna() & option_dates.eq(entry_dates)
+
+    out = out.loc[keep].copy()
+    if out.empty:
+        raise ValueError("option panel has no contracts tradable on their entry_date")
     return out.reset_index(drop=True)
 
 
@@ -517,7 +576,7 @@ def _select_family_features(
     *,
     source: str,
     family: str,
-    max_features: int,
+    max_features: int | None,
 ) -> tuple[list[str], pd.DataFrame, pd.DataFrame]:
     family_meta = metadata.loc[
         metadata["source"].astype(str).eq(source) & metadata["family"].astype(str).eq(family)
@@ -596,11 +655,18 @@ def _flatten_family_summary(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _join_family_features(option_panel: pd.DataFrame, feature_panel: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+def _join_family_features(
+    option_panel: pd.DataFrame,
+    feature_panel: pd.DataFrame,
+    feature_cols: list[str],
+) -> pd.DataFrame:
     left = option_panel.copy()
     left["_row_id"] = np.arange(len(left))
+    left["entry_date"] = pd.to_datetime(left["entry_date"], errors="coerce").dt.normalize()
     left = left.sort_values(["symbol", "entry_date", "_row_id"])
-    right = feature_panel.rename(columns={"date": "feature_date"}).sort_values(["symbol", "feature_date"])
+    right = feature_panel.rename(columns={"date": "feature_date"}).copy()
+    right["feature_date"] = pd.to_datetime(right["feature_date"], errors="coerce").dt.normalize()
+    right = right.dropna(subset=["feature_date"]).sort_values(["symbol", "feature_date"])
     merged_parts: list[pd.DataFrame] = []
     for symbol, group in left.groupby("symbol", sort=False):
         family = right.loc[right["symbol"].eq(symbol)]
@@ -626,6 +692,20 @@ def _split_by_entry_date(frame: pd.DataFrame, *, train_end: str, eval_start: str
     train = frame.loc[dates.le(pd.Timestamp(train_end))].copy()
     eval_ = frame.loc[dates.ge(pd.Timestamp(eval_start))].copy()
     return train.reset_index(drop=True), eval_.reset_index(drop=True)
+
+
+def _training_and_scoring_frames(
+    frame: pd.DataFrame,
+    *,
+    train_end: str,
+    eval_start: str,
+    train_on_all_data: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, int, str]:
+    if train_on_all_data:
+        all_rows = frame.copy().reset_index(drop=True)
+        return all_rows, all_rows.copy(), 0, "train_in_sample_no_reserved_eval"
+    train, eval_ = _split_by_entry_date(frame, train_end=train_end, eval_start=eval_start)
+    return train, eval_, int(len(eval_)), "held_out_eval_window"
 
 
 def _fit_score_and_evaluate(

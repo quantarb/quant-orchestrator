@@ -84,6 +84,8 @@ class MLTradingExperimentConfig:
     run_zipline_backtests: bool = True
     include_yearly_vectorized_diagnostics: bool = True
     backtesting_py_symbol_cases_per_side: int = 10
+    run_model_diagnostics: bool = True
+    run_trading_diagnostics: bool = True
     random_seed: int = 20260702
     provider: str = "fmp"
     event_families: tuple[str, ...] = (
@@ -232,6 +234,7 @@ def run_ml_trading_experiment(
             equity_provider=config.provider,
             etf_provider=config.provider,
             equity_symbols=symbols,
+            etf_symbols=(),
             include_macro=config.refresh_missing_fmp_include_macro,
             include_prices=config.refresh_missing_fmp_include_prices,
             force_macro=config.refresh_missing_fmp_force_macro,
@@ -286,10 +289,12 @@ def run_ml_trading_experiment(
         )
     else:
         mark_phase("load_event_pairs", event_rows=0, event_load_seconds=0.0, skipped=True)
-    oracle_label_rows, oracle_label_diagnostics, oracle_seconds = _build_oracle_trade_label_rows_sparse(
-        symbols,
-        target_config,
-        warehouse=warehouse,
+    oracle_label_rows, oracle_label_diagnostics, oracle_seconds, _oracle_unique_windows = (
+        _build_oracle_trade_label_rows_sparse(
+            symbols,
+            target_config,
+            warehouse=warehouse,
+        )
     )
     event_label_rows, event_label_diagnostics = (
         collapsed_label_rows(collapsed_event_panel, pd.DataFrame())
@@ -323,6 +328,7 @@ def run_ml_trading_experiment(
         train_end=train_end,
         oos_start=oos_start,
         fit_all_available_data=config.fit_all_available_data,
+        run_model_diagnostics=config.run_model_diagnostics,
     )
     mark_phase("train_family_models", trained_models=int((model_results["status"] == "ok").sum()) if "status" in model_results else len(model_results))
     strategy_scores, mean_scores = _score_family_models(
@@ -332,41 +338,55 @@ def run_ml_trading_experiment(
         score_start=score_start,
     )
     mark_phase("score_family_models", score_rows=len(strategy_scores), strategy_sources=strategy_scores["strategy_source"].nunique() if not strategy_scores.empty else 0)
-    price_frames = _load_price_frames(
-        warehouse,
-        symbols,
-        provider=config.provider,
-        start=config.start_date,
-        end=config.end_date,
-    )
-    mark_phase("load_price_frames", price_symbols=len(price_frames))
-    backtest_summary, trade_log, yearly_backtest_summary, trade_generation_audit = _run_shared_book_backtests(
-        config,
-        strategy_scores,
-        price_frames,
-        oos_start=oos_start,
-    )
-    mark_phase(
-        "shared_book_backtests",
-        zipline_rows=len(backtest_summary),
-        yearly_rows=len(yearly_backtest_summary),
-        run_zipline_backtests=bool(config.run_zipline_backtests),
-    )
-    symbol_strategy_summary, symbol_robustness_summary = _run_symbol_rule_diagnostics(
-        config,
-        strategy_scores,
-        price_frames,
-        oos_start=oos_start,
-    )
-    mark_phase("symbol_rule_diagnostics", symbol_rows=len(symbol_strategy_summary), robustness_rows=len(symbol_robustness_summary))
-    backtesting_py_symbol_validation = _run_backtesting_py_symbol_validation(
-        config,
-        strategy_scores,
-        price_frames,
-        symbol_strategy_summary,
-        oos_start=oos_start,
-    )
-    mark_phase("backtesting_py_symbol_validation", validation_rows=len(backtesting_py_symbol_validation))
+    if config.run_trading_diagnostics:
+        price_frames = _load_price_frames(
+            warehouse,
+            symbols,
+            provider=config.provider,
+            start=config.start_date,
+            end=config.end_date,
+        )
+        mark_phase("load_price_frames", price_symbols=len(price_frames))
+        backtest_summary, trade_log, yearly_backtest_summary, trade_generation_audit = _run_shared_book_backtests(
+            config,
+            strategy_scores,
+            price_frames,
+            oos_start=oos_start,
+        )
+        mark_phase(
+            "shared_book_backtests",
+            zipline_rows=len(backtest_summary),
+            yearly_rows=len(yearly_backtest_summary),
+            run_zipline_backtests=bool(config.run_zipline_backtests),
+        )
+        symbol_strategy_summary, symbol_robustness_summary = _run_symbol_rule_diagnostics(
+            config,
+            strategy_scores,
+            price_frames,
+            oos_start=oos_start,
+        )
+        mark_phase("symbol_rule_diagnostics", symbol_rows=len(symbol_strategy_summary), robustness_rows=len(symbol_robustness_summary))
+        backtesting_py_symbol_validation = _run_backtesting_py_symbol_validation(
+            config,
+            strategy_scores,
+            price_frames,
+            symbol_strategy_summary,
+            oos_start=oos_start,
+        )
+        mark_phase("backtesting_py_symbol_validation", validation_rows=len(backtesting_py_symbol_validation))
+    else:
+        price_frames = {}
+        backtest_summary = pd.DataFrame()
+        trade_log = pd.DataFrame()
+        yearly_backtest_summary = pd.DataFrame()
+        symbol_strategy_summary = pd.DataFrame()
+        symbol_robustness_summary = pd.DataFrame()
+        backtesting_py_symbol_validation = pd.DataFrame()
+        trade_generation_audit = {"skipped": True, "reason": "run_trading_diagnostics=False"}
+        mark_phase("load_price_frames", skipped=True)
+        mark_phase("shared_book_backtests", skipped=True)
+        mark_phase("symbol_rule_diagnostics", skipped=True)
+        mark_phase("backtesting_py_symbol_validation", skipped=True)
     model_oos_summary = _model_oos_summary(model_results)
     model_vs_trading = model_vs_trading_summary(model_results, backtest_summary)
     metric_correlations = metric_correlation_summary(
@@ -661,8 +681,25 @@ def _build_oracle_trade_label_rows_sparse(
     config,
     *,
     warehouse,
-) -> tuple[pd.DataFrame, pd.DataFrame, float]:
-    """Build collapsed oracle labels without materializing dense per-k target columns."""
+) -> tuple[pd.DataFrame, pd.DataFrame, float, pd.DataFrame]:
+    """Build collapsed oracle labels from unique trade windows.
+
+    Multi-k solvers often emit the same ``(symbol, side, entry_date, exit_date)``
+    window for several k values. Windows are deduped on that key first; labels are
+    then collapsed to entry-date long/short rows (ambiguous long+short entry dates
+    dropped).
+
+    Returns
+    -------
+    labels
+        ``symbol, date, collapsed_label, label_source`` rows for training.
+    diagnostics
+        Row-count diagnostics (multi-k raw vs unique windows vs labels).
+    elapsed_seconds
+        Wall time for this builder.
+    unique_windows
+        One row per unique ``(symbol, side, entry_date, exit_date)`` window.
+    """
 
     from quant_warehouse.platforms.data_providers.fmp.target_engineering.strategy_solver import (
         solve_side_trades_by_frequency_batched_multi_k,
@@ -684,8 +721,9 @@ def _build_oracle_trade_label_rows_sparse(
             continue
         price_frames[symbol] = prices
 
-    long_dates: set[tuple[str, pd.Timestamp]] = set()
-    short_dates: set[tuple[str, pd.Timestamp]] = set()
+    # key: (symbol, side, entry_date, exit_date) -> metadata for unique windows
+    unique_window_meta: dict[tuple[str, str, pd.Timestamp, pd.Timestamp], dict[str, object]] = {}
+    multi_k_raw_rows = 0
     k_by_frequency = config.oracle_trade_k_by_frequency or {"YE": tuple(range(1, 13))}
     for raw_frequency, raw_ks in k_by_frequency.items():
         frequency = str(raw_frequency or "").strip().upper()
@@ -702,20 +740,111 @@ def _build_oracle_trade_label_rows_sparse(
             short_entry_price_col=config.oracle_trade_short_entry_price_col,
             short_exit_price_col=config.oracle_trade_short_exit_price_col,
         )
-        for trades_by_symbol in trades_by_k.values():
+        for k_value, trades_by_symbol in trades_by_k.items():
             for raw_symbol, trades in trades_by_symbol.items():
                 symbol = str(raw_symbol).strip().upper()
                 for trade in trades or []:
-                    entry_date = getattr(trade.get("entry_row"), "name", None)
-                    date = pd.to_datetime(entry_date, errors="coerce")
-                    if pd.isna(date):
-                        continue
-                    key = (symbol, pd.Timestamp(date).normalize())
                     side = str(trade.get("side") or "").strip().lower()
-                    if side == "long":
-                        long_dates.add(key)
-                    elif side == "short":
-                        short_dates.add(key)
+                    if side not in {"long", "short"}:
+                        continue
+                    entry_date = pd.to_datetime(
+                        getattr(trade.get("entry_row"), "name", None), errors="coerce"
+                    )
+                    exit_date = pd.to_datetime(
+                        getattr(trade.get("exit_row"), "name", None), errors="coerce"
+                    )
+                    if pd.isna(entry_date) or pd.isna(exit_date):
+                        continue
+                    entry_date = pd.Timestamp(entry_date).normalize()
+                    exit_date = pd.Timestamp(exit_date).normalize()
+                    if exit_date <= entry_date:
+                        continue
+                    multi_k_raw_rows += 1
+                    window_key = (symbol, side, entry_date, exit_date)
+                    meta = unique_window_meta.get(window_key)
+                    if meta is None:
+                        unique_window_meta[window_key] = {
+                            "symbol": symbol,
+                            "side": side,
+                            "entry_date": entry_date,
+                            "exit_date": exit_date,
+                            "freq": frequency,
+                            "k_values": {int(k_value)},
+                            "entry_price": trade.get("entry_price"),
+                            "exit_price": trade.get("exit_price"),
+                            "profit": trade.get("profit"),
+                            "multi_k_rows": 1,
+                        }
+                    else:
+                        meta["k_values"].add(int(k_value))  # type: ignore[union-attr]
+                        meta["multi_k_rows"] = int(meta["multi_k_rows"]) + 1
+                        # keep first prices/profit; freq is already set
+
+    if unique_window_meta:
+        window_rows = []
+        for meta in unique_window_meta.values():
+            k_vals = sorted(int(v) for v in meta["k_values"])  # type: ignore[arg-type]
+            entry_date = pd.Timestamp(meta["entry_date"])
+            exit_date = pd.Timestamp(meta["exit_date"])
+            window_rows.append(
+                {
+                    "symbol": meta["symbol"],
+                    "side": meta["side"],
+                    "entry_date": entry_date,
+                    "exit_date": exit_date,
+                    "freq": meta["freq"],
+                    "k_min": k_vals[0],
+                    "k_max": k_vals[-1],
+                    "k_count": len(k_vals),
+                    "k_values": ",".join(str(v) for v in k_vals),
+                    "multi_k_rows": int(meta["multi_k_rows"]),
+                    "entry_price": meta.get("entry_price"),
+                    "exit_price": meta.get("exit_price"),
+                    "profit": meta.get("profit"),
+                    "hold_days": int((exit_date - entry_date).days),
+                    "trade_id": (
+                        f"{meta['symbol']}|{meta['side']}|"
+                        f"{entry_date.strftime('%Y%m%d')}|{exit_date.strftime('%Y%m%d')}"
+                    ),
+                }
+            )
+        unique_windows = (
+            pd.DataFrame(window_rows)
+            .sort_values(["entry_date", "symbol", "side", "exit_date"], kind="stable")
+            .reset_index(drop=True)
+        )
+    else:
+        unique_windows = pd.DataFrame(
+            columns=[
+                "symbol",
+                "side",
+                "entry_date",
+                "exit_date",
+                "freq",
+                "k_min",
+                "k_max",
+                "k_count",
+                "k_values",
+                "multi_k_rows",
+                "entry_price",
+                "exit_price",
+                "profit",
+                "hold_days",
+                "trade_id",
+            ]
+        )
+
+    long_dates: set[tuple[str, pd.Timestamp]] = set()
+    short_dates: set[tuple[str, pd.Timestamp]] = set()
+    if not unique_windows.empty:
+        for symbol, side, entry_date in unique_windows[["symbol", "side", "entry_date"]].itertuples(
+            index=False, name=None
+        ):
+            key = (str(symbol).upper(), pd.Timestamp(entry_date).normalize())
+            if str(side).lower() == "long":
+                long_dates.add(key)
+            elif str(side).lower() == "short":
+                short_dates.add(key)
 
     ambiguous = long_dates & short_dates
     rows = [
@@ -736,14 +865,19 @@ def _build_oracle_trade_label_rows_sparse(
         [
             {
                 "source": "oracle_trade",
-                "candidate_rows": len(long_dates | short_dates),
+                "candidate_rows": multi_k_raw_rows,
                 "used_rows": len(labels),
-                "dropped_rows": len(ambiguous),
-                "note": "sparse collapsed oracle labels; ambiguous long+short rows dropped after k collapse",
+                "dropped_rows": max(0, multi_k_raw_rows - len(unique_windows)) + len(ambiguous),
+                "unique_trade_windows": len(unique_windows),
+                "ambiguous_entry_dates": len(ambiguous),
+                "note": (
+                    "unique windows on (symbol, side, entry_date, exit_date); "
+                    "labels collapsed to entry date; ambiguous long+short entry dates dropped"
+                ),
             }
         ]
     )
-    return labels, diagnostics, perf_counter() - started
+    return labels, diagnostics, perf_counter() - started, unique_windows
 
 
 def _combine_label_rows(*frames: pd.DataFrame) -> pd.DataFrame:
@@ -770,6 +904,7 @@ def _train_family_models(
     train_end: pd.Timestamp,
     oos_start: pd.Timestamp,
     fit_all_available_data: bool = False,
+    run_model_diagnostics: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
     model_rows = []
     models = {}
@@ -864,22 +999,44 @@ def _train_family_models(
                 "base_family": str(family),
                 "representation": representation,
             }
-            train_proba = classifier.predict_proba_frame(train_rep, train_features)
-            train_scores = classification_probability_diagnostics(
-                train_rep,
-                train_proba,
-                target_col="collapsed_label",
-                labels=classifier.encoder.classes_,
-            )
-            if not oos_rep.empty and oos_rep["collapsed_label"].nunique() > 1:
-                oos_proba = classifier.predict_proba_frame(oos_rep, train_features)
-                oos_scores = classification_probability_diagnostics(
-                    oos_rep,
-                    oos_proba,
+            if run_model_diagnostics:
+                train_proba = classifier.predict_proba_frame(train_rep, train_features)
+                train_scores = classification_probability_diagnostics(
+                    train_rep,
+                    train_proba,
                     target_col="collapsed_label",
                     labels=classifier.encoder.classes_,
                 )
+                if not oos_rep.empty and oos_rep["collapsed_label"].nunique() > 1:
+                    oos_proba = classifier.predict_proba_frame(oos_rep, train_features)
+                    oos_scores = classification_probability_diagnostics(
+                        oos_rep,
+                        oos_proba,
+                        target_col="collapsed_label",
+                        labels=classifier.encoder.classes_,
+                    )
+                else:
+                    oos_scores = {
+                        "rows": len(oos_rep),
+                        "accuracy": np.nan,
+                        "balanced_accuracy": np.nan,
+                        "macro_f1": np.nan,
+                        "log_loss": np.nan,
+                        "brier_macro": np.nan,
+                        "expected_calibration_error": np.nan,
+                        "mean_confidence": np.nan,
+                    }
             else:
+                train_scores = {
+                    "rows": len(train_rep),
+                    "accuracy": np.nan,
+                    "balanced_accuracy": np.nan,
+                    "macro_f1": np.nan,
+                    "log_loss": np.nan,
+                    "brier_macro": np.nan,
+                    "expected_calibration_error": np.nan,
+                    "mean_confidence": np.nan,
+                }
                 oos_scores = {
                     "rows": len(oos_rep),
                     "accuracy": np.nan,
