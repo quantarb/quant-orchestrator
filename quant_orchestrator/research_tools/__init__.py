@@ -28,6 +28,12 @@ from quant_orchestrator.research_tools.family_score_pipeline import (
     release_training_memory,
     train_and_materialize_family_scores,
 )
+from quant_orchestrator.research_tools.anchored_annual_wfo import (
+    AnchoredAnnualWFOConfig,
+    AnchoredAnnualWFOResult,
+    process_peak_rss_mb,
+    run_anchored_annual_wfo,
+)
 from quant_orchestrator.research_tools.attribution import (
     DEFAULT_ATTRIBUTION_DIMENSIONS,
     attach_security_context,
@@ -83,6 +89,8 @@ from quant_orchestrator.research_tools.synthetic_options_backtest import (
 __all__ = [
     "MLTradingExperimentConfig",
     "MLTradingExperimentResult",
+    "AnchoredAnnualWFOConfig",
+    "AnchoredAnnualWFOResult",
     "SCORE_COLUMNS",
     "FamilyClassifierConfig",
     "DEFAULT_ATTRIBUTION_DIMENSIONS",
@@ -129,10 +137,12 @@ __all__ = [
     "normalize_family_scores",
     "option_experiment_artifact_dir",
     "prepare_family_dataset",
+    "process_peak_rss_mb",
     "rank_option_window_strategy_sources",
     "read_backtest_panel",
     "release_training_memory",
     "run_ml_trading_experiment",
+    "run_anchored_annual_wfo",
     "run_option_family_ranker_experiment",
     "run_backtest_report_option_execution",
     "run_backtest_report_option_experiment",

@@ -43,6 +43,7 @@ def test_annual_wfo_uses_prior_rows_bounds_oos_and_restarts(tmp_path):
     lineage_path = write_dataset_lineage_manifest(lineage, tmp_path / "lineage.json")
     fit_dates = []
     factory_calls = []
+    memory_samples = iter([100.0, 120.0, 125.5])
 
     def batches():
         factory_calls.append("called")
@@ -58,7 +59,13 @@ def test_annual_wfo_uses_prior_rows_bounds_oos_and_restarts(tmp_path):
         input_lineage_paths=(lineage_path,), test_years=(2021, 2020), min_train_rows=2,
         persist_models=False, run_diagnostics=False,
     )
-    first = run_anchored_annual_wfo(batches, labels, config=config, classifier_factory=classifier_factory)
+    first = run_anchored_annual_wfo(
+        batches,
+        labels,
+        config=config,
+        classifier_factory=classifier_factory,
+        memory_probe=lambda: next(memory_samples),
+    )
 
     assert list(first.folds["test_year"]) == [2020, 2021]
     assert factory_calls == ["called", "called"]
@@ -67,8 +74,16 @@ def test_annual_wfo_uses_prior_rows_bounds_oos_and_restarts(tmp_path):
     scores_2021 = FamilyScoreStore(tmp_path / "wfo/test_year=2021/scores").read_scores()
     assert set(scores_2020["date"]) == {pd.Timestamp("2020-01-02")}
     assert set(scores_2021["date"]) == {pd.Timestamp("2021-01-02")}
+    assert first.peak_unified_memory_rss_mb == 125.5
+    assert first.folds["peak_unified_memory_rss_mb"].tolist() == [120.0, 125.5]
 
-    second = run_anchored_annual_wfo(batches, labels, config=config, classifier_factory=classifier_factory)
+    second = run_anchored_annual_wfo(
+        batches,
+        labels,
+        config=config,
+        classifier_factory=classifier_factory,
+        memory_probe=lambda: 130.0,
+    )
 
     assert second.folds["resumed"].all()
     assert factory_calls == ["called", "called"]

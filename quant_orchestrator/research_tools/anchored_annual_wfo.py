@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import resource
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -48,9 +49,11 @@ class AnchoredAnnualWFOResult:
     folds: pd.DataFrame
     checkpoint_path: Path
     elapsed_seconds: float
+    peak_unified_memory_rss_mb: float
 
 
 BatchFactory = Callable[[], Iterable[FeatureFamilyBatch]]
+MemoryProbe = Callable[[], float]
 
 
 def run_anchored_annual_wfo(
@@ -61,6 +64,7 @@ def run_anchored_annual_wfo(
     classifier_factory: ClassifierFactory | None = None,
     cleanup_callback: CleanupCallback | None = None,
     progress_logger: ProgressLogger | None = None,
+    memory_probe: MemoryProbe | None = None,
 ) -> AnchoredAnnualWFOResult:
     """Run independently streamed family classifiers for anchored annual OOS folds.
 
@@ -69,6 +73,8 @@ def run_anchored_annual_wfo(
     """
 
     started = perf_counter()
+    probe = memory_probe or process_peak_rss_mb
+    peak_unified_memory_rss_mb = float(probe())
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / "annual_wfo_checkpoint.json"
@@ -123,7 +129,14 @@ def run_anchored_annual_wfo(
             cleanup_callback=cleanup_callback,
             progress_logger=progress_logger,
         )
-        row = _fold_row(test_year, train_end, result, perf_counter() - fold_started)
+        peak_unified_memory_rss_mb = max(peak_unified_memory_rss_mb, float(probe()))
+        row = _fold_row(
+            test_year,
+            train_end,
+            result,
+            perf_counter() - fold_started,
+            peak_unified_memory_rss_mb,
+        )
         completed[fold_id] = row
         fold_rows.append({**row, "resumed": False})
         _write_checkpoint(checkpoint_path, config, completed)
@@ -135,6 +148,7 @@ def run_anchored_annual_wfo(
         folds=folds,
         checkpoint_path=checkpoint_path,
         elapsed_seconds=perf_counter() - started,
+        peak_unified_memory_rss_mb=peak_unified_memory_rss_mb,
     )
 
 
@@ -158,6 +172,7 @@ def _fold_row(
     train_end: pd.Timestamp,
     result: FamilyScoreRunResult,
     seconds: float,
+    peak_unified_memory_rss_mb: float,
 ) -> dict[str, Any]:
     return {
         "test_year": int(test_year),
@@ -167,8 +182,29 @@ def _fold_row(
         "models_trained": int(result.model_results.get("status", pd.Series(dtype=str)).eq("ok").sum()),
         "score_rows": int(result.score_rows),
         "elapsed_seconds": float(seconds),
+        "peak_unified_memory_rss_mb": float(peak_unified_memory_rss_mb),
         "manifest_path": str(result.manifest_path),
     }
+
+
+def process_peak_rss_mb() -> float:
+    """Return this process's peak resident memory in MiB.
+
+    Linux ``VmHWM`` includes host-resident CUDA unified-memory pages, making it
+    the useful reproducible process-level bound for the CUDA-first WFO smoke run.
+    ``ru_maxrss`` is retained as a portable fallback (bytes on macOS, KiB on
+    Linux and other supported Unix platforms).
+    """
+
+    status_path = Path("/proc/self/status")
+    if status_path.is_file():
+        for line in status_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmHWM:"):
+                return float(line.split()[1]) / 1024.0
+    peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    if __import__("sys").platform == "darwin":
+        peak /= 1024.0
+    return peak / 1024.0
 
 
 def _read_checkpoint(path: Path) -> dict[str, Any]:
