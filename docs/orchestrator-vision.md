@@ -148,6 +148,8 @@ Current examples:
 
 Reusable raw classifier-family training uses a bounded lifecycle: load one feature family, train its classifier, materialize standardized score partitions, persist the native model, and release CPU/GPU memory before loading the next family. The score artifact—not a process-wide model dictionary—is the reusable handoff into ensembles, meta-models, and trading strategies. Autoencoder representations remain a separate optional experiment path and are not part of the raw classifier configuration.
 
+Score publication requires immutable Quant Warehouse input-lineage manifests. Their combined fingerprint is stored in every score row and the family-score run manifest. Consumers can require an expected lineage fingerprint, and ensembles reject mixed or missing lineage rather than silently combining predictions produced from different datasets or recipes.
+
 ML outputs should remain native unless there is a clear reason to normalize them. A common metrics table is useful for comparison, but the platform should still store framework-specific reports and artifacts.
 
 ## Intended Workflow Examples

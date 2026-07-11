@@ -12,6 +12,7 @@ from time import perf_counter
 from typing import Any, Protocol
 
 import pandas as pd
+from quant_warehouse.lineage import canonical_fingerprint, read_dataset_lineage_manifest
 
 from quant_orchestrator.platforms.ml_frameworks.rapids import RapidsRandomForestClassifier
 from quant_orchestrator.research_tools.ml_trading import (
@@ -37,6 +38,7 @@ SCORE_COLUMNS = (
     "score_rank",
     "training_end",
     "is_out_of_sample",
+    "lineage_fingerprint",
 )
 
 
@@ -82,6 +84,7 @@ class ScoreMaterializationConfig:
     output_dir: Path
     run_id: str
     target_id: str
+    input_lineage_paths: tuple[Path, ...]
     rows_per_chunk: int = 250_000
     model_version: str = "1"
     persist_models: bool = True
@@ -138,6 +141,7 @@ class FamilyScoreStore:
         model_ids: Iterable[str] | None = None,
         start: str | None = None,
         end: str | None = None,
+        expected_lineage_fingerprint: str | None = None,
     ) -> pd.DataFrame:
         wanted = {str(value) for value in model_ids or ()}
         paths = sorted(self.root.glob("model=*/year=*/part-*.parquet"))
@@ -158,6 +162,13 @@ class FamilyScoreStore:
             dates = pd.to_datetime(out["date"], errors="coerce")
         if end is not None:
             out = out.loc[dates.le(pd.Timestamp(end))].copy()
+        if expected_lineage_fingerprint is not None:
+            actual = set(out["lineage_fingerprint"].dropna().astype(str))
+            if actual != {str(expected_lineage_fingerprint)}:
+                raise ValueError(
+                    "score lineage mismatch: "
+                    f"expected={expected_lineage_fingerprint!r} actual={sorted(actual)!r}"
+                )
         return out.reset_index(drop=True)
 
 
@@ -214,6 +225,7 @@ def train_and_materialize_family_scores(
         model_dir.mkdir(parents=True, exist_ok=True)
 
     labels = _normalize_labels(label_rows, target_col=classifier.target_col)
+    input_lineage, lineage_fingerprint = _load_input_lineage(materialization.input_lineage_paths)
     factory = classifier_factory or _fit_rapids_classifier
     cleanup = cleanup_callback or release_training_memory
     model_rows: list[dict[str, Any]] = []
@@ -241,6 +253,7 @@ def train_and_materialize_family_scores(
                         train_rows=len(training_frame),
                         score_rows=0,
                         seconds=perf_counter() - family_started,
+                        lineage_fingerprint=lineage_fingerprint,
                     )
                 )
                 continue
@@ -281,6 +294,7 @@ def train_and_materialize_family_scores(
                     batch=batch,
                     classifier=classifier,
                     materialization=materialization,
+                    lineage_fingerprint=lineage_fingerprint,
                 )
                 paths = score_store.write_chunk(scores, model_id=batch.model_id, chunk_number=chunk_number)
                 score_paths.extend(str(path.relative_to(output_dir)) for path in paths)
@@ -297,6 +311,7 @@ def train_and_materialize_family_scores(
                         train_rows=len(training_frame),
                         score_rows=family_score_rows,
                         seconds=perf_counter() - family_started,
+                        lineage_fingerprint=lineage_fingerprint,
                     ),
                     "model_path": None if model_path is None else str(model_path.relative_to(output_dir)),
                     **diagnostics,
@@ -318,6 +333,8 @@ def train_and_materialize_family_scores(
         "schema_version": 1,
         "run_id": materialization.run_id,
         "target_id": materialization.target_id,
+        "lineage_fingerprint": lineage_fingerprint,
+        "input_lineage": input_lineage,
         "score_columns": list(SCORE_COLUMNS),
         "score_rows": int(total_score_rows),
         "models_requested": int(len(model_rows)),
@@ -367,8 +384,11 @@ def build_score_ensemble(
         selected = selected.loc[selected["model_id"].astype(str).isin(wanted)].copy()
     if selected.empty:
         return pd.DataFrame(columns=list(SCORE_COLUMNS))
+    lineage_values = set(selected["lineage_fingerprint"].dropna().astype(str))
+    if len(lineage_values) != 1:
+        raise ValueError(f"cannot ensemble mixed or missing score lineage: {sorted(lineage_values)!r}")
     grouped = (
-        selected.groupby(["run_id", "target_id", "symbol", "date"], as_index=False)
+        selected.groupby(["run_id", "target_id", "lineage_fingerprint", "symbol", "date"], as_index=False)
         .agg(
             long_score=("long_score", "mean"),
             short_score=("short_score", "mean"),
@@ -479,6 +499,7 @@ def _score_contract_columns(
     batch: FeatureFamilyBatch,
     classifier: FamilyClassifierConfig,
     materialization: ScoreMaterializationConfig,
+    lineage_fingerprint: str,
 ) -> pd.DataFrame:
     out = scores.copy()
     out["run_id"] = materialization.run_id
@@ -488,6 +509,7 @@ def _score_contract_columns(
     out["feature_family"] = batch.family
     out["training_end"] = pd.Timestamp(classifier.train_end).normalize()
     out["is_out_of_sample"] = pd.to_datetime(out["date"], errors="coerce").gt(pd.Timestamp(classifier.train_end))
+    out["lineage_fingerprint"] = lineage_fingerprint
     out["score_rank"] = out.groupby("date")["long_score"].rank(method="average", pct=True)
     return normalize_family_scores(out)
 
@@ -500,6 +522,7 @@ def _model_result_row(
     train_rows: int,
     score_rows: int,
     seconds: float,
+    lineage_fingerprint: str,
 ) -> dict[str, Any]:
     return {
         "model_id": batch.model_id,
@@ -510,6 +533,7 @@ def _model_result_row(
         "train_rows": int(train_rows),
         "score_rows": int(score_rows),
         "elapsed_seconds": float(seconds),
+        "lineage_fingerprint": lineage_fingerprint,
     }
 
 
@@ -525,3 +549,14 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
     return value
+
+
+def _load_input_lineage(paths: tuple[Path, ...]) -> tuple[list[dict[str, Any]], str]:
+    if not paths:
+        raise ValueError("at least one input lineage manifest is required before publishing scores")
+    manifests = [read_dataset_lineage_manifest(Path(path)) for path in paths]
+    identities = [str(manifest["lineage_fingerprint"]) for manifest in manifests]
+    if len(identities) != len(set(identities)):
+        raise ValueError("duplicate input lineage manifests are not allowed")
+    combined = canonical_fingerprint({"input_lineage_fingerprints": sorted(identities)})
+    return manifests, combined

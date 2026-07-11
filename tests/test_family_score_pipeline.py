@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import pytest
+from quant_warehouse.lineage import build_dataset_lineage_manifest, write_dataset_lineage_manifest
 
 from quant_orchestrator.research_tools.family_score_pipeline import (
     SCORE_COLUMNS,
@@ -74,6 +75,31 @@ def _labels() -> pd.DataFrame:
     )
 
 
+def _lineage_paths(tmp_path):
+    feature_manifest = build_dataset_lineage_manifest(
+        _feature_panel(),
+        dataset_id="features",
+        dataset_kind="feature_panel",
+        provider="fmp",
+        available_at_cutoff="2020-01-04",
+        recipe_id="features-v1",
+        recipe={"families": ["quality", "value"]},
+    )
+    label_manifest = build_dataset_lineage_manifest(
+        _labels(),
+        dataset_id="labels",
+        dataset_kind="target_panel",
+        provider="fmp",
+        available_at_cutoff="2020-01-04",
+        recipe_id="labels-v1",
+        recipe={"target": "oracle_side"},
+    )
+    return (
+        write_dataset_lineage_manifest(feature_manifest, tmp_path / "feature_lineage.json"),
+        write_dataset_lineage_manifest(label_manifest, tmp_path / "label_lineage.json"),
+    )
+
+
 def test_iter_feature_family_batches_yields_only_family_columns():
     batches = list(iter_feature_family_batches(_feature_panel(), _metadata()))
 
@@ -113,6 +139,7 @@ def test_streaming_pipeline_materializes_reusable_scores_and_releases_each_model
             output_dir=output,
             run_id="run-1",
             target_id="oracle_side",
+            input_lineage_paths=_lineage_paths(tmp_path),
             rows_per_chunk=2,
         ),
         classifier_factory=factory,
@@ -127,11 +154,14 @@ def test_streaming_pipeline_materializes_reusable_scores_and_releases_each_model
     assert scores["run_id"].eq("run-1").all()
     assert scores["target_id"].eq("oracle_side").all()
     assert scores["is_out_of_sample"].all()
+    assert scores["lineage_fingerprint"].nunique() == 1
     assert len(fitted) == 2
     assert all(row["missing"] == 0 for row in fitted)
     assert cleanups == ["released", "released"]
     assert manifest["models_trained"] == 2
     assert manifest["score_rows"] == 6
+    assert len(manifest["input_lineage"]) == 2
+    assert manifest["lineage_fingerprint"] == scores["lineage_fingerprint"].iloc[0]
     assert len(list((output / "models").glob("*.pkl"))) == 2
 
 
@@ -163,13 +193,16 @@ def test_score_store_supports_strategy_specific_model_and_date_reads(tmp_path):
     assert selected.iloc[0]["model_id"] == "fmp.quality"
     assert selected.iloc[0]["long_score"] == pytest.approx(0.8)
 
+    with pytest.raises(ValueError, match="score lineage mismatch"):
+        store.read_scores(expected_lineage_fingerprint="different-lineage")
+
 
 def test_score_ensemble_reuses_selected_materialized_models():
     scores = pd.DataFrame(
         [
-            {"run_id": "r", "target_id": "oracle", "model_id": "quality", "symbol": "AAPL", "date": "2021-01-01", "long_score": 0.8, "short_score": 0.2},
-            {"run_id": "r", "target_id": "oracle", "model_id": "value", "symbol": "AAPL", "date": "2021-01-01", "long_score": 0.6, "short_score": 0.4},
-            {"run_id": "r", "target_id": "oracle", "model_id": "other", "symbol": "AAPL", "date": "2021-01-01", "long_score": 0.1, "short_score": 0.9},
+            {"run_id": "r", "target_id": "oracle", "lineage_fingerprint": "lineage-1", "model_id": "quality", "symbol": "AAPL", "date": "2021-01-01", "long_score": 0.8, "short_score": 0.2},
+            {"run_id": "r", "target_id": "oracle", "lineage_fingerprint": "lineage-1", "model_id": "value", "symbol": "AAPL", "date": "2021-01-01", "long_score": 0.6, "short_score": 0.4},
+            {"run_id": "r", "target_id": "oracle", "lineage_fingerprint": "lineage-1", "model_id": "other", "symbol": "AAPL", "date": "2021-01-01", "long_score": 0.1, "short_score": 0.9},
         ]
     )
 
@@ -195,5 +228,21 @@ def test_streaming_pipeline_refuses_to_mix_with_existing_output(tmp_path):
                 output_dir=output,
                 run_id="run-1",
                 target_id="oracle_side",
+                input_lineage_paths=(),
+            ),
+        )
+
+
+def test_streaming_pipeline_requires_valid_input_lineage(tmp_path):
+    with pytest.raises(ValueError, match="input lineage manifest"):
+        train_and_materialize_family_scores(
+            [],
+            _labels(),
+            classifier=FamilyClassifierConfig(train_end="2019-12-31", score_start="2020-01-01"),
+            materialization=ScoreMaterializationConfig(
+                output_dir=tmp_path / "new",
+                run_id="run-1",
+                target_id="oracle_side",
+                input_lineage_paths=(),
             ),
         )
