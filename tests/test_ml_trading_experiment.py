@@ -58,6 +58,11 @@ class _ConstantClassifier:
         )
 
 
+class _PredictRaisesClassifier(_ConstantClassifier):
+    def predict_proba_frame(self, frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+        raise AssertionError("predict_proba_frame should not be called when model diagnostics are disabled")
+
+
 def test_ml_trading_experiment_config_defaults_to_fast_1t_smoke() -> None:
     config = MLTradingExperimentConfig()
 
@@ -69,6 +74,8 @@ def test_ml_trading_experiment_config_defaults_to_fast_1t_smoke() -> None:
     assert config.target_label_mode == "oracle_only"
     assert config.fit_all_available_data is False
     assert config.refresh_missing_fmp_data is False
+    assert config.run_model_diagnostics is True
+    assert config.run_trading_diagnostics is True
 
 
 def test_train_family_models_can_fit_all_available_rows(monkeypatch) -> None:
@@ -123,6 +130,58 @@ def test_train_family_models_can_fit_all_available_rows(monkeypatch) -> None:
     assert row["train_rows"] == 6
     assert row["oos_rows"] == 0
     assert row["classifier_backend"] == "rapids_cuml_gpu"
+
+
+def test_train_family_models_can_skip_model_diagnostics(monkeypatch) -> None:
+    dates = pd.date_range("2020-01-01", periods=6)
+    feature_panel = pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 6,
+            "date": dates,
+            "feature_a": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        }
+    )
+    feature_metadata = pd.DataFrame(
+        [{"source": "fmp", "family": "unit", "feature": "feature_a"}]
+    )
+    labels = pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 6,
+            "date": dates,
+            "collapsed_label": ["oracle_long", "oracle_short"] * 3,
+            "label_source": ["unit"] * 6,
+        }
+    )
+
+    def _fake_fit(cls, frame, *, features, target_col, random_state, params):
+        return _PredictRaisesClassifier()
+
+    monkeypatch.setattr(
+        "quant_orchestrator.research_tools.ml_trading_experiment.RapidsRandomForestClassifier.fit",
+        classmethod(_fake_fit),
+    )
+
+    results, _models = _train_family_models(
+        MLTradingExperimentConfig(
+            log_mlflow=False,
+            min_train_rows_per_family=1,
+            fit_all_available_data=True,
+            run_model_diagnostics=False,
+        ),
+        feature_panel,
+        feature_metadata,
+        labels,
+        train_end=pd.Timestamp("2020-01-03"),
+        oos_start=pd.Timestamp("2020-01-04"),
+        fit_all_available_data=True,
+        run_model_diagnostics=False,
+    )
+
+    row = results.iloc[0]
+    assert row["status"] == "ok"
+    assert row["train_rows"] == 6
+    assert pd.isna(row["train_accuracy"])
+    assert pd.isna(row["oos_accuracy"])
     assert row["gpu_device_name"] == "unit-test-gpu"
 
 
@@ -521,3 +580,94 @@ def test_backtesting_py_ml_score_backtest_runs() -> None:
     assert result.summary["framework"] == "backtesting_py_signal"
     assert result.summary["symbol"] == "AAPL"
     assert result.summary["days"] == len(dates)
+
+def test_build_oracle_trade_label_rows_sparse_dedupes_unique_windows(monkeypatch) -> None:
+    """Multi-k duplicate windows collapse to one unique (symbol, side, entry, exit)."""
+    import pandas as pd
+    from quant_orchestrator.research_tools import ml_trading_experiment as ml_exp
+
+    class _Row:
+        def __init__(self, name):
+            self.name = name
+
+    trades_by_k = {
+        1: {
+            "AAA": [
+                {
+                    "side": "long",
+                    "entry_row": _Row(pd.Timestamp("2020-01-02")),
+                    "exit_row": _Row(pd.Timestamp("2020-01-10")),
+                    "entry_price": 10.0,
+                    "exit_price": 11.0,
+                    "profit": 0.1,
+                }
+            ]
+        },
+        2: {
+            "AAA": [
+                # same window as k=1
+                {
+                    "side": "long",
+                    "entry_row": _Row(pd.Timestamp("2020-01-02")),
+                    "exit_row": _Row(pd.Timestamp("2020-01-10")),
+                    "entry_price": 10.0,
+                    "exit_price": 11.0,
+                    "profit": 0.1,
+                },
+                # different exit -> second unique window, same entry
+                {
+                    "side": "long",
+                    "entry_row": _Row(pd.Timestamp("2020-01-02")),
+                    "exit_row": _Row(pd.Timestamp("2020-01-15")),
+                    "entry_price": 10.0,
+                    "exit_price": 12.0,
+                    "profit": 0.2,
+                },
+            ]
+        },
+    }
+
+    def _fake_solve(price_frames, ks, freq, min_profit_pct, **kwargs):
+        return {int(k): trades_by_k.get(int(k), {}) for k in ks}
+
+    monkeypatch.setattr(
+        "quant_warehouse.platforms.data_providers.fmp.target_engineering.strategy_solver.solve_side_trades_by_frequency_batched_multi_k",
+        _fake_solve,
+        raising=False,
+    )
+    # Patch the import site used inside the function
+    import quant_warehouse.platforms.data_providers.fmp.target_engineering.strategy_solver as ss
+
+    monkeypatch.setattr(ss, "solve_side_trades_by_frequency_batched_multi_k", _fake_solve)
+
+    class _WH:
+        def read_prices(self, symbol, provider=None, start=None, end=None):
+            idx = pd.date_range("2020-01-01", periods=20, freq="B")
+            return pd.DataFrame(
+                {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0},
+                index=idx,
+            )
+
+    class _Cfg:
+        provider = "fmp"
+        start_date = "2020-01-01"
+        end_date = "2020-12-31"
+        oracle_trade_k_by_frequency = {"YE": (1, 2)}
+        oracle_trade_min_profit_pct = 0.01
+        oracle_trade_long_entry_price_col = "high"
+        oracle_trade_long_exit_price_col = "low"
+        oracle_trade_short_entry_price_col = "low"
+        oracle_trade_short_exit_price_col = "high"
+
+    labels, diag, _seconds, windows = ml_exp._build_oracle_trade_label_rows_sparse(
+        ("AAA",),
+        _Cfg(),
+        warehouse=_WH(),
+    )
+    assert len(windows) == 2
+    assert windows.duplicated(subset=["symbol", "side", "entry_date", "exit_date"]).sum() == 0
+    # both unique windows share entry date -> one training label
+    assert len(labels) == 1
+    assert labels.iloc[0]["collapsed_label"] == "oracle_long"
+    assert int(diag.iloc[0]["unique_trade_windows"]) == 2
+    assert int(diag.iloc[0]["candidate_rows"]) == 3  # multi-k raw
