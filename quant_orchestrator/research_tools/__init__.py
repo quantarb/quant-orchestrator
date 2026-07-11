@@ -51,6 +51,12 @@ from quant_orchestrator.research_tools.option_family_ranker import (
     OptionFamilyRankerResult,
     run_option_family_ranker_experiment,
 )
+from quant_orchestrator.research_tools.option_meta_ranker import (
+    OptionMetaRankerConfig,
+    OptionMetaRankerResult,
+    score_option_meta_ranker,
+    train_option_meta_ranker,
+)
 from quant_orchestrator.research_tools.options_experiment import (
     OptopsyExecutionConfig,
     OptionExperimentArtifacts,
@@ -103,6 +109,8 @@ __all__ = [
     "OptionExperimentArtifacts",
     "OptionFamilyRankerConfig",
     "OptionFamilyRankerResult",
+    "OptionMetaRankerConfig",
+    "OptionMetaRankerResult",
     "OptionMvBasketConfig",
     "OptionRetrievalConfig",
     "OptionRuntimeEstimate",
@@ -154,6 +162,8 @@ __all__ = [
     "run_trade_list_option_execution",
     "run_trade_list_option_experiment",
     "train_and_materialize_family_scores",
+    "train_option_meta_ranker",
+    "score_option_meta_ranker",
     "run_synthetic_options_backtest",
     "run_synthetic_options_backtest_experiment",
     "write_ml_trading_artifact_files",
