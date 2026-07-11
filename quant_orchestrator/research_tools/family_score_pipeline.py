@@ -148,7 +148,10 @@ class FamilyScoreStore:
         frames = []
         for path in paths:
             frame = pd.read_parquet(path)
-            if wanted and ("model_id" not in frame.columns or not frame["model_id"].astype(str).isin(wanted).any()):
+            if wanted and (
+                "model_id" not in frame.columns
+                or not frame["model_id"].astype(str).isin(wanted).any()
+            ):
                 continue
             frames.append(frame)
         if not frames:
@@ -185,12 +188,16 @@ def iter_feature_family_batches(
     key_columns = [col for col in ("symbol", "date") if col in feature_panel.columns]
     if len(key_columns) != 2:
         raise KeyError("feature panel requires symbol and date columns")
-    families = feature_metadata[["source", "family"]].drop_duplicates().sort_values(["source", "family"])
+    families = (
+        feature_metadata[["source", "family"]].drop_duplicates().sort_values(["source", "family"])
+    )
     for source, family in families.itertuples(index=False, name=None):
         selected = feature_metadata.loc[
             feature_metadata["source"].eq(source) & feature_metadata["family"].eq(family), "feature"
         ]
-        features = tuple(dict.fromkeys(str(col) for col in selected if str(col) in feature_panel.columns))
+        features = tuple(
+            dict.fromkeys(str(col) for col in selected if str(col) in feature_panel.columns)
+        )
         if not features:
             continue
         yield FeatureFamilyBatch(
@@ -240,11 +247,25 @@ def train_and_materialize_family_scores(
         model: FamilyClassifier | None = None
         training_frame = pd.DataFrame()
         try:
-            score_frame, usable_features = _prepare_score_frame(batch, classifier.min_feature_coverage)
-            training_frame = _event_training_frame(score_frame, labels, target_col=classifier.target_col)
             train_end = pd.Timestamp(classifier.train_end).normalize()
+            score_frame, candidate_features = _prepare_score_frame(batch)
+            training_frame = _event_training_frame(
+                score_frame, labels, target_col=classifier.target_col
+            )
             training_frame = training_frame.loc[training_frame["date"].le(train_end)].copy()
-            if len(training_frame) < classifier.min_train_rows or training_frame[classifier.target_col].nunique() < classifier.min_classes:
+            usable_features = [
+                feature for feature in candidate_features if training_frame[feature].notna().any()
+            ]
+            score_frame = _filter_by_feature_coverage(
+                score_frame, usable_features, classifier.min_feature_coverage
+            )
+            training_frame = _filter_by_feature_coverage(
+                training_frame, usable_features, classifier.min_feature_coverage
+            )
+            if (
+                len(training_frame) < classifier.min_train_rows
+                or training_frame[classifier.target_col].nunique() < classifier.min_classes
+            ):
                 model_rows.append(
                     _model_result_row(
                         batch,
@@ -264,11 +285,17 @@ def train_and_materialize_family_scores(
                 .replace([float("inf"), float("-inf")], float("nan"))
                 .fillna(0.0)
             )
-            training_frame[usable_features] = training_frame[usable_features].fillna(medians).astype("float32")
-            score_frame[usable_features] = score_frame[usable_features].fillna(medians).astype("float32")
+            training_frame[usable_features] = (
+                training_frame[usable_features].fillna(medians).astype("float32")
+            )
+            score_frame[usable_features] = (
+                score_frame[usable_features].fillna(medians).astype("float32")
+            )
 
             model = factory(training_frame, usable_features, classifier)
-            diagnostics = _classifier_diagnostics(model, training_frame, usable_features, classifier)
+            diagnostics = _classifier_diagnostics(
+                model, training_frame, usable_features, classifier
+            )
             model_path = None
             if materialization.persist_models:
                 model_path = model_dir / f"{_safe_path_token(batch.model_id)}.pkl"
@@ -276,7 +303,9 @@ def train_and_materialize_family_scores(
                     pickle.dump(model, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
             family_score_rows = 0
-            filtered_scores = score_frame.loc[score_frame["date"].ge(pd.Timestamp(classifier.score_start))].copy()
+            filtered_scores = score_frame.loc[
+                score_frame["date"].ge(pd.Timestamp(classifier.score_start))
+            ].copy()
             chunk_size = max(1, int(materialization.rows_per_chunk))
             for chunk_number, start in enumerate(range(0, len(filtered_scores), chunk_size)):
                 chunk = filtered_scores.iloc[start : start + chunk_size].copy()
@@ -296,7 +325,9 @@ def train_and_materialize_family_scores(
                     materialization=materialization,
                     lineage_fingerprint=lineage_fingerprint,
                 )
-                paths = score_store.write_chunk(scores, model_id=batch.model_id, chunk_number=chunk_number)
+                paths = score_store.write_chunk(
+                    scores, model_id=batch.model_id, chunk_number=chunk_number
+                )
                 score_paths.extend(str(path.relative_to(output_dir)) for path in paths)
                 family_score_rows += len(scores)
                 del probability, scores, chunk
@@ -313,7 +344,9 @@ def train_and_materialize_family_scores(
                         seconds=perf_counter() - family_started,
                         lineage_fingerprint=lineage_fingerprint,
                     ),
-                    "model_path": None if model_path is None else str(model_path.relative_to(output_dir)),
+                    "model_path": None
+                    if model_path is None
+                    else str(model_path.relative_to(output_dir)),
                     **diagnostics,
                 }
             )
@@ -365,7 +398,11 @@ def normalize_family_scores(frame: pd.DataFrame) -> pd.DataFrame:
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
     for column in ("long_score", "short_score", "net_score", "score_rank"):
         out[column] = pd.to_numeric(out[column], errors="coerce")
-    return out.loc[:, list(SCORE_COLUMNS)].sort_values(["model_id", "date", "symbol"], kind="stable").reset_index(drop=True)
+    return (
+        out.loc[:, list(SCORE_COLUMNS)]
+        .sort_values(["model_id", "date", "symbol"], kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 def build_score_ensemble(
@@ -386,15 +423,16 @@ def build_score_ensemble(
         return pd.DataFrame(columns=list(SCORE_COLUMNS))
     lineage_values = set(selected["lineage_fingerprint"].dropna().astype(str))
     if len(lineage_values) != 1:
-        raise ValueError(f"cannot ensemble mixed or missing score lineage: {sorted(lineage_values)!r}")
-    grouped = (
-        selected.groupby(["run_id", "target_id", "lineage_fingerprint", "symbol", "date"], as_index=False)
-        .agg(
-            long_score=("long_score", "mean"),
-            short_score=("short_score", "mean"),
-            training_end=("training_end", "max"),
-            is_out_of_sample=("is_out_of_sample", "all"),
+        raise ValueError(
+            f"cannot ensemble mixed or missing score lineage: {sorted(lineage_values)!r}"
         )
+    grouped = selected.groupby(
+        ["run_id", "target_id", "lineage_fingerprint", "symbol", "date"], as_index=False
+    ).agg(
+        long_score=("long_score", "mean"),
+        short_score=("short_score", "mean"),
+        training_end=("training_end", "max"),
+        is_out_of_sample=("is_out_of_sample", "all"),
     )
     grouped["model_id"] = ensemble_id
     grouped["model_version"] = "1"
@@ -423,29 +461,41 @@ def release_training_memory() -> None:
         pass
 
 
-def _prepare_score_frame(batch: FeatureFamilyBatch, min_coverage: float) -> tuple[pd.DataFrame, list[str]]:
-    features = [
-        col
-        for col in batch.feature_columns
-        if col in batch.frame.columns and pd.to_numeric(batch.frame[col], errors="coerce").notna().any()
-    ]
+def _prepare_score_frame(batch: FeatureFamilyBatch) -> tuple[pd.DataFrame, list[str]]:
+    features = [col for col in batch.feature_columns if col in batch.frame.columns]
     if not features:
         return pd.DataFrame(columns=["symbol", "date"]), []
-    numeric = batch.frame[features].apply(pd.to_numeric, errors="coerce").replace(
-        [float("inf"), float("-inf")], float("nan")
+    numeric = (
+        batch.frame[features]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([float("inf"), float("-inf")], float("nan"))
     )
-    coverage = numeric.notna().mean(axis=1)
-    frame = batch.frame.loc[coverage.ge(float(min_coverage)), ["symbol", "date"]].copy()
-    frame[features] = numeric.loc[frame.index]
+    frame = batch.frame[["symbol", "date"]].copy()
+    frame[features] = numeric
     frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
     return frame.dropna(subset=["symbol", "date"]).reset_index(drop=True), features
 
 
-def _event_training_frame(score_frame: pd.DataFrame, labels: pd.DataFrame, *, target_col: str) -> pd.DataFrame:
+def _filter_by_feature_coverage(
+    frame: pd.DataFrame,
+    features: list[str],
+    min_coverage: float,
+) -> pd.DataFrame:
+    if not features:
+        return frame.iloc[0:0].copy()
+    coverage = frame[features].notna().mean(axis=1)
+    return frame.loc[coverage.ge(float(min_coverage))].copy()
+
+
+def _event_training_frame(
+    score_frame: pd.DataFrame, labels: pd.DataFrame, *, target_col: str
+) -> pd.DataFrame:
     if score_frame.empty or labels.empty:
         return pd.DataFrame(columns=[*score_frame.columns, target_col])
-    return score_frame.merge(labels[["symbol", "date", target_col]], on=["symbol", "date"], how="inner")
+    return score_frame.merge(
+        labels[["symbol", "date", target_col]], on=["symbol", "date"], how="inner"
+    )
 
 
 def _normalize_labels(labels: pd.DataFrame, *, target_col: str) -> pd.DataFrame:
@@ -508,7 +558,9 @@ def _score_contract_columns(
     out["target_id"] = materialization.target_id
     out["feature_family"] = batch.family
     out["training_end"] = pd.Timestamp(classifier.train_end).normalize()
-    out["is_out_of_sample"] = pd.to_datetime(out["date"], errors="coerce").gt(pd.Timestamp(classifier.train_end))
+    out["is_out_of_sample"] = pd.to_datetime(out["date"], errors="coerce").gt(
+        pd.Timestamp(classifier.train_end)
+    )
     out["lineage_fingerprint"] = lineage_fingerprint
     out["score_rank"] = out.groupby("date")["long_score"].rank(method="average", pct=True)
     return normalize_family_scores(out)
