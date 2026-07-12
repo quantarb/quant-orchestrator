@@ -23,7 +23,7 @@ class OptionMetaRankerConfig:
     equity_score_store: Path
     output_dir: Path
     symbols: tuple[str, ...] = ()
-    max_candidates_per_trade: int = 64
+    max_candidates_per_trade: int = 128
     max_trades: int = 0
     n_estimators: int = 300
     random_seed: int = 20260704
@@ -93,6 +93,8 @@ def train_option_meta_ranker(config: OptionMetaRankerConfig) -> OptionMetaRanker
     with model_path.open("wb") as handle:
         pickle.dump(
             {
+                "schema_version": 2,
+                "equity_score_contract": "family_long_probability_only",
                 "model": model,
                 "features": features,
                 "option_features": option_features,
@@ -134,7 +136,7 @@ def wide_equity_family_scores(scores: pd.DataFrame) -> tuple[pd.DataFrame, list[
     work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
     frames: list[pd.DataFrame] = []
     features: list[str] = []
-    for value_col in ("long_score", "short_score", "net_score"):
+    for value_col in ("long_score",):
         wide = work.pivot_table(index=["symbol", "date"], columns="model_id", values=value_col, aggfunc="mean")
         wide.columns = [f"{value_col}__{str(column).replace('.', '_')}" for column in wide.columns]
         features.extend(wide.columns.astype(str).tolist())
@@ -154,6 +156,10 @@ def score_option_meta_ranker(
 
     with Path(model_path).open("rb") as handle:
         bundle = pickle.load(handle)
+    if bundle.get("schema_version") != 2 or bundle.get("equity_score_contract") != "family_long_probability_only":
+        raise ValueError(
+            "Option meta-ranker artifact is incompatible; retrain with family long-probability-only features"
+        )
     model = bundle["model"]
     features = list(bundle["features"])
     candidates = option_candidates.copy()

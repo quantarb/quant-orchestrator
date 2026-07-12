@@ -44,7 +44,37 @@ def test_option_panel_load_projects_filters_and_caps_candidates(tmp_path) -> Non
     assert set(loaded["symbol"]) == {"AAPL"}
     assert len(loaded) == 2
     assert "unused_large_column" not in loaded.columns
-    assert loaded["option_return"].tolist() == [4.0, 3.0]
+    assert loaded["option_return"].tolist() == [4.0, 0.0]
+
+
+def test_diverse_candidate_cap_keeps_core_and_spans_dte_moneyness(tmp_path) -> None:
+    rows = []
+    for index in range(20):
+        rows.append(
+            {
+                "trade_id": "AAPL-trade",
+                "symbol": "AAPL",
+                "entry_date": "2026-01-02",
+                "expiration": "2026-12-31",
+                "snapshot_date": "2026-01-02",
+                "option_return": float(index),
+                "fixed_near_atm_score": 100.0 if index == 10 else -float(abs(index - 10)),
+                "side": "buy",
+                "option_type": "call",
+                "dte": index + 1,
+                "moneyness": (index - 10) / 10.0,
+                "spread_pct": 0.05,
+            }
+        )
+    path = tmp_path / "options.parquet"
+    pd.DataFrame(rows).to_parquet(path, index=False)
+
+    loaded = _load_option_panel(path, max_trades=0, max_candidates_per_trade=8)
+
+    assert len(loaded) == 8
+    assert 10.0 in loaded["option_return"].tolist()
+    assert loaded["dte"].min() == 1
+    assert loaded["dte"].max() == 20
 
 
 def test_filter_oracle_entry_options_keeps_buy_calls_for_longs_and_buy_puts_for_shorts() -> None:

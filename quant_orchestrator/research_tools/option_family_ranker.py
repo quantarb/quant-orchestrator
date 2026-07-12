@@ -468,18 +468,52 @@ def _load_option_panel(
                 score_terms.append(values.fillna(values.max()))
         out["fixed_near_atm_score"] = -sum(score_terms) if score_terms else np.nan
     if int(max_candidates_per_trade) > 0:
-        order_columns = ["trade_id", "fixed_near_atm_score"]
-        ascending = [True, False]
-        out = (
-            out.sort_values(order_columns, ascending=ascending, kind="stable")
-            .groupby("trade_id", sort=False, as_index=False)
-            .head(int(max_candidates_per_trade))
-            .copy()
+        out = pd.concat(
+            [
+                _select_diverse_option_candidates(group, int(max_candidates_per_trade))
+                for _, group in out.groupby("trade_id", sort=False)
+            ],
+            ignore_index=True,
+            sort=False,
         )
     if max_trades > 0:
         trade_ids = out[["trade_id", "entry_date"]].drop_duplicates().sort_values(["entry_date", "trade_id"]).head(max_trades)["trade_id"]
         out = out.loc[out["trade_id"].isin(set(trade_ids))].copy()
     return out.reset_index(drop=True)
+
+
+def _select_diverse_option_candidates(frame: pd.DataFrame, limit: int) -> pd.DataFrame:
+    """Keep an executable core plus broad deterministic DTE/moneyness coverage."""
+
+    if len(frame) <= int(limit):
+        return frame.copy()
+    work = frame.copy()
+    work["_source_order"] = range(len(work))
+    core_size = max(1, int(limit) // 4)
+    core = work.sort_values(
+        ["fixed_near_atm_score", "_source_order"],
+        ascending=[False, True],
+        kind="stable",
+    ).head(core_size)
+    remaining = work.drop(index=core.index)
+    coverage_columns = [column for column in ("dte", "moneyness", "spread_pct") if column in remaining]
+    for column in coverage_columns:
+        remaining[column] = pd.to_numeric(remaining[column], errors="coerce")
+    remaining = remaining.sort_values(
+        [*coverage_columns, "_source_order"],
+        ascending=True,
+        kind="stable",
+        na_position="last",
+    )
+    coverage_size = min(int(limit) - len(core), len(remaining))
+    positions = (
+        np.linspace(0, len(remaining) - 1, num=coverage_size, dtype=int)
+        if coverage_size > 0
+        else np.array([], dtype=int)
+    )
+    coverage = remaining.iloc[positions]
+    selected = pd.concat([core, coverage], ignore_index=True, sort=False)
+    return selected.drop(columns=["_source_order"])
 
 
 def _filter_oracle_entry_options(frame: pd.DataFrame, *, target_col: str = "rank_y") -> pd.DataFrame:

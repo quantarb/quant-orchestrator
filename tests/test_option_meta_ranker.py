@@ -63,6 +63,20 @@ def test_trains_one_meta_ranker_from_reusable_equity_scores(monkeypatch, tmp_pat
         bundle = pickle.load(handle)
     assert "dte" in bundle["features"]
     assert "long_score__fmp_alpha" in bundle["features"]
+    assert bundle["schema_version"] == 2
+    assert bundle["equity_score_contract"] == "family_long_probability_only"
+    assert not any(
+        feature.startswith(("short_score__", "net_score__")) for feature in bundle["features"]
+    )
+    assert {
+        "vanna",
+        "charm",
+        "vomma",
+        "speed",
+        "zomma",
+        "color",
+        "ultima",
+    }.isdisjoint(bundle["features"])
 
     live_options = options.head(4).copy()
     live_scores = scores.head(1).copy()
