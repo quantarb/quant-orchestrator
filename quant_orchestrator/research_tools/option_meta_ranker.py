@@ -17,6 +17,9 @@ from quant_orchestrator.research_tools.family_score_pipeline import FamilyScoreS
 from quant_orchestrator.research_tools.option_family_ranker import OPTION_FEATURES, _filter_oracle_entry_options, _load_option_panel
 
 
+OPTION_TARGET_CONTRACT = "unified_realized_return_and_expiration_closeness_v1"
+
+
 @dataclass(frozen=True)
 class OptionMetaRankerConfig:
     option_panel: Path
@@ -52,6 +55,10 @@ def train_option_meta_ranker(config: OptionMetaRankerConfig) -> OptionMetaRanker
         max_candidates_per_trade=int(config.max_candidates_per_trade),
     )
     options = _filter_oracle_entry_options(options, target_col=config.target_col)
+    if "label_basis" not in options.columns:
+        raise ValueError(
+            "Option panel uses the legacy return-only target; rebuild it with the unified behavior label contract"
+        )
     scores = FamilyScoreStore(Path(config.equity_score_store)).read_scores(model_ids=None)
     wide, score_features = wide_equity_family_scores(scores)
     stack = options.merge(
@@ -81,8 +88,9 @@ def train_option_meta_ranker(config: OptionMetaRankerConfig) -> OptionMetaRanker
     with model_path.open("wb") as handle:
         pickle.dump(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "equity_score_contract": "family_long_probability_only",
+                "option_target_contract": OPTION_TARGET_CONTRACT,
                 "model_backend": config.model_backend,
                 "model": model,
                 "medians": medians,
@@ -98,6 +106,11 @@ def train_option_meta_ranker(config: OptionMetaRankerConfig) -> OptionMetaRanker
         "design": "one option meta-ranker over option features and reusable equity-family scores",
         "config": {key: str(value) if isinstance(value, Path) else value for key, value in asdict(config).items()},
         "option_rows_after_bounding": int(len(options)),
+        "option_target_contract": OPTION_TARGET_CONTRACT,
+        "label_basis_rows": {
+            str(key): int(value)
+            for key, value in options["label_basis"].value_counts(dropna=False).items()
+        },
         "training_rows": int(valid.sum()),
         "training_trades": int(stack.loc[valid, "trade_id"].nunique()),
         "symbols": int(stack.loc[valid, "symbol"].nunique()),
@@ -146,9 +159,13 @@ def score_option_meta_ranker(
 
     with Path(model_path).open("rb") as handle:
         bundle = pickle.load(handle)
-    if bundle.get("schema_version") != 3 or bundle.get("equity_score_contract") != "family_long_probability_only":
+    if (
+        bundle.get("schema_version") != 4
+        or bundle.get("equity_score_contract") != "family_long_probability_only"
+        or bundle.get("option_target_contract") != OPTION_TARGET_CONTRACT
+    ):
         raise ValueError(
-            "Option meta-ranker artifact is incompatible; retrain with family long-probability-only features"
+            "Option meta-ranker artifact is incompatible; retrain with unified behavior labels and family long-probability-only features"
         )
     model = bundle["model"]
     features = list(bundle["features"])

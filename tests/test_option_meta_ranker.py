@@ -18,6 +18,7 @@ def test_trains_one_meta_ranker_from_reusable_equity_scores(monkeypatch, tmp_pat
                 "entry_date": pd.Timestamp("2026-01-02") + pd.Timedelta(days=trade),
                 "option_return": float(candidate),
                 "rank_y": candidate / 4.0,
+                "label_basis": "realized_exit_return",
                 "side": "buy",
                 "option_type": "call",
                 "dte": 30 + candidate,
@@ -64,8 +65,9 @@ def test_trains_one_meta_ranker_from_reusable_equity_scores(monkeypatch, tmp_pat
         bundle = pickle.load(handle)
     assert "dte" in bundle["features"]
     assert "long_score__fmp_alpha" in bundle["features"]
-    assert bundle["schema_version"] == 3
+    assert bundle["schema_version"] == 4
     assert bundle["equity_score_contract"] == "family_long_probability_only"
+    assert bundle["option_target_contract"] == "unified_realized_return_and_expiration_closeness_v1"
     assert bundle["model_backend"] == "sklearn_random_forest"
     assert not any(
         feature.startswith(("short_score__", "net_score__")) for feature in bundle["features"]

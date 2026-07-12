@@ -427,6 +427,7 @@ def _load_option_panel(
         dict.fromkeys(
             [
                 "trade_id", "symbol", "entry_date", "option_return", "rank_y",
+                "label_basis", "days_before_oracle_exit",
                 "equity_signal_side", "side", "option_type", "option_action",
                 "expiration", "snapshot_date", "fixed_near_atm_score",
                 *OPTION_FEATURES,
@@ -436,15 +437,16 @@ def _load_option_panel(
     columns = [column for column in projected if column in available]
     filters = [("symbol", "in", list(symbols))] if symbols else None
     frame = pd.read_parquet(path, columns=columns, filters=filters)
-    required = {"trade_id", "symbol", "entry_date", "option_return"}
+    required = {"trade_id", "symbol", "entry_date"}
     missing = required.difference(frame.columns)
     if missing:
         raise ValueError(f"option panel missing required columns: {sorted(missing)}")
     out = frame.copy()
     out["symbol"] = out["symbol"].astype(str).str.upper()
     out["entry_date"] = pd.to_datetime(out["entry_date"], errors="coerce").dt.normalize()
-    out["option_return"] = pd.to_numeric(out["option_return"], errors="coerce")
-    out = out.dropna(subset=["trade_id", "symbol", "entry_date", "option_return"])
+    if "option_return" in out.columns:
+        out["option_return"] = pd.to_numeric(out["option_return"], errors="coerce")
+    out = out.dropna(subset=["trade_id", "symbol", "entry_date"])
     out = _filter_entry_date_tradable_options(out)
     if symbols:
         wanted = set(symbols)
@@ -452,6 +454,8 @@ def _load_option_panel(
         if out.empty:
             raise ValueError(f"option panel has no rows for requested symbols: {sorted(wanted)}")
     if "rank_y" not in out.columns:
+        if "option_return" not in out.columns:
+            raise ValueError("option panel requires rank_y or option_return")
         out["rank_y"] = out.groupby("trade_id")["option_return"].rank(method="average", pct=True, ascending=True)
     else:
         out["rank_y"] = pd.to_numeric(out["rank_y"], errors="coerce")
@@ -546,7 +550,11 @@ def _filter_oracle_entry_options(frame: pd.DataFrame, *, target_col: str = "rank
     out = out.loc[keep].copy()
     if out.empty:
         raise ValueError("oracle option filter removed all rows; expected long/buy call rows and short/sell put rows")
-    if target_col == "rank_y" and "option_return" in out.columns:
+    supplied_rank = pd.to_numeric(out.get("rank_y"), errors="coerce") if "rank_y" in out else None
+    unified_behavior_labels = "label_basis" in out.columns
+    if unified_behavior_labels and (supplied_rank is None or supplied_rank.isna().any()):
+        raise ValueError("Unified option behavior labels require a complete rank_y column")
+    if target_col == "rank_y" and "option_return" in out.columns and not unified_behavior_labels:
         out["rank_y"] = (
             out.groupby("trade_id")["option_return"]
             .rank(method="average", pct=True, ascending=True)

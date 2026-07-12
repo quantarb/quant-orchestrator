@@ -101,6 +101,26 @@ def test_filter_oracle_entry_options_keeps_buy_calls_for_longs_and_buy_puts_for_
     assert out.set_index(["trade_id", "option_return"]).loc[("t2", 0.40), "rank_y"] == pytest.approx(1.0)
 
 
+def test_filter_preserves_unified_rank_for_early_expiration_rows() -> None:
+    frame = pd.DataFrame(
+        {
+            "trade_id": ["t1", "t1"],
+            "symbol": ["AAPL", "AAPL"],
+            "equity_signal_side": ["long", "long"],
+            "option_type": ["call", "call"],
+            "option_action": ["buy_call", "buy_call"],
+            "option_return": [float("nan"), 0.4],
+            "label_basis": ["expiration_closeness", "realized_exit_return"],
+            "rank_y": [0.5, 1.0],
+        }
+    )
+
+    out = _filter_oracle_entry_options(frame, target_col="rank_y")
+
+    assert out["rank_y"].tolist() == [0.5, 1.0]
+    assert out["label_basis"].tolist() == ["expiration_closeness", "realized_exit_return"]
+
+
 def test_filter_oracle_entry_options_uses_side_fallback_without_option_action() -> None:
     frame = pd.DataFrame(
         {
