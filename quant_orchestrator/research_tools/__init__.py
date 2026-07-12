@@ -28,6 +28,12 @@ from quant_orchestrator.research_tools.family_score_pipeline import (
     release_training_memory,
     train_and_materialize_family_scores,
 )
+from quant_orchestrator.research_tools.equity_meta_stack import (
+    EquityMetaStackConfig,
+    EquityMetaStackResult,
+    build_equity_meta_feature_frame,
+    train_equity_meta_stack,
+)
 from quant_orchestrator.research_tools.anchored_annual_wfo import (
     AnchoredAnnualWFOConfig,
     AnchoredAnnualWFOResult,
@@ -104,6 +110,8 @@ __all__ = [
     "DEFAULT_ATTRIBUTION_DIMENSIONS",
     "FamilyScoreRunResult",
     "FamilyScoreStore",
+    "EquityMetaStackConfig",
+    "EquityMetaStackResult",
     "FeatureFamilyBatch",
     "OptopsyExecutionConfig",
     "OptionExperimentArtifacts",
@@ -131,6 +139,7 @@ __all__ = [
     "attribute_model_scores",
     "attribute_strategy_returns",
     "build_score_ensemble",
+    "build_equity_meta_feature_frame",
     "build_option_window_dataset",
     "build_family_prediction_frame",
     "build_strategy_score_frame",
@@ -162,6 +171,7 @@ __all__ = [
     "run_trade_list_option_execution",
     "run_trade_list_option_experiment",
     "train_and_materialize_family_scores",
+    "train_equity_meta_stack",
     "train_option_meta_ranker",
     "score_option_meta_ranker",
     "run_synthetic_options_backtest",
