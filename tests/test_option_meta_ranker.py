@@ -54,6 +54,7 @@ def test_trains_one_meta_ranker_from_reusable_equity_scores(monkeypatch, tmp_pat
             equity_score_store=tmp_path / "scores",
             output_dir=tmp_path / "model",
             n_estimators=50,
+            model_backend="sklearn_random_forest",
         )
     )
 
@@ -63,8 +64,9 @@ def test_trains_one_meta_ranker_from_reusable_equity_scores(monkeypatch, tmp_pat
         bundle = pickle.load(handle)
     assert "dte" in bundle["features"]
     assert "long_score__fmp_alpha" in bundle["features"]
-    assert bundle["schema_version"] == 2
+    assert bundle["schema_version"] == 3
     assert bundle["equity_score_contract"] == "family_long_probability_only"
+    assert bundle["model_backend"] == "sklearn_random_forest"
     assert not any(
         feature.startswith(("short_score__", "net_score__")) for feature in bundle["features"]
     )

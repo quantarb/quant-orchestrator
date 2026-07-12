@@ -28,6 +28,7 @@ class OptionMetaRankerConfig:
     n_estimators: int = 300
     random_seed: int = 20260704
     target_col: str = "rank_y"
+    model_backend: str = "rapids_random_forest"
 
 
 @dataclass(frozen=True)
@@ -71,31 +72,20 @@ def train_option_meta_ranker(config: OptionMetaRankerConfig) -> OptionMetaRanker
     valid = target.notna()
     if not features or not valid.any():
         raise RuntimeError("Option meta-ranker has no usable features or targets")
-    model = Pipeline(
-        [
-            ("impute", SimpleImputer(strategy="median")),
-            (
-                "rf",
-                RandomForestRegressor(
-                    n_estimators=max(50, int(config.n_estimators)),
-                    max_depth=10,
-                    min_samples_leaf=3,
-                    n_jobs=-1,
-                    random_state=int(config.random_seed),
-                ),
-            ),
-        ]
+    model, medians = _fit_option_ranker(
+        stack.loc[valid, features], target.loc[valid], config
     )
-    model.fit(stack.loc[valid, features], target.loc[valid])
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_path = output_dir / "meta_stack_ranker.pkl"
     with model_path.open("wb") as handle:
         pickle.dump(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "equity_score_contract": "family_long_probability_only",
+                "model_backend": config.model_backend,
                 "model": model,
+                "medians": medians,
                 "features": features,
                 "option_features": option_features,
                 "equity_score_cols": score_features,
@@ -156,7 +146,7 @@ def score_option_meta_ranker(
 
     with Path(model_path).open("rb") as handle:
         bundle = pickle.load(handle)
-    if bundle.get("schema_version") != 2 or bundle.get("equity_score_contract") != "family_long_probability_only":
+    if bundle.get("schema_version") != 3 or bundle.get("equity_score_contract") != "family_long_probability_only":
         raise ValueError(
             "Option meta-ranker artifact is incompatible; retrain with family long-probability-only features"
         )
@@ -175,7 +165,16 @@ def score_option_meta_ranker(
     for feature in features:
         if feature not in scored.columns:
             scored[feature] = np.nan
-    scored["pred_meta_stack_rank"] = np.clip(model.predict(scored[features]), 0.0, 1.0)
+    scored["pred_meta_stack_rank"] = np.clip(
+        _predict_option_ranker(
+            model,
+            scored[features],
+            medians=bundle["medians"],
+            backend=str(bundle["model_backend"]),
+        ),
+        0.0,
+        1.0,
+    )
     scored = scored.sort_values(
         ["trade_id", "pred_meta_stack_rank"],
         ascending=[True, False],
@@ -184,3 +183,68 @@ def score_option_meta_ranker(
     scored["option_ensemble_rank"] = scored.groupby("trade_id", sort=False).cumcount() + 1
     scored["selected_by_option_ensemble"] = scored["option_ensemble_rank"].eq(1)
     return scored.reset_index(drop=True)
+
+
+def _fit_option_ranker(
+    features: pd.DataFrame,
+    target: pd.Series,
+    config: OptionMetaRankerConfig,
+) -> tuple[Any, dict[str, float]]:
+    medians = (
+        features.apply(pd.to_numeric, errors="coerce").median(axis=0).fillna(0.0).astype(float)
+    )
+    training = features.apply(pd.to_numeric, errors="coerce").fillna(medians).astype("float32")
+    y = pd.to_numeric(target, errors="coerce").astype("float32")
+    if config.model_backend == "rapids_random_forest":
+        import cudf
+        from cuml.ensemble import RandomForestRegressor as CuRandomForestRegressor
+
+        model = CuRandomForestRegressor(
+            n_estimators=max(50, int(config.n_estimators)),
+            max_depth=10,
+            min_samples_leaf=3,
+            max_features="sqrt",
+            n_bins=128,
+            n_streams=8,
+            random_state=int(config.random_seed),
+        )
+        model.fit(cudf.from_pandas(training), cudf.Series(y.to_numpy()))
+        return model, medians.to_dict()
+    if config.model_backend == "sklearn_random_forest":
+        model = Pipeline(
+            [
+                ("impute", SimpleImputer(strategy="median")),
+                (
+                    "rf",
+                    RandomForestRegressor(
+                        n_estimators=max(50, int(config.n_estimators)),
+                        max_depth=10,
+                        min_samples_leaf=3,
+                        n_jobs=-1,
+                        random_state=int(config.random_seed),
+                    ),
+                ),
+            ]
+        )
+        model.fit(training, y)
+        return model, medians.to_dict()
+    raise ValueError(f"Unsupported option ranker backend: {config.model_backend}")
+
+
+def _predict_option_ranker(
+    model: Any,
+    features: pd.DataFrame,
+    *,
+    medians: dict[str, float],
+    backend: str,
+) -> np.ndarray:
+    work = features.apply(pd.to_numeric, errors="coerce").fillna(pd.Series(medians)).astype("float32")
+    if backend == "rapids_random_forest":
+        import cupy as cp
+        import cudf
+
+        prediction = model.predict(cudf.from_pandas(work))
+        return prediction.to_numpy() if hasattr(prediction, "to_numpy") else cp.asnumpy(prediction)
+    if backend == "sklearn_random_forest":
+        return np.asarray(model.predict(work))
+    raise ValueError(f"Unsupported option ranker backend: {backend}")
