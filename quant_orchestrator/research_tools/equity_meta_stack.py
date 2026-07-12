@@ -144,6 +144,7 @@ def train_equity_meta_stack(
     summary = {
         "schema_version": 1,
         "training_prediction_scope": "in_sample_same_oracle_rows",
+        "meta_feature_contract": "family_long_probability_only",
         "training_rows": int(len(training)),
         "family_models": len(model_ids),
         "model_ids": model_ids,
@@ -176,15 +177,14 @@ def build_equity_meta_feature_frame(
     model_ids = sorted(scores["model_id"].dropna().astype(str).unique())
     keys = ["symbol", "date"]
     wide = scores[keys].drop_duplicates().sort_values(keys).reset_index(drop=True)
-    for score_col in ("long_score", "short_score"):
-        pivot = scores.pivot_table(
-            index=keys,
-            columns="model_id",
-            values=score_col,
-            aggfunc="first",
-        )
-        pivot.columns = [f"{score_col}__{column}" for column in pivot.columns]
-        wide = wide.merge(pivot.reset_index(), on=keys, how="left", validate="one_to_one")
+    pivot = scores.pivot_table(
+        index=keys,
+        columns="model_id",
+        values="long_score",
+        aggfunc="first",
+    )
+    pivot.columns = [f"long_score__{column}" for column in pivot.columns]
+    wide = wide.merge(pivot.reset_index(), on=keys, how="left", validate="one_to_one")
     return wide, model_ids, lineage[0]
 
 

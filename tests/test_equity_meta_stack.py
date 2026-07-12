@@ -51,8 +51,12 @@ def test_meta_features_pivot_family_probabilities():
     assert len(wide) == 4
     assert {
         "long_score__fmp.technical_math",
-        "short_score__fmp.technical_momentum",
+        "long_score__fmp.technical_momentum",
     }.issubset(wide.columns)
+    assert not any(
+        column.startswith(("short_score__", "net_score__", "score_rank__"))
+        for column in wide.columns
+    )
 
 
 def test_train_meta_stack_uses_same_oracle_rows_and_persists_scores(tmp_path):
@@ -83,6 +87,8 @@ def test_train_meta_stack_uses_same_oracle_rows_and_persists_scores(tmp_path):
     }
     assert result.training_rows == 4
     assert result.family_models == 2
+    assert len(result.features) == 2
+    assert all(feature.startswith("long_score__") for feature in result.features)
     assert result.model_path.exists()
     assert result.summary_path.exists()
     assert result.scores_path.exists()
