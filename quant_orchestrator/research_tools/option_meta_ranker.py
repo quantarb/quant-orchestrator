@@ -17,7 +17,8 @@ from quant_orchestrator.research_tools.family_score_pipeline import FamilyScoreS
 from quant_orchestrator.research_tools.option_family_ranker import OPTION_FEATURES, _filter_oracle_entry_options, _load_option_panel
 
 
-OPTION_TARGET_CONTRACT = "unified_realized_return_and_expiration_closeness_v1"
+OPTION_TARGET_CONTRACT = "oracle_horizon_behavior_rank_v2"
+ORACLE_OPTION_LABEL_POLICY = "oracle_exit_survivors_expiration_early_fallback_v1"
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,12 @@ def train_option_meta_ranker(config: OptionMetaRankerConfig) -> OptionMetaRanker
     if "label_basis" not in options.columns:
         raise ValueError(
             "Option panel uses the legacy return-only target; rebuild it with the unified behavior label contract"
+        )
+    policies = set(options.get("label_policy", pd.Series(dtype=str)).dropna().astype(str))
+    if policies != {ORACLE_OPTION_LABEL_POLICY}:
+        raise ValueError(
+            "Option panel uses an unsupported label policy; rebuild it with the current "
+            f"oracle-horizon contract (expected {ORACLE_OPTION_LABEL_POLICY!r}, got {sorted(policies)!r})"
         )
     scores = FamilyScoreStore(Path(config.equity_score_store)).read_scores(model_ids=None)
     wide, score_features = wide_equity_family_scores(scores)
