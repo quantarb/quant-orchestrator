@@ -46,6 +46,10 @@ def test_trains_one_meta_ranker_from_reusable_equity_scores(monkeypatch, tmp_pat
         lambda *args, **kwargs: options,
     )
     monkeypatch.setattr(
+        "quant_orchestrator.research_tools.option_meta_ranker._validate_option_label_policy",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
         "quant_orchestrator.research_tools.option_meta_ranker.FamilyScoreStore.read_scores",
         lambda self, **kwargs: scores,
     )

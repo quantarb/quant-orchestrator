@@ -427,7 +427,7 @@ def _load_option_panel(
         dict.fromkeys(
             [
                 "trade_id", "symbol", "entry_date", "option_return", "rank_y",
-                "label_basis", "days_before_oracle_exit",
+                "label_basis", "label_policy", "return_horizon", "days_before_oracle_exit",
                 "equity_signal_side", "side", "option_type", "option_action",
                 "expiration", "snapshot_date", "fixed_near_atm_score",
                 *OPTION_FEATURES,

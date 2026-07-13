@@ -49,6 +49,7 @@ def train_option_meta_ranker(config: OptionMetaRankerConfig) -> OptionMetaRanker
     """Train one option ranker from option features plus reusable equity-family scores."""
 
     started = perf_counter()
+    _validate_option_label_policy(Path(config.option_panel))
     options = _load_option_panel(
         Path(config.option_panel),
         max_trades=int(config.max_trades),
@@ -59,12 +60,6 @@ def train_option_meta_ranker(config: OptionMetaRankerConfig) -> OptionMetaRanker
     if "label_basis" not in options.columns:
         raise ValueError(
             "Option panel uses the legacy return-only target; rebuild it with the unified behavior label contract"
-        )
-    policies = set(options.get("label_policy", pd.Series(dtype=str)).dropna().astype(str))
-    if policies != {ORACLE_OPTION_LABEL_POLICY}:
-        raise ValueError(
-            "Option panel uses an unsupported label policy; rebuild it with the current "
-            f"oracle-horizon contract (expected {ORACLE_OPTION_LABEL_POLICY!r}, got {sorted(policies)!r})"
         )
     scores = FamilyScoreStore(Path(config.equity_score_store)).read_scores(model_ids=None)
     wide, score_features = wide_equity_family_scores(scores)
@@ -136,6 +131,33 @@ def train_option_meta_ranker(config: OptionMetaRankerConfig) -> OptionMetaRanker
         training_trades=int(stack.loc[valid, "trade_id"].nunique()),
         features=tuple(features),
     )
+
+
+def _validate_option_label_policy(path: Path) -> None:
+    """Validate the persisted label contract before feature projection."""
+
+    import pyarrow.parquet as pq
+
+    panel_path = Path(path)
+    if not panel_path.exists():
+        raise FileNotFoundError(f"Missing option candidate panel: {panel_path}")
+    columns = set(pq.ParquetFile(panel_path).schema.names)
+    if "label_policy" not in columns:
+        raise ValueError(
+            "Option panel uses an unsupported label policy; rebuild it with the current "
+            f"oracle-horizon contract (expected {ORACLE_OPTION_LABEL_POLICY!r}, got [])"
+        )
+    policies = set(
+        pd.read_parquet(panel_path, columns=["label_policy"])["label_policy"]
+        .dropna()
+        .astype(str)
+        .unique()
+    )
+    if policies != {ORACLE_OPTION_LABEL_POLICY}:
+        raise ValueError(
+            "Option panel uses an unsupported label policy; rebuild it with the current "
+            f"oracle-horizon contract (expected {ORACLE_OPTION_LABEL_POLICY!r}, got {sorted(policies)!r})"
+        )
 
 
 def wide_equity_family_scores(scores: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
