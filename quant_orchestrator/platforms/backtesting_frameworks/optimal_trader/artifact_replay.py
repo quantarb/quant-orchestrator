@@ -258,7 +258,7 @@ def read_price_frame(warehouse: Any, symbol: str, *, start: str, end: str, provi
 
 def build_technical_panel(symbols: Sequence[str], *, start: str, end: str, provider: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     from quant_warehouse import Warehouse
-    from quant_warehouse.platforms.data_providers.fmp.feature_engineering import build_price_technical_features
+    from quant_warehouse.platforms.data_providers.fmp.feature_engineering import build_historical_price_eod_features
 
     warehouse = Warehouse()
     frames: list[pd.DataFrame] = []
@@ -270,7 +270,7 @@ def build_technical_panel(symbols: Sequence[str], *, start: str, end: str, provi
         if prices.empty:
             skipped.append(symbol)
             continue
-        built = build_price_technical_features(symbol, prices)
+        built = build_historical_price_eod_features(symbol, prices)
         if built.df.empty:
             skipped.append(symbol)
             continue

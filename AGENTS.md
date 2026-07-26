@@ -23,6 +23,20 @@
 - `trade_windows` is the preferred handoff into option-equivalent replay, WFO summaries, Monte Carlo over trades, and cross-framework comparison. Keep the required columns stable: `trade_id`, `symbol`, `side`, `entry_date`, and `exit_date`. Preserve `equity_entry_notional` when available so option replay can use the same capital budget as the equity trade.
 - Do not assume every workflow is ML-driven, equity-only, or backtest-driven. Train-only, inference-only, backtest-only, train-then-backtest, and external-engine strategy runs should all fit the platform model.
 
+## Experiment Universe And Artifact Layout
+
+- Do not duplicate experiment code or create separate top-level experiment names for different market-cap universes.
+- A single experiment should accept the universe through its configuration, especially `min_market_cap` (or the equivalent universe parameter).
+- Store outputs under one experiment root with universe-specific subdirectories, using canonical names such as:
+  `artifacts/experiment_xyz/1T/`, `artifacts/experiment_xyz/100B/`, and `artifacts/experiment_xyz/10B/`.
+- Keep shared configuration, model code, dataset construction, training, evaluation, and reporting in the same workflow. Only the universe parameter, input artifact paths, and resulting metadata should vary by subdirectory.
+- When adding a new universe run, extend the existing experiment configuration and artifact manifest instead of copying the experiment into names such as `experiment_xyz_1t`, `experiment_xyz_100b`, or `experiment_xyz_10b`.
+
+## Embedding Visualization Defaults
+
+- Generate embedding visualizations, including t-SNE charts, as true three-dimensional plots by default so the first three embedding coordinates are visible together.
+- Prefer an interactive or rotatable 3D output when the reporting format supports it, and save the plotted coordinates alongside the chart for reproducibility.
+
 ## ML Training Vs Strategy Backtesting Boundary
 
 - ML model training and ML model evaluation datasets must stay event-only. Do not add synthetic `no_event`, non-event, daily filler, or unlabeled feature-panel rows to classifier training/evaluation labels unless the user explicitly asks for a different modeling problem.
