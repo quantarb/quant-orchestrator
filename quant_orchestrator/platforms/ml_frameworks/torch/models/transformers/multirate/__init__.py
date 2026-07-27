@@ -18,6 +18,19 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
     build_1t_subtoken_documents,
     mean_document_embeddings,
 )
+from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.target_documents import (
+    TargetSubtokenDocumentCorpus,
+    build_endpoint_target_subtoken_documents,
+    build_event_target_family_subtoken_documents,
+    build_earnings_report_subtoken_documents,
+    build_analyst_rating_subtoken_documents,
+    build_ownership_insider_trading_subtoken_documents,
+)
+from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.entity_embeddings import (
+    GlobalEntityEmbedding,
+    GlobalEntityVocabulary,
+    canonical_entity,
+)
 
 __all__ = [
     "MultiRateTaskSpec",
@@ -30,4 +43,13 @@ __all__ = [
     "SubtokenDocumentCorpus",
     "build_1t_subtoken_documents",
     "mean_document_embeddings",
+    "TargetSubtokenDocumentCorpus",
+    "build_endpoint_target_subtoken_documents",
+    "build_event_target_family_subtoken_documents",
+    "build_earnings_report_subtoken_documents",
+    "build_analyst_rating_subtoken_documents",
+    "build_ownership_insider_trading_subtoken_documents",
+    "GlobalEntityEmbedding",
+    "GlobalEntityVocabulary",
+    "canonical_entity",
 ]
