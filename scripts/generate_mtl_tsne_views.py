@@ -16,6 +16,8 @@ def _save_view(frame: pd.DataFrame, output: Path, title: str, *, target_labels: 
     axis = figure.add_subplot(111, projection="3d")
     target_labels = target_labels or set()
     for task, color, marker in (
+        ("feature_family", "tab:blue", "o"),
+        ("target_family", "black", "*"),
         ("family", "tab:blue", "o"),
         ("sector", "tab:orange", "s"),
         ("subsector", "tab:green", "^"),
@@ -64,20 +66,8 @@ def main() -> None:
     }
     _save_view(
         frame,
-        args.output_dir / "all_tasks_tsne_3d.png",
-        f"{args.title_prefix} — all MTL prototype embeddings",
-        target_labels=target_labels,
-    )
-    _save_view(
-        frame.loc[frame["task"].eq("family")],
-        args.output_dir / "feature_and_target_families_tsne_3d.png",
-        f"{args.title_prefix} — feature and endpoint target families",
-        target_labels=target_labels,
-    )
-    _save_view(
-        frame.loc[frame["task"].isin({"family", "sector", "subsector", "industry"})],
-        args.output_dir / "family_taxonomy_tsne_3d.png",
-        f"{args.title_prefix} — family and taxonomy prototype embeddings",
+        args.output_dir / "prototype_embeddings_tsne_3d.png",
+        f"{args.title_prefix} — all prototype embeddings",
         target_labels=target_labels,
     )
 

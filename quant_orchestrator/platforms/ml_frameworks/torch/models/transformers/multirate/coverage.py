@@ -9,6 +9,7 @@ with presence ``0``.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import re
 import torch
 from torch import nn
 
@@ -37,6 +38,10 @@ class CoverageAwareInput(nn.Module):
             raise ValueError("family_dims must contain positive dimensions")
         self.family_names = tuple(family_dims)
         self.family_dims = {name: int(dim) for name, dim in family_dims.items()}
+        self.family_keys = {
+            name: re.sub(r"[^a-zA-Z0-9_]", "_", str(name))
+            for name in self.family_names
+        }
         self.slices: dict[str, slice] = {}
         start = 0
         for name, dim in self.family_dims.items():
@@ -44,7 +49,7 @@ class CoverageAwareInput(nn.Module):
             start += dim
         self.feature_dim = start
         self.family_adapters = nn.ModuleDict({
-            name: nn.Sequential(nn.Linear(dim, d_model), nn.LayerNorm(d_model), nn.GELU())
+            self.family_keys[name]: nn.Sequential(nn.Linear(dim, d_model), nn.LayerNorm(d_model), nn.GELU())
             for name, dim in self.family_dims.items()
         })
         self.missingness_embeddings = nn.Parameter(torch.randn(len(self.family_names), d_model) * 0.02)
@@ -82,7 +87,7 @@ class CoverageAwareInput(nn.Module):
         states = []
         for index, name in enumerate(self.family_names):
             family = clean[..., self.slices[name]]
-            state = self.family_adapters[name](family)
+            state = self.family_adapters[self.family_keys[name]](family)
             missing = (~observed_features[..., self.slices[name]]).to(values.dtype).mean(dim=-1, keepdim=True)
             state = state + missing * self.missingness_embeddings[index]
             gate = torch.sigmoid(self.coverage_gate_bias[index]) * presence[..., index:index + 1]

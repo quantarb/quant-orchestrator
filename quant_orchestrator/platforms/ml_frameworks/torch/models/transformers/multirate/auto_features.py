@@ -110,6 +110,14 @@ class AutoFeatureEngineer(nn.Module):
         if padding_mask is not None:
             token_padding = token_padding | padding_mask.unsqueeze(-1)
         token_padding = token_padding.reshape(batch, length * family_count)
+        # A causal attention row that is entirely padding would otherwise
+        # have no legal keys and PyTorch returns NaNs. Keep one zero-valued
+        # placeholder family token for each entirely missing date; its
+        # presence weight remains zero, so it cannot contribute to features.
+        missing_dates = token_padding.view(batch, length, family_count).all(dim=-1)
+        token_padding_view = token_padding.view(batch, length, family_count)
+        token_padding_view[..., 0] = token_padding_view[..., 0] & ~missing_dates
+        token_padding = token_padding_view.reshape(batch, length * family_count)
 
         attended, _ = self.family_attention(
             tokens,

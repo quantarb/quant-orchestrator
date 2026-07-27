@@ -26,10 +26,15 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
     build_analyst_rating_subtoken_documents,
     build_ownership_insider_trading_subtoken_documents,
 )
-from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.entity_embeddings import (
-    GlobalEntityEmbedding,
-    GlobalEntityVocabulary,
-    canonical_entity,
+from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.text_embeddings import (
+    canonical_row_text,
+    encode_frozen_text_rows,
+)
+from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.document_axes import (
+    CrossSectionalDocument,
+    TemporalDocument,
+    build_cross_sectional_documents,
+    build_temporal_documents,
 )
 
 __all__ = [
@@ -49,7 +54,10 @@ __all__ = [
     "build_earnings_report_subtoken_documents",
     "build_analyst_rating_subtoken_documents",
     "build_ownership_insider_trading_subtoken_documents",
-    "GlobalEntityEmbedding",
-    "GlobalEntityVocabulary",
-    "canonical_entity",
+    "canonical_row_text",
+    "encode_frozen_text_rows",
+    "TemporalDocument",
+    "CrossSectionalDocument",
+    "build_temporal_documents",
+    "build_cross_sectional_documents",
 ]
