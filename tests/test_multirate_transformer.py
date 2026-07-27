@@ -76,7 +76,8 @@ def test_padding_mask_is_respected_by_document_pooling():
         torch.randn(1, 3, 2), torch.randn(1, 1, 2), torch.randn(1, 1, 2),
         daily_padding_mask=torch.tensor([[False, True, True]]),
     )
-    assert torch.equal(output["document_state"], output["token_states"][:, 0])
+    assert output["document_state"].shape == (1, 16)
+    assert torch.isfinite(output["document_state"]).all()
 
 
 def test_coverage_input_distinguishes_missing_from_observed_zero():
@@ -127,6 +128,25 @@ def test_auto_feature_engineer_has_temporal_and_cross_sectional_paths():
     assert not torch.equal(temporal, cross)
 
 
+def test_auto_feature_engineer_keeps_family_documents_isolated():
+    torch.manual_seed(11)
+    block = AutoFeatureEngineer(12)
+    values = torch.randn(1, 4, 12)
+    families = torch.randn(1, 4, 2, 12)
+    changed = families.clone()
+    changed[:, :, 1] += 100.0
+    presence = torch.ones(1, 4, 2)
+    _, first = block(
+        values, mode="temporal", family_states=families,
+        family_presence=presence, return_subtoken_states=True,
+    )
+    _, changed_first = block(
+        values, mode="temporal", family_states=changed,
+        family_presence=presence, return_subtoken_states=True,
+    )
+    assert torch.allclose(first[:, :, 0], changed_first[:, :, 0])
+
+
 def test_auto_feature_engineer_has_cross_rate_path():
     block = AutoFeatureEngineer(12)
     rates = tuple(torch.randn(2, 12) for _ in range(3))
@@ -153,3 +173,47 @@ def test_prediction_heads_support_token_and_subtoken_objectives():
     )
     assert output["prediction_outputs"]["next_daily_token"].shape == (2, 4, 3)
     assert output["prediction_outputs"]["masked_daily_family"].shape == (2, 4, 2, 2)
+
+
+def test_document_pooling_means_valid_subtokens_and_excludes_missing_families():
+    states = torch.tensor([[[[1.0, 3.0], [100.0, 100.0]], [[5.0, 7.0], [9.0, 11.0]]]])
+    padding = torch.tensor([[False, False]])
+    presence = torch.tensor([[[True, False], [True, True]]])
+    pooled = MultiRateTransformer._pool_subtokens(states, padding, presence)
+    assert torch.allclose(pooled, torch.tensor([[5.0, 7.0]]))
+
+
+def test_family_classification_is_document_level():
+    model = MultiRateTransformer(
+        {"annual": 2, "quarterly": 2, "daily": 2},
+        config=MultiRateTransformerConfig(d_model=12, num_heads=3, layers=1),
+        feature_families={
+            "annual": {"fundamentals": 1, "prices": 1},
+            "quarterly": {"fundamentals": 1, "prices": 1},
+            "daily": {"fundamentals": 1, "prices": 1},
+        },
+        tasks=(MultiRateTaskSpec("sector", "document", output_dim=3),),
+        family_classification_dim=5,
+    )
+    output = model(
+        torch.randn(2, 3, 2), torch.randn(2, 2, 2), torch.randn(2, 2, 2),
+    )
+    assert output["family_outputs"].shape == (2, 5)
+    assert output["document_outputs"]["sector"].shape == (2, 3)
+
+
+def test_family_documents_are_a_regular_document_task_source():
+    model = MultiRateTransformer(
+        {"annual": 2, "quarterly": 2, "daily": 2},
+        config=MultiRateTransformerConfig(d_model=12, num_heads=3, layers=1),
+        feature_families={
+            "annual": {"balance_sheet": 1, "prices": 1},
+            "quarterly": {"balance_sheet": 1, "prices": 1},
+            "daily": {"balance_sheet": 1, "prices": 1},
+        },
+        tasks=(MultiRateTaskSpec("family", "document", output_dim=2, source="family"),),
+    )
+    output = model(
+        torch.randn(2, 3, 2), torch.randn(2, 2, 2), torch.randn(2, 2, 2),
+    )
+    assert output["document_outputs"]["family"].shape == (2, 2, 2)

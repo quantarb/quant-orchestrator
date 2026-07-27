@@ -67,5 +67,19 @@ shares one implementation across issuers, instruments, and asset classes:
 - pooled annual, quarterly, and daily states receive learned bidirectional
   cross-rate attention before fused document tasks.
 
+The feature-engineering attention is document-local: each `(symbol,
+feature_family)` stream is encoded as its own causal temporal document. A
+family document never attends to another family or symbol. Documents are
+batched by reshaping to independent `(batch × family)` sequences, avoiding a
+dense attention matrix over all documents while preserving the document
+boundary. The training entry point also supports small physical batches with
+`--grad-accumulation-steps`, plus configurable `--d-model`, `--num-heads`, and
+`--layers`.
+
+Document tasks can use `source="family"` to receive one representation per
+family document. A family classifier therefore uses the same document-task
+interface as industry, sector, and year heads. Symbol/year tasks consume the
+pooled cross-family symbol-year representation.
+
 These are learned latent features for the supervised tasks; they are not
 persisted as an unbounded set of generated columns.

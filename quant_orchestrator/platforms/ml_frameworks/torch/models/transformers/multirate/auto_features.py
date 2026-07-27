@@ -38,8 +38,14 @@ class AutoFeatureEngineer(nn.Module):
         if d_model % num_heads:
             raise ValueError("d_model must be divisible by num_heads")
         self.position = nn.Parameter(torch.randn(max_position, d_model) * 0.02)
-        self.family_attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
-        self.family_norm = nn.LayerNorm(d_model)
+        # Each family is an independent temporal document. Reshaping to
+        # [batch * family, date, d_model] gives every (symbol, family)
+        # document its own attention sequence and prevents cross-family
+        # interactions inside the encoder.
+        self.temporal_attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        # Cross-rate fusion happens only after each rate/family document has
+        # been independently encoded and pooled.
+        self.cross_rate_attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.feature_mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
@@ -52,7 +58,7 @@ class AutoFeatureEngineer(nn.Module):
         if not rate_states:
             raise ValueError("at least one rate state is required")
         stacked = torch.stack(rate_states, dim=1)
-        attended, _ = self.family_attention(stacked, stacked, stacked)
+        attended, _ = self.cross_rate_attention(stacked, stacked, stacked)
         return attended.mean(dim=1)
 
     def forward(
@@ -100,38 +106,34 @@ class AutoFeatureEngineer(nn.Module):
         if dates.ndim != 1 or dates.shape[0] != length:
             raise ValueError("dates must have shape [sequence]")
 
-        tokens = (family_states + self.position[:length].view(1, length, 1, -1)).reshape(
-            batch, length * family_count, d_model
-        )
-        token_dates = dates.repeat_interleave(family_count)
-        # Query rows can see keys at the same or an earlier date.
-        attention_mask = token_dates[None, :] > token_dates[:, None]
+        tokens = family_states + self.position[:length].view(1, length, 1, -1)
         token_padding = family_presence.eq(0)
         if padding_mask is not None:
             token_padding = token_padding | padding_mask.unsqueeze(-1)
-        token_padding = token_padding.reshape(batch, length * family_count)
-        # A causal attention row that is entirely padding would otherwise
-        # have no legal keys and PyTorch returns NaNs. Keep one zero-valued
-        # placeholder family token for each entirely missing date; its
-        # presence weight remains zero, so it cannot contribute to features.
-        missing_dates = token_padding.view(batch, length, family_count).all(dim=-1)
-        token_padding_view = token_padding.view(batch, length, family_count)
-        token_padding_view[..., 0] = token_padding_view[..., 0] & ~missing_dates
-        token_padding = token_padding_view.reshape(batch, length * family_count)
-
-        attended, _ = self.family_attention(
-            tokens,
-            tokens,
-            tokens,
-            attn_mask=attention_mask,
-            key_padding_mask=token_padding,
+        # One independent temporal document per (batch item, family).
+        document_tokens = tokens.permute(0, 2, 1, 3).reshape(batch * family_count, length, d_model)
+        document_padding = token_padding.permute(0, 2, 1).reshape(batch * family_count, length).clone()
+        # Avoid all-masked rows; the placeholder is excluded from pooling by
+        # the original presence/padding mask after attention. Unmasking the
+        # first position for every document also gives left-padded queries a
+        # legal causal key.
+        document_padding[:, 0] = False
+        temporal_mask = dates[None, :] > dates[:, None]
+        attended, _ = self.temporal_attention(
+            document_tokens,
+            document_tokens,
+            document_tokens,
+            attn_mask=temporal_mask,
+            key_padding_mask=document_padding,
         )
-        attended = self.family_norm(attended + tokens)
+        attended = torch.nan_to_num(attended, nan=0.0, posinf=0.0, neginf=0.0)
+        attended = attended.reshape(batch, family_count, length, d_model).permute(0, 2, 1, 3)
+        attended = self.output_norm(attended + tokens)
         attended = self.output_norm(attended + self.feature_mlp(attended))
-        attended = attended.reshape(batch, length, family_count, d_model)
         weights = family_presence.to(attended.dtype).unsqueeze(-1)
         engineered = (attended * weights).sum(dim=2) / weights.sum(dim=2).clamp_min(1.0)
         output = self.output_norm(values + engineered)
+        output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
         if return_subtoken_states:
             return output, attended
         return output

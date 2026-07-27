@@ -47,7 +47,7 @@ class MultiRateTaskSpec:
     task_name: str
     level: Literal["token", "document"]
     output_dim: int = 1
-    source: Literal["daily", "annual", "quarterly", "sparse", "fused"] = "daily"
+    source: Literal["daily", "annual", "quarterly", "sparse", "fused", "family"] = "daily"
 
     def __post_init__(self) -> None:
         if not self.task_name.strip():
@@ -213,6 +213,15 @@ class MultiRateTransformer(nn.Module):
             nn.LayerNorm(self.config.d_model),
             nn.GELU(),
         )
+        self.family_names = tuple(dict.fromkeys(
+            name for rate in self.config.rates for name in self.coverage_inputs[rate].family_names
+        ))
+        self.family_indices = {name: index for index, name in enumerate(self.family_names)}
+        self.family_document_fusion = nn.Sequential(
+            nn.Linear(self.config.d_model * len(self.config.rates), self.config.d_model),
+            nn.LayerNorm(self.config.d_model),
+            nn.GELU(),
+        )
         self.task_specs = tuple(tasks)
         self.prediction_task_specs = tuple(prediction_tasks)
         self.family_classification_head = (
@@ -299,6 +308,45 @@ class MultiRateTransformer(nn.Module):
         clean = torch.where(valid, states, torch.zeros_like(states))
         return clean.sum(dim=1) / valid.sum(dim=1).clamp_min(1)
 
+    @staticmethod
+    def _pool_subtokens(
+        states: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+        family_presence: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Mean-pool valid ``[date, family]`` subtokens into one document."""
+        if states.ndim != 4:
+            raise ValueError("subtoken states must have shape [batch, sequence, family, d_model]")
+        batch, length, family_count, _ = states.shape
+        valid = torch.ones((batch, length, family_count), dtype=torch.bool, device=states.device)
+        if padding_mask is not None:
+            valid &= ~padding_mask.bool().unsqueeze(-1)
+        if family_presence is not None:
+            valid &= family_presence.bool()
+        clean = torch.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
+        weights = valid.unsqueeze(-1).to(clean.dtype)
+        return (clean * weights).sum(dim=(1, 2)) / weights.sum(dim=(1, 2)).clamp_min(1.0)
+
+    @staticmethod
+    def _pool_family_documents(
+        states: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+        family_presence: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pool each family document separately; return states and validity."""
+        if states.ndim != 4:
+            raise ValueError("subtoken states must have shape [batch, sequence, family, d_model]")
+        batch, length, family_count, _ = states.shape
+        valid = torch.ones((batch, length, family_count), dtype=torch.bool, device=states.device)
+        if padding_mask is not None:
+            valid &= ~padding_mask.bool().unsqueeze(-1)
+        if family_presence is not None:
+            valid &= family_presence.bool()
+        clean = torch.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
+        weights = valid.unsqueeze(-1).to(clean.dtype)
+        pooled = (clean * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        return pooled, valid.any(dim=1)
+
     def _heads(
         self,
         *,
@@ -310,14 +358,52 @@ class MultiRateTransformer(nn.Module):
         annual_padding_mask: torch.Tensor | None,
         quarterly_padding_mask: torch.Tensor | None,
         sparse_padding_mask: torch.Tensor | None,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        rate_states = {
-            "annual": self._pool(annual_states, annual_padding_mask),
-            "quarterly": self._pool(quarterly_states, quarterly_padding_mask),
-            "daily": self._pool(daily_states, daily_padding_mask),
+        annual_subtokens: torch.Tensor | None,
+        quarterly_subtokens: torch.Tensor | None,
+        daily_subtokens: torch.Tensor | None,
+        sparse_subtokens: torch.Tensor | None,
+        family_presence: Mapping[str, torch.Tensor | None],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        subtoken_states = {
+            "annual": annual_subtokens,
+            "quarterly": quarterly_subtokens,
+            "daily": daily_subtokens,
+            "sparse": sparse_subtokens,
         }
-        if sparse_states is not None:
-            rate_states["sparse"] = self._pool(sparse_states, sparse_padding_mask)
+        padding_masks = {
+            "annual": annual_padding_mask,
+            "quarterly": quarterly_padding_mask,
+            "daily": daily_padding_mask,
+            "sparse": sparse_padding_mask,
+        }
+        rate_states = {
+            rate: self._pool_subtokens(subtoken_states[rate], padding_masks[rate], family_presence[rate])
+            if subtoken_states[rate] is not None
+            else self._pool(states, padding_masks[rate])
+            for rate, states in (
+                ("annual", annual_states), ("quarterly", quarterly_states),
+                ("daily", daily_states), ("sparse", sparse_states),
+            ) if rate in self.config.rates
+        }
+        family_documents: dict[str, torch.Tensor] = {}
+        for rate, subtokens in subtoken_states.items():
+            if subtokens is None:
+                continue
+            family_documents[rate], _ = self._pool_family_documents(
+                subtokens, padding_masks[rate], family_presence[rate],
+            )
+        total_families = len(self.family_names)
+        family_parts = []
+        for rate in self.config.rates:
+            part = torch.zeros(
+                (daily_states.shape[0], total_families, self.config.d_model),
+                device=daily_states.device, dtype=daily_states.dtype,
+            )
+            if rate in family_documents:
+                for local_index, name in enumerate(self.coverage_inputs[rate].family_names):
+                    part[:, self.family_indices[name]] = family_documents[rate][:, local_index]
+            family_parts.append(part)
+        family_document_state = self.family_document_fusion(torch.cat(family_parts, dim=-1))
         ordered = tuple(rate_states[rate] for rate in self.config.rates)
         fused = self.fusion(torch.cat(ordered, dim=-1))
         fused = fused + self.auto_feature_engineer.cross_rate_features(ordered)
@@ -329,19 +415,15 @@ class MultiRateTransformer(nn.Module):
         if sparse_states is not None:
             sources["sparse"] = sparse_states
         sources["fused"] = fused
+        document_sources = {**rate_states, "fused": fused, "family": family_document_state}
         for task in self.task_specs:
-            source = sources[task.source]
+            source = document_sources[task.source] if task.level == "document" else sources[task.source]
             source = torch.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
             if task.level == "token":
                 token_outputs[task.task_name] = self.task_heads[task.task_name](source)
             else:
-                if source.ndim == 3:
-                    source = self._pool(
-                        source,
-                        daily_padding_mask if task.source == "daily" else sparse_padding_mask if task.source == "sparse" else None,
-                    )
                 document_outputs[task.task_name] = self.task_heads[task.task_name](source)
-        return token_outputs, document_outputs
+        return token_outputs, document_outputs, fused, family_document_state
 
     def _prediction_heads(
         self,
@@ -354,36 +436,6 @@ class MultiRateTransformer(nn.Module):
             source = subtoken_states[task.source] if task.level == "subtoken" else token_states[task.source]
             source = torch.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
             outputs[task.task_name] = self.prediction_heads[task.task_name](source)
-        return outputs
-
-    def _family_outputs(
-        self,
-        *,
-        subtoken_states: Mapping[str, torch.Tensor | None],
-        padding_masks: Mapping[str, torch.Tensor | None],
-        family_presence: Mapping[str, torch.Tensor | None],
-    ) -> dict[str, torch.Tensor]:
-        if self.family_classification_head is None:
-            return {}
-        outputs: dict[str, torch.Tensor] = {}
-        for rate in self.config.rates:
-            states = subtoken_states.get(rate)
-            if states is None:
-                continue
-            # [batch, sequence, family, d_model] -> one document prototype
-            # per family. Padding and unavailable families do not contribute.
-            padding = padding_masks[rate]
-            if padding is None:
-                padding = torch.zeros(states.shape[:2], dtype=torch.bool, device=states.device)
-            valid = (~padding).unsqueeze(-1).unsqueeze(-1)
-            presence = family_presence[rate]
-            if presence is None:
-                presence = torch.ones(states.shape[:2] + (states.shape[2],), dtype=torch.bool, device=states.device)
-            presence = presence.bool().unsqueeze(-1)
-            weights = valid & presence
-            clean = torch.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
-            pooled = (clean * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
-            outputs[rate] = self.family_classification_head(pooled)
         return outputs
 
     def forward(
@@ -445,7 +497,14 @@ class MultiRateTransformer(nn.Module):
         quarterly_mask = build_attention_mask(quarterly_dates, mode=attention_mode)
         sparse_mask = build_attention_mask(sparse_dates, mode=attention_mode) if sparse_dates is not None else None
 
-        need_subtokens = bool(self.prediction_task_specs)
+        # Document tasks and family classification are defined over mean
+        # subtoken embeddings; retain subtoken states whenever either class
+        # of task is present, not only when next/masked prediction is used.
+        need_subtokens = bool(
+            self.prediction_task_specs
+            or any(task.level == "document" for task in self.task_specs)
+            or self.family_classification_head is not None
+        )
         daily_projected = self._project(
             "daily", daily_values, daily_family_presence, daily_modality_ids,
             attention_mode, daily_dates, daily_padding_mask,
@@ -530,7 +589,21 @@ class MultiRateTransformer(nn.Module):
             )
         else:
             raise ValueError(f"unsupported backbone: {self.config.backbone!r}")
-        token_outputs, document_outputs = self._heads(
+        # Padded causal rows can still yield NaNs in PyTorch Transformer
+        # kernels when a stream has no usable family token. Keep those rows
+        # inert so auxiliary document/token heads receive finite states.
+        daily_states = torch.nan_to_num(daily_states, nan=0.0, posinf=0.0, neginf=0.0)
+        annual_states = torch.nan_to_num(annual_states, nan=0.0, posinf=0.0, neginf=0.0)
+        quarterly_states = torch.nan_to_num(quarterly_states, nan=0.0, posinf=0.0, neginf=0.0)
+        if sparse_states is not None:
+            sparse_states = torch.nan_to_num(sparse_states, nan=0.0, posinf=0.0, neginf=0.0)
+        family_presence = {
+            "daily": self.coverage_inputs["daily"](daily_values, return_family_states=True)[2],
+            "annual": self.coverage_inputs["annual"](annual_values, return_family_states=True)[2],
+            "quarterly": self.coverage_inputs["quarterly"](quarterly_values, return_family_states=True)[2],
+            "sparse": self.coverage_inputs["sparse"](sparse_values, return_family_states=True)[2] if sparse_values is not None else None,
+        }
+        token_outputs, document_outputs, fused_document_state, family_document_state = self._heads(
             daily_states=daily_states,
             annual_states=annual_states,
             quarterly_states=quarterly_states,
@@ -539,24 +612,24 @@ class MultiRateTransformer(nn.Module):
             annual_padding_mask=annual_padding_mask,
             quarterly_padding_mask=quarterly_padding_mask,
             sparse_padding_mask=sparse_padding_mask,
+            annual_subtokens=annual_subtokens,
+            quarterly_subtokens=quarterly_subtokens,
+            daily_subtokens=daily_subtokens,
+            sparse_subtokens=sparse_subtokens,
+            family_presence=family_presence,
         )
         prediction_outputs = self._prediction_heads(
             token_states={"daily": daily_states, "annual": annual_states, "quarterly": quarterly_states, "sparse": sparse_states},
             subtoken_states={"daily": daily_subtokens, "annual": annual_subtokens, "quarterly": quarterly_subtokens, "sparse": sparse_subtokens},
         ) if need_subtokens else {}
-        family_outputs = self._family_outputs(
-            subtoken_states={"daily": daily_subtokens, "annual": annual_subtokens, "quarterly": quarterly_subtokens, "sparse": sparse_subtokens},
-            padding_masks={"daily": daily_padding_mask, "annual": annual_padding_mask, "quarterly": quarterly_padding_mask, "sparse": sparse_padding_mask},
-            family_presence={
-                "daily": self.coverage_inputs["daily"](daily_values, return_family_states=True)[2],
-                "annual": self.coverage_inputs["annual"](annual_values, return_family_states=True)[2],
-                "quarterly": self.coverage_inputs["quarterly"](quarterly_values, return_family_states=True)[2],
-                "sparse": self.coverage_inputs["sparse"](sparse_values, return_family_states=True)[2] if sparse_values is not None else None,
-            },
-        ) if need_subtokens and self.family_classification_head is not None else {}
+        family_outputs = (
+            self.family_classification_head(fused_document_state)
+            if self.family_classification_head is not None else None
+        )
         return {
             "token_states": daily_states,
-            "document_state": self._pool(daily_states, daily_padding_mask),
+            "document_state": fused_document_state,
+            "family_document_state": family_document_state,
             "rate_states": {
                 "annual": annual_states,
                 "quarterly": quarterly_states,

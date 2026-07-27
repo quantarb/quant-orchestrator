@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,45 @@ FAMILIES = (
     "financetoolkit.ft_ratios_profitability", "financetoolkit.ft_ratios_solvency",
     "financetoolkit.ft_ratios_valuation",
 )
+
+
+def _load_project_credentials() -> None:
+    """Load the shared project .env before invoking OpenBB/FMP."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    project_root = Path(__file__).resolve().parents[2]
+    candidates = (
+        project_root / "quant-warehouse" / ".env",
+        project_root / "optimal_trader" / ".env",
+        project_root / ".env",
+    )
+    for path in candidates:
+        if path.exists():
+            load_dotenv(path, override=False)
+
+
+def _subsector_map(symbols: tuple[str, ...]) -> dict[str, str]:
+    """Read FMP/OpenBB ``subSector`` classifications for the symbol universe."""
+    _load_project_credentials()
+    try:
+        from quant_warehouse.ingest.constituent_fetch import fetch_index_constituents
+
+        rows = fetch_index_constituents(("sp500", "nasdaq", "dowjones"))
+    except Exception as exc:
+        print(f"warning: unable to load OpenBB/FMP subsectors: {exc}", flush=True)
+        return {}
+    wanted = set(symbols)
+    result: dict[str, str] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or row.get("ticker") or "").strip().upper()
+        subsector = str(
+            row.get("subSector") or row.get("sub_sector") or row.get("subsector") or ""
+        ).strip()
+        if symbol in wanted and subsector and subsector.lower() not in {"nan", "none"}:
+            result.setdefault(symbol, subsector)
+    return result
 
 
 def _family_values(panel: pd.DataFrame, metadata: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -130,6 +170,7 @@ def main() -> None:
     parser.add_argument("--start-date", default="1900-01-01")
     args = parser.parse_args()
     symbols = tuple(sorted(pd.read_csv(args.symbols)["symbol"].astype(str).str.upper().unique()))
+    subsectors = _subsector_map(symbols)
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     warehouse = Warehouse()
@@ -156,7 +197,8 @@ def main() -> None:
     profiles = warehouse.catalog.query_symbol_profiles(provider="fmp", min_market_cap=0, country="", exchanges=(), exclude_etf=True, exclude_fund=True, limit=100_000)
     taxonomy = pd.DataFrame([
         {"symbol": symbol, "sector": (next((p.sector for p in profiles if p.symbol == symbol), None) or "Unknown"),
-         "subsector": "Unknown", "industry": (next((p.industry for p in profiles if p.symbol == symbol), None) or "Unknown")}
+         "subsector": subsectors.get(symbol, "Unknown"),
+         "industry": (next((p.industry for p in profiles if p.symbol == symbol), None) or "Unknown")}
         for symbol in symbols
     ])
     taxonomy.to_csv(output / "taxonomy.csv", index=False)
