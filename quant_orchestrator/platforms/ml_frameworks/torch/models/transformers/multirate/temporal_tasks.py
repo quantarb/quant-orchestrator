@@ -51,7 +51,20 @@ HITS_SUPERVISED_TASK_NAMES = (
     "hits_long_speed_hub", "hits_long_speed_authority",
     "hits_short_speed_hub", "hits_short_speed_authority",
 )
-SUPERVISED_TARGET_TASK_NAMES = ORACLE_SUPERVISED_TASK_NAMES + HITS_SUPERVISED_TASK_NAMES
+FUND_ACTIVITY_SUPERVISED_TASK_NAMES = (
+    "fund_activity_etf_buy",
+    "fund_activity_mutual_fund_buy",
+    "fund_activity_institutional_buy",
+    "fund_activity_hedge_fund_buy",
+    "fund_activity_add",
+    "fund_activity_reduce",
+    "fund_activity_exit",
+)
+SUPERVISED_TARGET_TASK_NAMES = (
+    ORACLE_SUPERVISED_TASK_NAMES
+    + HITS_SUPERVISED_TASK_NAMES
+    + FUND_ACTIVITY_SUPERVISED_TASK_NAMES
+)
 PREDICTION_TASK_NAMES = SUBTOKEN_PREDICTION_TASK_NAMES + TOKEN_PREDICTION_TASK_NAMES
 TEMPORAL_MTL_TASK_NAMES = DOCUMENT_TASK_NAMES + SUPERVISED_TARGET_TASK_NAMES + PREDICTION_TASK_NAMES
 
@@ -130,6 +143,7 @@ __all__ = [
     "TOKEN_PREDICTION_TASK_NAMES",
     "ORACLE_SUPERVISED_TASK_NAMES",
     "HITS_SUPERVISED_TASK_NAMES",
+    "FUND_ACTIVITY_SUPERVISED_TASK_NAMES",
     "SUPERVISED_TARGET_TASK_NAMES",
     "PREDICTION_TASK_NAMES",
     "TEMPORAL_MTL_TASK_NAMES",

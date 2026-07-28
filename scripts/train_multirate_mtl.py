@@ -28,6 +28,7 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.temporal_tasks import (
     DOCUMENT_TASK_NAMES,
+    FUND_ACTIVITY_SUPERVISED_TASK_NAMES,
     HITS_SUPERVISED_TASK_NAMES,
     ORACLE_SUPERVISED_TASK_NAMES,
     SUPERVISED_TARGET_TASK_NAMES,
@@ -165,6 +166,11 @@ def main() -> None:
                 for task_name, channel in zip(ORACLE_SUPERVISED_TASK_NAMES, target_channels[:4]):
                     if channel in values:
                         targets[task_name] = max(targets.get(task_name, 0.0), values[channel])
+            if target_family.startswith("fund_activity."):
+                activity_name = target_family.removeprefix("fund_activity.")
+                task_name = f"fund_activity_{activity_name}"
+                if task_name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES:
+                    targets[task_name] = max(targets.get(task_name, 0.0), values.get("signal_value", 0.0))
 
     daily_value_columns = [f"value__{family}" for family in feature_families]
     annual_value_columns = daily_value_columns
@@ -366,7 +372,7 @@ def main() -> None:
                 continue
             target = supervised_targets[:, :, task_index]
             prediction = output["token_outputs"][name].squeeze(-1)
-            if name in ORACLE_SUPERVISED_TASK_NAMES:
+            if name in ORACLE_SUPERVISED_TASK_NAMES or name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES:
                 task_losses[name] = nn.functional.binary_cross_entropy_with_logits(prediction[valid], target[valid])
             else:
                 task_losses[name] = nn.functional.smooth_l1_loss(prediction[valid], target[valid])

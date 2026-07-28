@@ -6,10 +6,14 @@ import argparse
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "quant-warehouse"))
 
 from quant_warehouse import Warehouse
 from quant_warehouse.research_tools.feature_family_eval import (
@@ -189,6 +193,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", type=Path, required=True)
     parser.add_argument("--target-events", type=Path, required=True)
+    parser.add_argument(
+        "--fund-activity-events",
+        type=Path,
+        default=None,
+        help="Optional parquet fund_activity target events to append to target-events.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--chunk-size", type=int, default=100)
     parser.add_argument("--text-device", default="cuda")
@@ -259,7 +269,11 @@ def main() -> None:
     families = sorted({str(value) for part in metadata_parts for value in part["family"]})
     for rate in ("daily", "quarterly", "annual"):
         _rate_table(daily, families, rate).to_parquet(output / f"{rate}.parquet", index=False)
-    target_families = _build_sparse_events(pd.read_parquet(args.target_events), output, args.text_device)
+    target_events = pd.read_parquet(args.target_events)
+    if args.fund_activity_events is not None:
+        fund_activity_events = pd.read_parquet(args.fund_activity_events)
+        target_events = pd.concat([target_events, fund_activity_events], ignore_index=True, sort=False)
+    target_families = _build_sparse_events(target_events, output, args.text_device)
     profiles = warehouse.catalog.query_symbol_profiles(provider="fmp", min_market_cap=0, country="", exchanges=(), exclude_etf=True, exclude_fund=True, limit=100_000)
     profiles_by_symbol = {str(profile.symbol).strip().upper(): profile for profile in profiles}
     taxonomy = pd.DataFrame([
