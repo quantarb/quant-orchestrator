@@ -38,7 +38,10 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.temporal_tasks import (
     DOCUMENT_TASK_NAMES,
+    HITS_SUPERVISED_TASK_NAMES,
+    ORACLE_SUPERVISED_TASK_NAMES,
     PREDICTION_TASK_NAMES,
+    SUPERVISED_TARGET_TASK_NAMES,
     SUBTOKEN_PREDICTION_TASK_NAMES,
     TOKEN_PREDICTION_TASK_NAMES,
     TEMPORAL_MTL_TASK_NAMES,
@@ -76,6 +79,9 @@ __all__ = [
     "build_temporal_documents",
     "build_cross_sectional_documents",
     "DOCUMENT_TASK_NAMES",
+    "ORACLE_SUPERVISED_TASK_NAMES",
+    "HITS_SUPERVISED_TASK_NAMES",
+    "SUPERVISED_TARGET_TASK_NAMES",
     "SUBTOKEN_PREDICTION_TASK_NAMES",
     "TOKEN_PREDICTION_TASK_NAMES",
     "PREDICTION_TASK_NAMES",

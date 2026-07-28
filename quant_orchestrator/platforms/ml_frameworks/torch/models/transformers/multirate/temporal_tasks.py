@@ -19,7 +19,9 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.multitask import Corpus
 
 
-DOCUMENT_TASK_NAMES = ("family", "industry", "sector", "subsector", "year")
+DOCUMENT_TASK_NAMES = (
+    "family", "issuer", "symbol", "industry", "sector", "subsector", "year",
+)
 SUBTOKEN_PREDICTION_TASK_NAMES = (
     "next_annual_subtoken",
     "next_quarterly_subtoken",
@@ -40,8 +42,18 @@ TOKEN_PREDICTION_TASK_NAMES = (
     "masked_daily_token",
     "masked_sparse_token",
 )
+ORACLE_SUPERVISED_TASK_NAMES = (
+    "oracle_is_buy", "oracle_is_sell", "oracle_is_short", "oracle_is_cover",
+)
+HITS_SUPERVISED_TASK_NAMES = (
+    "hits_long_return_hub", "hits_long_return_authority",
+    "hits_short_return_hub", "hits_short_return_authority",
+    "hits_long_speed_hub", "hits_long_speed_authority",
+    "hits_short_speed_hub", "hits_short_speed_authority",
+)
+SUPERVISED_TARGET_TASK_NAMES = ORACLE_SUPERVISED_TASK_NAMES + HITS_SUPERVISED_TASK_NAMES
 PREDICTION_TASK_NAMES = SUBTOKEN_PREDICTION_TASK_NAMES + TOKEN_PREDICTION_TASK_NAMES
-TEMPORAL_MTL_TASK_NAMES = DOCUMENT_TASK_NAMES + PREDICTION_TASK_NAMES
+TEMPORAL_MTL_TASK_NAMES = DOCUMENT_TASK_NAMES + SUPERVISED_TARGET_TASK_NAMES + PREDICTION_TASK_NAMES
 
 
 @dataclass(frozen=True)
@@ -50,15 +62,16 @@ class TemporalMTLTaskBundle:
 
     corpus: Corpus
     document_tasks: tuple[MultiRateTaskSpec, ...]
+    supervised_tasks: tuple[MultiRateTaskSpec, ...]
     prediction_tasks: tuple[MultiRatePredictionTaskSpec, ...]
 
     @property
     def task_names(self) -> tuple[str, ...]:
-        return tuple(task.task_name for task in self.document_tasks + self.prediction_tasks)
+        return tuple(task.task_name for task in self.document_tasks + self.supervised_tasks + self.prediction_tasks)
 
     @property
     def tasks(self) -> tuple[Task, ...]:
-        return tuple(Task(task.task_name, task) for task in self.document_tasks + self.prediction_tasks)
+        return tuple(Task(task.task_name, task) for task in self.document_tasks + self.supervised_tasks + self.prediction_tasks)
 
 
 def add_subtoken_temporal_tasks(
@@ -72,9 +85,9 @@ def add_subtoken_temporal_tasks(
     """Create shared corpus with co-trained token and subtoken task heads.
 
     ``family_names`` contains the union of feature and target families.  The
-    remaining document labels must contain ``industry``, ``sector``,
-    ``subsector``, and ``year``.  Those labels classify temporal documents;
-    they are not cross-sectional document sources.
+    remaining document labels must contain ``issuer``, ``symbol``,
+    ``industry``, ``sector``, ``subsector``, and ``year``.  Those labels
+    classify temporal documents; they are not cross-sectional document sources.
     """
     corpus = Corpus(rows, name=corpus_name, batch_size=batch_size)
     required_labels = set(DOCUMENT_TASK_NAMES[1:])
@@ -91,6 +104,10 @@ def add_subtoken_temporal_tasks(
         )
         for task_name in DOCUMENT_TASK_NAMES
     )
+    supervised_tasks = tuple(
+        MultiRateTaskSpec(task_name, level="token", output_dim=1, source="daily")
+        for task_name in SUPERVISED_TARGET_TASK_NAMES
+    )
     prediction_tasks = tuple(
         MultiRatePredictionTaskSpec(
             task_name,
@@ -101,7 +118,7 @@ def add_subtoken_temporal_tasks(
         )
         for task_name in PREDICTION_TASK_NAMES
     )
-    bundle = TemporalMTLTaskBundle(corpus, document_tasks, prediction_tasks)
+    bundle = TemporalMTLTaskBundle(corpus, document_tasks, supervised_tasks, prediction_tasks)
     if bundle.task_names != TEMPORAL_MTL_TASK_NAMES:
         raise RuntimeError("temporal MTL task bundle does not match the token+subtoken contract")
     return bundle
@@ -111,6 +128,9 @@ __all__ = [
     "DOCUMENT_TASK_NAMES",
     "SUBTOKEN_PREDICTION_TASK_NAMES",
     "TOKEN_PREDICTION_TASK_NAMES",
+    "ORACLE_SUPERVISED_TASK_NAMES",
+    "HITS_SUPERVISED_TASK_NAMES",
+    "SUPERVISED_TARGET_TASK_NAMES",
     "PREDICTION_TASK_NAMES",
     "TEMPORAL_MTL_TASK_NAMES",
     "TemporalMTLTaskBundle",

@@ -18,6 +18,8 @@ import torch
 from sklearn.manifold import TSNE
 from torch import nn
 
+from quant_warehouse import Warehouse
+
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import (
     MultiRateTransformer,
     MultiRateTransformerConfig,
@@ -26,10 +28,15 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.temporal_tasks import (
     DOCUMENT_TASK_NAMES,
+    HITS_SUPERVISED_TASK_NAMES,
+    ORACLE_SUPERVISED_TASK_NAMES,
+    SUPERVISED_TARGET_TASK_NAMES,
     TEMPORAL_MTL_TASK_NAMES,
 )
 
 
+ANNUAL_WINDOW = 252
+QUARTERLY_WINDOW = 252
 DAILY_WINDOW = 252  # one trading year for daily self-supervision
 DEFAULT_EPOCHS = 20
 
@@ -43,6 +50,16 @@ def _symbol_rows(table: pd.DataFrame | dict[str, pd.DataFrame], symbol: str) -> 
     if isinstance(table, dict):
         return table.get(symbol, table.get("__empty__", pd.DataFrame()))
     return table.loc[table["symbol"].eq(symbol)]
+
+
+def _canonical_issuer_key(profile: object | None, symbol: str) -> str:
+    cik = str(getattr(profile, "cik", None) or "").strip()
+    if cik and cik.lower() not in {"none", "nan"}:
+        return f"cik:{cik}"
+    company_name = " ".join(str(getattr(profile, "company_name", None) or "").split()).casefold()
+    if company_name and company_name not in {"none", "nan"}:
+        return f"name:{company_name}"
+    return f"symbol:{str(symbol).strip().upper()}"
 
 
 def _window(table: pd.DataFrame | dict[str, pd.DataFrame], symbol: str, anchor: pd.Timestamp, value_columns: list[str], length: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -100,14 +117,54 @@ def main() -> None:
     manifest = json.loads((root / "manifest.json").read_text())
     feature_families = list(manifest["feature_families"])
     target_families = list(manifest["target_families"])
-    annual = pd.read_parquet(root / "annual.parquet")
-    quarterly = pd.read_parquet(root / "quarterly.parquet")
-    daily = pd.read_parquet(root / "daily.parquet")
+    # Presence columns are useful for corpus diagnostics but are not model
+    # inputs.  Avoid materializing them for the large 10B corpus.
+    rate_columns = ["symbol", "date", *[f"value__{family}" for family in feature_families]]
+    annual = pd.read_parquet(root / "annual.parquet", columns=rate_columns)
+    quarterly = pd.read_parquet(root / "quarterly.parquet", columns=rate_columns)
+    daily = pd.read_parquet(root / "daily.parquet", columns=rate_columns)
     sparse = pd.read_parquet(root / "sparse_events.parquet")
     taxonomy = pd.read_csv(root / "taxonomy.csv").set_index("symbol")
+    if "issuer" not in taxonomy.columns:
+        profile_rows = Warehouse().catalog.query_symbol_profiles(
+            provider="fmp", min_market_cap=0, country="", exchanges=(),
+            exclude_etf=False, exclude_fund=False, limit=100_000,
+        )
+        profiles_by_symbol = {str(profile.symbol).strip().upper(): profile for profile in profile_rows}
+        taxonomy["issuer"] = [
+            _canonical_issuer_key(profiles_by_symbol.get(str(symbol).upper()), str(symbol))
+            for symbol in taxonomy.index
+        ]
     for table in (annual, quarterly, daily, sparse):
         table["symbol"] = table["symbol"].astype(str).str.upper()
         table["date"] = pd.to_datetime(table["date"], errors="coerce", utc=True).dt.tz_localize(None)
+    if "event_date" in sparse:
+        sparse["event_date"] = pd.to_datetime(sparse["event_date"], errors="coerce", utc=True).dt.tz_localize(None)
+
+    # Derived target labels are supervised at their original event date. Their
+    # delayed availability remains in ``date`` and therefore keeps them out
+    # of the input context at the prediction date.
+    supervised_target_map: dict[tuple[str, pd.Timestamp], dict[str, float]] = {}
+    if "event_date" in sparse:
+        target_channels = ["signal_value", *[f"text_{i}" for i in range(7)]]
+        for row in sparse.loc[sparse["target_family"].isin({
+            "equity.strategy.hits_graph", "equity.strategy.oracle_trades",
+        })].itertuples(index=False):
+            event_date = getattr(row, "event_date")
+            if pd.isna(event_date):
+                continue
+            key = (str(row.symbol).upper(), pd.Timestamp(event_date).normalize())
+            values = {channel: float(getattr(row, channel)) for channel in target_channels if pd.notna(getattr(row, channel))}
+            target_family = str(row.target_family)
+            targets = supervised_target_map.setdefault(key, {})
+            if target_family == "equity.strategy.hits_graph":
+                for task_name, channel in zip(HITS_SUPERVISED_TASK_NAMES, target_channels):
+                    if channel in values:
+                        targets[task_name] = max(targets.get(task_name, float("-inf")), values[channel])
+            else:
+                for task_name, channel in zip(ORACLE_SUPERVISED_TASK_NAMES, target_channels[:4]):
+                    if channel in values:
+                        targets[task_name] = max(targets.get(task_name, 0.0), values[channel])
 
     daily_value_columns = [f"value__{family}" for family in feature_families]
     annual_value_columns = daily_value_columns
@@ -166,23 +223,37 @@ def main() -> None:
         symbol = str(row.symbol).upper(); anchor = pd.Timestamp(row.date)
         if symbol not in taxonomy.index:
             continue
-        annual_values, annual_padding, _ = _window(annual_by_symbol, symbol, anchor, annual_value_columns, 8)
-        quarterly_values, quarterly_padding, _ = _window(quarterly_by_symbol, symbol, anchor, quarterly_value_columns, 20)
-        daily_values, daily_padding, _ = _window(daily_by_symbol, symbol, anchor, daily_value_columns, DAILY_WINDOW)
+        annual_values, annual_padding, _ = _window(annual_by_symbol, symbol, anchor, annual_value_columns, ANNUAL_WINDOW)
+        quarterly_values, quarterly_padding, _ = _window(quarterly_by_symbol, symbol, anchor, quarterly_value_columns, QUARTERLY_WINDOW)
+        daily_values, daily_padding, daily_dates = _window(daily_by_symbol, symbol, anchor, daily_value_columns, DAILY_WINDOW)
         sparse_values, sparse_padding, sparse_labels, sparse_dates = _sparse_window(sparse_by_symbol, symbol, anchor, sparse_value_columns, 16)
-        samples.append({
+        supervised_targets = np.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype="float32")
+        supervised_valid = np.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=bool)
+        if len(daily_dates):
+            offset = DAILY_WINDOW - len(daily_dates)
+            for position, date in enumerate(pd.to_datetime(daily_dates).normalize()):
+                values = supervised_target_map.get((symbol, pd.Timestamp(date)), {})
+                for task_index, task_name in enumerate(SUPERVISED_TARGET_TASK_NAMES):
+                    if task_name in values:
+                        supervised_targets[offset + position, task_index] = values[task_name]
+                        supervised_valid[offset + position, task_index] = True
+        sample = {
             "symbol": symbol, "year": int(anchor.year),
+            "issuer": str(taxonomy.loc[symbol, "issuer"]),
             "annual": annual_values, "annual_padding": annual_padding,
             "quarterly": quarterly_values, "quarterly_padding": quarterly_padding,
             "daily": daily_values, "daily_padding": daily_padding,
             "sparse": sparse_values, "sparse_padding": sparse_padding, "sparse_labels": sparse_labels,
             "sector": str(taxonomy.loc[symbol, "sector"]), "subsector": str(taxonomy.loc[symbol, "subsector"]),
             "industry": str(taxonomy.loc[symbol, "industry"]),
-        })
+            "supervised_targets": supervised_targets,
+            "supervised_valid": supervised_valid,
+        }
+        samples.append(sample)
     frame = pd.DataFrame([{key: value for key, value in sample.items() if isinstance(value, str) or isinstance(value, int)} for sample in samples])
     label_arrays: dict[str, np.ndarray] = {}
     label_names: dict[str, list[str]] = {}
-    for task in DOCUMENT_TASK_NAMES[1:4]:
+    for task in DOCUMENT_TASK_NAMES[1:-1]:
         label_arrays[task], label_names[task], _ = _encode_labels(frame[task])
     years = sorted(frame["year"].unique())
     year_map = {year: i for i, year in enumerate(years)}
@@ -213,7 +284,8 @@ def main() -> None:
             "daily": {family: 1 for family in feature_families},
             "sparse": {family: len(raw_sparse_columns) for family in target_families},
         },
-        tasks=task_bundle.document_tasks, prediction_tasks=task_bundle.prediction_tasks,
+        tasks=task_bundle.document_tasks + task_bundle.supervised_tasks,
+        prediction_tasks=task_bundle.prediction_tasks,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
     trainer = Trainer(
@@ -272,10 +344,10 @@ def main() -> None:
             daily_batch, annual_batch, quarterly_batch, sparse_batch,
             daily_padding_mask=daily_mask, annual_padding_mask=annual_mask,
             quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask,
-            daily_dates=torch.arange(DAILY_WINDOW, device=device), annual_dates=torch.arange(8, device=device),
-            quarterly_dates=torch.arange(20, device=device), sparse_dates=torch.arange(16, device=device),
+            daily_dates=torch.arange(DAILY_WINDOW, device=device), annual_dates=torch.arange(ANNUAL_WINDOW, device=device),
+            quarterly_dates=torch.arange(QUARTERLY_WINDOW, device=device), sparse_dates=torch.arange(16, device=device),
         )
-        if tuple(output["document_outputs"]) + tuple(output["prediction_outputs"]) != TEMPORAL_MTL_TASK_NAMES:
+        if tuple(output["document_outputs"]) + tuple(output["token_outputs"]) + tuple(output["prediction_outputs"]) != TEMPORAL_MTL_TASK_NAMES:
             raise RuntimeError("model task outputs do not match the temporal token+subtoken MTL contract")
         zero = output["document_outputs"]["family"].sum() * 0.0
         active_names = {task.name for task in active_tasks}
@@ -284,6 +356,20 @@ def main() -> None:
             if name in active_names:
                 target = torch.tensor([item[f"{name}_label"] for item in batch], device=device)
                 task_losses[name] = nn.functional.cross_entropy(output["document_outputs"][name], target)
+        supervised_targets = stack("supervised_targets")
+        supervised_valid = stack("supervised_valid").bool()
+        for task_index, name in enumerate(SUPERVISED_TARGET_TASK_NAMES):
+            if name not in active_names:
+                continue
+            valid = supervised_valid[:, :, task_index] & ~daily_mask
+            if not valid.any():
+                continue
+            target = supervised_targets[:, :, task_index]
+            prediction = output["token_outputs"][name].squeeze(-1)
+            if name in ORACLE_SUPERVISED_TASK_NAMES:
+                task_losses[name] = nn.functional.binary_cross_entropy_with_logits(prediction[valid], target[valid])
+            else:
+                task_losses[name] = nn.functional.smooth_l1_loss(prediction[valid], target[valid])
         family_labels = torch.arange(len(family_names), device=device).view(1, -1).expand(len(batch), -1)
         family_valid = torch.zeros((len(batch), len(family_names)), dtype=torch.bool, device=device)
         for rate in ("annual", "quarterly", "daily", "sparse"):
@@ -387,8 +473,8 @@ def main() -> None:
             annual_batch, annual_mask = context("annual", "annual_padding")
             quarterly_batch, quarterly_mask = context("quarterly", "quarterly_padding")
             sparse_batch, sparse_padding_mask = context("sparse", "sparse_padding")
-            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=torch.arange(DAILY_WINDOW, device=device), annual_dates=torch.arange(8, device=device), quarterly_dates=torch.arange(20, device=device), sparse_dates=torch.arange(16, device=device))
-            states.append(output["document_state"].cpu().numpy())
+            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=torch.arange(DAILY_WINDOW, device=device), annual_dates=torch.arange(ANNUAL_WINDOW, device=device), quarterly_dates=torch.arange(QUARTERLY_WINDOW, device=device), sparse_dates=torch.arange(16, device=device))
+            states.append(output["document_prototypes"].cpu().numpy())
             family_labels = torch.arange(len(family_names), device=device).view(1, -1).expand(len(batch), -1)
             family_valid = torch.zeros((len(batch), len(family_names)), dtype=torch.bool, device=device)
             for rate in ("annual", "quarterly", "daily", "sparse"):
@@ -400,7 +486,7 @@ def main() -> None:
                     local_count, width, offset = len(feature_families), 1, 0
                     observed = torch.isfinite(raw).reshape(raw.shape[0], raw.shape[1], local_count, width).any(dim=-1).any(dim=1)
                 family_valid[:, offset:offset + local_count] |= observed
-            family_states.append(output["family_document_state"].cpu().numpy())
+            family_states.append(output["family_document_prototypes"].cpu().numpy())
             family_valid_rows.append(family_valid.cpu().numpy())
             family_predictions = output["document_outputs"]["family"].argmax(dim=-1)
             family_correct += int((family_predictions[family_valid] == family_labels[family_valid]).sum())
@@ -418,11 +504,23 @@ def main() -> None:
     for family_index, label in enumerate(family_names):
         indices = np.where(family_valid_array[:, family_index])[0]
         if len(indices):
-            rows.append({"task": "family", "label": label, "support": int(len(indices)), "embedding": family_embeddings[indices, family_index].mean(axis=0)})
+            for prototype_index, prototype_name in enumerate(("mean", "min", "max")):
+                start = prototype_index * config.d_model
+                stop = start + config.d_model
+                rows.append({"task": "family", "label": f"{label} [{prototype_name}]", "prototype": prototype_name, "support": int(len(indices)), "embedding": family_embeddings[indices, family_index, start:stop].mean(axis=0)})
     for name in predictions:
+        # Issuer and symbol are high-cardinality document tasks. They remain
+        # fully trained and evaluated, but are omitted from the global t-SNE
+        # prototype plot so the 10B visualization remains tractable.
+        if name in {"issuer", "symbol"}:
+            continue
         for label in label_names[name]:
             indices = np.where(np.asarray(label_names[name])[label_arrays[name]] == label)[0]
-            if len(indices): rows.append({"task": name, "label": label, "support": int(len(indices)), "embedding": embeddings[indices].mean(axis=0)})
+            if len(indices):
+                for prototype_index, prototype_name in enumerate(("mean", "min", "max")):
+                    start = prototype_index * config.d_model
+                    stop = start + config.d_model
+                    rows.append({"task": name, "label": f"{label} [{prototype_name}]", "prototype": prototype_name, "support": int(len(indices)), "embedding": embeddings[indices, start:stop].mean(axis=0)})
     if len(rows) >= 2:
         coordinates = TSNE(n_components=3, perplexity=min(30.0, len(rows) - 1), init="pca", learning_rate="auto", max_iter=1500, random_state=42).fit_transform(np.stack([row.pop("embedding") for row in rows]).astype("float32"))
         plot = pd.DataFrame(rows); plot[["x", "y", "z"]] = coordinates; plot.to_csv(output_dir / "prototype_coordinates_3d.csv", index=False)
