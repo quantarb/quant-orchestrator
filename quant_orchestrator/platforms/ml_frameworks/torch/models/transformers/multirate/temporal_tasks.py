@@ -21,6 +21,7 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 
 DOCUMENT_TASK_NAMES = (
     "family", "issuer", "symbol", "industry", "sector", "subsector", "year",
+    "year_quarter", "year_month", "year_week",
 )
 SUBTOKEN_PREDICTION_TASK_NAMES = (
     "next_annual_subtoken",
@@ -55,15 +56,21 @@ FUND_ACTIVITY_SUPERVISED_TASK_NAMES = (
     "fund_activity_etf_buy",
     "fund_activity_mutual_fund_buy",
     "fund_activity_institutional_buy",
-    "fund_activity_hedge_fund_buy",
     "fund_activity_add",
     "fund_activity_reduce",
     "fund_activity_exit",
+)
+HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES = (
+    "holder_activity_buy",
+    "holder_activity_add",
+    "holder_activity_reduce",
+    "holder_activity_exit",
 )
 SUPERVISED_TARGET_TASK_NAMES = (
     ORACLE_SUPERVISED_TASK_NAMES
     + HITS_SUPERVISED_TASK_NAMES
     + FUND_ACTIVITY_SUPERVISED_TASK_NAMES
+    + HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES
 )
 PREDICTION_TASK_NAMES = SUBTOKEN_PREDICTION_TASK_NAMES + TOKEN_PREDICTION_TASK_NAMES
 TEMPORAL_MTL_TASK_NAMES = DOCUMENT_TASK_NAMES + SUPERVISED_TARGET_TASK_NAMES + PREDICTION_TASK_NAMES
@@ -99,7 +106,9 @@ def add_subtoken_temporal_tasks(
 
     ``family_names`` contains the union of feature and target families.  The
     remaining document labels must contain ``issuer``, ``symbol``,
-    ``industry``, ``sector``, ``subsector``, and ``year``.  Those labels
+    ``industry``, ``sector``, ``subsector``, ``year``, ``year_quarter``,
+    ``year_month``, and ``year_week``.  Calendar labels are combined period
+    labels such as ``2024-Q3``, ``2024-07``, and ISO ``2024-W27``.  Those labels
     classify temporal documents; they are not cross-sectional document sources.
     """
     corpus = Corpus(rows, name=corpus_name, batch_size=batch_size)
@@ -144,6 +153,7 @@ __all__ = [
     "ORACLE_SUPERVISED_TASK_NAMES",
     "HITS_SUPERVISED_TASK_NAMES",
     "FUND_ACTIVITY_SUPERVISED_TASK_NAMES",
+    "HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES",
     "SUPERVISED_TARGET_TASK_NAMES",
     "PREDICTION_TASK_NAMES",
     "TEMPORAL_MTL_TASK_NAMES",

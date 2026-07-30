@@ -57,17 +57,29 @@ def main() -> None:
     parser.add_argument("--coordinates", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--title-prefix", default="Historical MTL")
+    parser.add_argument("--prototype", choices=("all", "mean", "min", "max", "rmse", "q25", "q50", "q75"), default="all")
+    parser.add_argument("--aggregate-prototypes", action="store_true", help="Average the plotted prototype coordinates into one point per task and label.")
     args = parser.parse_args()
 
     frame = pd.read_csv(args.coordinates)
+    if args.prototype != "all":
+        frame = frame.loc[frame["prototype"].eq(args.prototype)].copy()
+    if args.aggregate_prototypes:
+        frame["label"] = frame["label"].str.replace(r" \[(mean|min|max|rmse|q25|q50|q75)\]$", "", regex=True)
+        frame = (
+            frame.groupby(["task", "label"], as_index=False)
+            .agg(x=("x", "mean"), y=("y", "mean"), z=("z", "mean"), support=("support", "sum"))
+        )
+        frame["prototype"] = "prototype_mean"
+    suffix = "_prototype_mean" if args.aggregate_prototypes else ("" if args.prototype == "all" else f"_{args.prototype}")
     target_labels = {
         str(label) for label in frame.loc[frame["task"].eq("family"), "label"]
         if str(label).startswith("equity.")
     }
     _save_view(
         frame,
-        args.output_dir / "prototype_embeddings_tsne_3d.png",
-        f"{args.title_prefix} — all prototype embeddings",
+        args.output_dir / f"prototype_embeddings_tsne_3d{suffix}.png",
+        f"{args.title_prefix} — {'mean of prototype coordinates' if args.aggregate_prototypes else f'{args.prototype} prototype embeddings'}",
         target_labels=target_labels,
     )
 

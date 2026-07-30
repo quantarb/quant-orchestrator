@@ -35,7 +35,58 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 BackboneName = Literal["encoder_only", "decoder_only", "encoder_decoder"]
 AttentionMode = Literal["temporal", "cross_sectional"]
 DocumentPool = Literal["last", "mean"]
-DOCUMENT_PROTOTYPE_STATS = ("mean", "min", "max")
+DOCUMENT_PROTOTYPE_STATS = ("mean", "min", "max", "rmse", "q25", "q50", "q75")
+
+
+def pool_prototype_statistics(
+    states: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Reduce ``[batch, rows, features]`` into reusable row prototypes.
+
+    This is intentionally independent of the transformer so the same reducer
+    can be used for collaborative-filtering matrices: rows may represent
+    users, assets, dates, or any other entities, while columns remain the
+    feature dimensions.
+    """
+    if states.ndim != 3 or states.shape[1] == 0:
+        raise ValueError("states must have shape [batch, rows, features] with non-empty rows")
+    clean = torch.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
+    valid = (
+        torch.ones(states.shape[:2], dtype=torch.bool, device=states.device)
+        if valid_mask is None else valid_mask.bool()
+    )
+    weights = valid.unsqueeze(-1).to(clean.dtype)
+    count = weights.sum(dim=1).clamp_min(1.0)
+    mean = (clean * weights).sum(dim=1) / count
+    min_values = clean.masked_fill(~valid.unsqueeze(-1), float("inf")).amin(dim=1)
+    max_values = clean.masked_fill(~valid.unsqueeze(-1), float("-inf")).amax(dim=1)
+    rmse_variance = (((clean - mean.unsqueeze(1)).square()) * weights).sum(dim=1) / count
+    rmse = torch.sqrt(rmse_variance.clamp_min(torch.finfo(states.dtype).eps))
+    # Keep the quantile path finite for autograd. ``nanquantile`` can produce
+    # NaN gradients for fully masked rows, even when its result is sanitized.
+    # Sorting finite values and interpolating valid positions avoids that.
+    sorted_values = clean.masked_fill(
+        ~valid.unsqueeze(-1), torch.finfo(states.dtype).max,
+    ).sort(dim=1).values
+    has_valid = valid.any(dim=1).unsqueeze(-1)
+    count = valid.sum(dim=1).clamp_min(1).to(states.dtype)
+    quantile_values = []
+    for quantile in (0.25, 0.50, 0.75):
+        position = quantile * (count - 1.0)
+        lower_index = position.floor().long().unsqueeze(1).unsqueeze(-1)
+        upper_index = position.ceil().long().unsqueeze(1).unsqueeze(-1)
+        lower = sorted_values.gather(1, lower_index.expand(-1, 1, states.shape[-1])).squeeze(1)
+        upper = sorted_values.gather(1, upper_index.expand(-1, 1, states.shape[-1])).squeeze(1)
+        quantile = lower + (upper - lower) * (position - position.floor()).unsqueeze(-1)
+        quantile_values.append(torch.where(has_valid, quantile, torch.zeros_like(quantile)))
+    return (
+        mean,
+        torch.nan_to_num(min_values, nan=0.0, posinf=0.0, neginf=0.0),
+        torch.nan_to_num(max_values, nan=0.0, posinf=0.0, neginf=0.0),
+        torch.nan_to_num(rmse, nan=0.0, posinf=0.0, neginf=0.0),
+        *(torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0) for values in quantile_values),
+    )
 PredictionObjective = Literal["next_token", "masked_token"]
 PredictionLevel = Literal["token", "subtoken"]
 RateName = Literal["annual", "quarterly", "daily", "sparse"]
@@ -317,24 +368,10 @@ class MultiRateTransformer(nn.Module):
     def _pool_prototypes(
         states: torch.Tensor,
         padding_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return mean, min, and max prototypes over valid temporal rows."""
-        if states.shape[1] == 0:
-            raise ValueError("cannot pool an empty sequence")
-        clean = torch.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
-        valid = (
-            torch.ones(states.shape[:2], dtype=torch.bool, device=states.device)
-            if padding_mask is None else ~padding_mask.bool()
-        )
-        weights = valid.unsqueeze(-1)
-        mean = (clean * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
-        min_values = clean.masked_fill(~weights, float("inf")).amin(dim=1)
-        max_values = clean.masked_fill(~weights, float("-inf")).amax(dim=1)
-        return (
-            mean,
-            torch.nan_to_num(min_values, nan=0.0, posinf=0.0, neginf=0.0),
-            torch.nan_to_num(max_values, nan=0.0, posinf=0.0, neginf=0.0),
-        )
+    ) -> tuple[torch.Tensor, ...]:
+        """Return all configured prototypes over valid temporal rows."""
+        valid = None if padding_mask is None else ~padding_mask.bool()
+        return pool_prototype_statistics(states, valid)
 
     @staticmethod
     def _pool_subtokens(
@@ -379,8 +416,8 @@ class MultiRateTransformer(nn.Module):
         states: torch.Tensor,
         padding_mask: torch.Tensor | None,
         family_presence: torch.Tensor | None,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
-        """Pool each family document into mean, min, and max prototypes."""
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Pool each family document into the configured prototypes."""
         if states.ndim != 4:
             raise ValueError("subtoken states must have shape [batch, sequence, family, d_model]")
         batch, length, family_count, _ = states.shape
@@ -389,23 +426,18 @@ class MultiRateTransformer(nn.Module):
             valid &= ~padding_mask.bool().unsqueeze(-1)
         if family_presence is not None:
             valid &= family_presence.bool()
-        clean = torch.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
-        weights = valid.unsqueeze(-1).to(clean.dtype)
-        mean = (clean * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-        min_values = clean.masked_fill(~valid.unsqueeze(-1), float("inf")).amin(dim=1)
-        max_values = clean.masked_fill(~valid.unsqueeze(-1), float("-inf")).amax(dim=1)
+        flat_states = states.permute(0, 2, 1, 3).reshape(batch * family_count, length, -1)
+        flat_valid = valid.permute(0, 2, 1).reshape(batch * family_count, length)
+        pooled = pool_prototype_statistics(flat_states, flat_valid)
         return (
-            (
-                mean,
-                torch.nan_to_num(min_values, nan=0.0, posinf=0.0, neginf=0.0),
-                torch.nan_to_num(max_values, nan=0.0, posinf=0.0, neginf=0.0),
-            ),
+            tuple(values.reshape(batch, family_count, -1) for values in pooled),
             valid.any(dim=1),
         )
 
     def _heads(
         self,
         *,
+        compute_document_outputs: bool,
         daily_states: torch.Tensor,
         annual_states: torch.Tensor,
         quarterly_states: torch.Tensor,
@@ -436,6 +468,32 @@ class MultiRateTransformer(nn.Module):
             "daily": daily_padding_mask,
             "sparse": sparse_padding_mask,
         }
+        if not compute_document_outputs:
+            # Training runs that do not include document tasks should not pay
+            # for mean/min/max document prototype pooling. Keep the fused
+            # mean state because token-level heads still use it.
+            rate_states = {
+                rate: self._pool_subtoken_tokens(
+                    subtokens, padding_masks[rate], family_presence[rate],
+                ).mean(dim=1) if subtokens is not None else states.mean(dim=1)
+                for rate, subtokens, states in (
+                    ("annual", annual_subtokens, annual_states),
+                    ("quarterly", quarterly_subtokens, quarterly_states),
+                    ("daily", daily_subtokens, daily_states),
+                    ("sparse", sparse_subtokens, sparse_states),
+                ) if rate in self.config.rates and states is not None
+            }
+            fused = self.fusion(torch.cat(tuple(rate_states[rate] for rate in self.config.rates), dim=-1))
+            fused = fused + self.auto_feature_engineer.cross_rate_features(
+                tuple(rate_states[rate] for rate in self.config.rates)
+            )
+            token_outputs: dict[str, torch.Tensor] = {}
+            sources = dict(token_states)
+            sources["fused"] = fused
+            for task in self.task_specs:
+                if task.level == "token":
+                    token_outputs[task.task_name] = self.task_heads[task.task_name](sources[task.source])
+            return token_outputs, {}, fused, None, None, None
         rate_prototypes = {
             rate: self._pool_prototypes(
                 self._pool_subtoken_tokens(subtoken_states[rate], padding_masks[rate], family_presence[rate]),
@@ -539,6 +597,7 @@ class MultiRateTransformer(nn.Module):
         quarterly_modality_ids: torch.Tensor | None = None,
         sparse_family_presence: torch.Tensor | None = None,
         sparse_modality_ids: torch.Tensor | None = None,
+        compute_document_outputs: bool = True,
     ) -> dict[str, object]:
         """Encode a multi-rate window and return states plus task outputs.
 
@@ -700,6 +759,7 @@ class MultiRateTransformer(nn.Module):
             token_outputs, document_outputs, fused_document_state, family_document_state,
             fused_document_prototypes, family_document_prototypes,
         ) = self._heads(
+            compute_document_outputs=compute_document_outputs,
             daily_states=daily_states,
             annual_states=annual_states,
             quarterly_states=quarterly_states,
@@ -721,7 +781,7 @@ class MultiRateTransformer(nn.Module):
         ) if need_subtokens else {}
         family_outputs = (
             self.family_classification_head(fused_document_prototypes)
-            if self.family_classification_head is not None else None
+            if self.family_classification_head is not None and fused_document_prototypes is not None else None
         )
         return {
             "token_states": token_states["daily"],
@@ -746,6 +806,7 @@ __all__ = [
     "AttentionMode",
     "BackboneName",
     "DOCUMENT_PROTOTYPE_STATS",
+    "pool_prototype_statistics",
     "MultiRateTaskSpec",
     "MultiRatePredictionTaskSpec",
     "MultiRateTransformer",

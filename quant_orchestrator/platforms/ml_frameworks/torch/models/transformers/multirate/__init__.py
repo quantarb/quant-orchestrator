@@ -5,13 +5,18 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
     MultiRateTaskSpec,
     MultiRateTransformer,
     MultiRateTransformerConfig,
+    DOCUMENT_PROTOTYPE_STATS,
     build_attention_mask,
+    pool_prototype_statistics,
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.coverage import (
     CoverageAwareInput,
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.auto_features import (
     AutoFeatureEngineer,
+)
+from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.factorization_pooling import (
+    FactorizationPooling,
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.documents import (
     SubtokenDocumentCorpus,
@@ -39,6 +44,7 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.temporal_tasks import (
     DOCUMENT_TASK_NAMES,
     FUND_ACTIVITY_SUPERVISED_TASK_NAMES,
+    HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES,
     HITS_SUPERVISED_TASK_NAMES,
     ORACLE_SUPERVISED_TASK_NAMES,
     PREDICTION_TASK_NAMES,
@@ -61,9 +67,12 @@ __all__ = [
     "MultiRatePredictionTaskSpec",
     "MultiRateTransformer",
     "MultiRateTransformerConfig",
+    "DOCUMENT_PROTOTYPE_STATS",
+    "pool_prototype_statistics",
     "build_attention_mask",
     "CoverageAwareInput",
     "AutoFeatureEngineer",
+    "FactorizationPooling",
     "SubtokenDocumentCorpus",
     "build_1t_subtoken_documents",
     "mean_document_embeddings",
@@ -81,6 +90,7 @@ __all__ = [
     "build_cross_sectional_documents",
     "DOCUMENT_TASK_NAMES",
     "FUND_ACTIVITY_SUPERVISED_TASK_NAMES",
+    "HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES",
     "ORACLE_SUPERVISED_TASK_NAMES",
     "HITS_SUPERVISED_TASK_NAMES",
     "SUPERVISED_TARGET_TASK_NAMES",

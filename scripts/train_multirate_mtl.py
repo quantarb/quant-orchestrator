@@ -21,6 +21,7 @@ from torch import nn
 from quant_warehouse import Warehouse
 
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import (
+    DOCUMENT_PROTOTYPE_STATS,
     MultiRateTransformer,
     MultiRateTransformerConfig,
     Trainer,
@@ -29,8 +30,10 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.temporal_tasks import (
     DOCUMENT_TASK_NAMES,
     FUND_ACTIVITY_SUPERVISED_TASK_NAMES,
+    HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES,
     HITS_SUPERVISED_TASK_NAMES,
     ORACLE_SUPERVISED_TASK_NAMES,
+    PREDICTION_TASK_NAMES,
     SUPERVISED_TARGET_TASK_NAMES,
     TEMPORAL_MTL_TASK_NAMES,
 )
@@ -108,8 +111,14 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--min-delta", type=float, default=1e-3)
+    parser.add_argument(
+        "--disable-document-tasks",
+        action="store_true",
+        help="Disable document classification heads for an apples-to-apples timing benchmark.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    enabled_document_tasks = () if args.disable_document_tasks else DOCUMENT_TASK_NAMES
     if args.grad_accumulation_steps < 1:
         parser.error("--grad-accumulation-steps must be at least 1")
     root = args.corpus
@@ -169,7 +178,12 @@ def main() -> None:
             if target_family.startswith("fund_activity."):
                 activity_name = target_family.removeprefix("fund_activity.")
                 task_name = f"fund_activity_{activity_name}"
-                if task_name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES:
+            if task_name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES:
+                targets[task_name] = max(targets.get(task_name, 0.0), values.get("signal_value", 0.0))
+            if target_family.startswith("holder_activity."):
+                activity_name = target_family.removeprefix("holder_activity.")
+                task_name = f"holder_activity_{activity_name}"
+                if task_name in HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES:
                     targets[task_name] = max(targets.get(task_name, 0.0), values.get("signal_value", 0.0))
 
     daily_value_columns = [f"value__{family}" for family in feature_families]
@@ -245,6 +259,9 @@ def main() -> None:
                         supervised_valid[offset + position, task_index] = True
         sample = {
             "symbol": symbol, "year": int(anchor.year),
+            "year_quarter": f"{anchor.year}-Q{anchor.quarter}",
+            "year_month": f"{anchor.year}-{anchor.month:02d}",
+            "year_week": f"{anchor.isocalendar().year}-W{anchor.isocalendar().week:02d}",
             "issuer": str(taxonomy.loc[symbol, "issuer"]),
             "annual": annual_values, "annual_padding": annual_padding,
             "quarterly": quarterly_values, "quarterly_padding": quarterly_padding,
@@ -259,11 +276,14 @@ def main() -> None:
     frame = pd.DataFrame([{key: value for key, value in sample.items() if isinstance(value, str) or isinstance(value, int)} for sample in samples])
     label_arrays: dict[str, np.ndarray] = {}
     label_names: dict[str, list[str]] = {}
-    for task in DOCUMENT_TASK_NAMES[1:-1]:
+    for task in DOCUMENT_TASK_NAMES[1:-4]:
         label_arrays[task], label_names[task], _ = _encode_labels(frame[task])
     years = sorted(frame["year"].unique())
     year_map = {year: i for i, year in enumerate(years)}
     label_arrays["year"] = frame["year"].map(year_map).to_numpy("int64"); label_names["year"] = [str(year) for year in years]
+    label_arrays["year_quarter"], label_names["year_quarter"], _ = _encode_labels(frame["year_quarter"])
+    label_arrays["year_month"], label_names["year_month"], _ = _encode_labels(frame["year_month"])
+    label_arrays["year_week"], label_names["year_week"], _ = _encode_labels(frame["year_week"])
     family_names = [*feature_families, *target_families]
     label_names["family"] = family_names
     for index, sample in enumerate(samples):
@@ -281,6 +301,12 @@ def main() -> None:
         label_names,
         batch_size=args.batch_size,
     )
+    model_tasks = tuple(
+        task for task in task_bundle.document_tasks + task_bundle.supervised_tasks
+        if task.task_name in enabled_document_tasks or task.task_name not in DOCUMENT_TASK_NAMES
+    )
+    active_tasks = tuple(task for task in task_bundle.tasks if task.name in {spec.task_name for spec in model_tasks} or task.name in {spec.task_name for spec in task_bundle.prediction_tasks})
+    expected_task_names = tuple(enabled_document_tasks) + SUPERVISED_TARGET_TASK_NAMES + PREDICTION_TASK_NAMES
     model = MultiRateTransformer(
         {"annual": len(annual_value_columns), "quarterly": len(quarterly_value_columns), "daily": len(daily_value_columns), "sparse": len(sparse_value_columns)},
         config=config,
@@ -290,13 +316,13 @@ def main() -> None:
             "daily": {family: 1 for family in feature_families},
             "sparse": {family: len(raw_sparse_columns) for family in target_families},
         },
-        tasks=task_bundle.document_tasks + task_bundle.supervised_tasks,
+        tasks=model_tasks,
         prediction_tasks=task_bundle.prediction_tasks,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
     trainer = Trainer(
         model,
-        [(task_bundle.corpus, task_bundle.tasks)],
+        [(task_bundle.corpus, active_tasks)],
         optimizer,
         grad_accumulation_steps=args.grad_accumulation_steps,
     )
@@ -352,13 +378,19 @@ def main() -> None:
             quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask,
             daily_dates=torch.arange(DAILY_WINDOW, device=device), annual_dates=torch.arange(ANNUAL_WINDOW, device=device),
             quarterly_dates=torch.arange(QUARTERLY_WINDOW, device=device), sparse_dates=torch.arange(16, device=device),
+            compute_document_outputs=not args.disable_document_tasks,
         )
-        if tuple(output["document_outputs"]) + tuple(output["token_outputs"]) + tuple(output["prediction_outputs"]) != TEMPORAL_MTL_TASK_NAMES:
+        if tuple(output["document_outputs"]) + tuple(output["token_outputs"]) + tuple(output["prediction_outputs"]) != expected_task_names:
             raise RuntimeError("model task outputs do not match the temporal token+subtoken MTL contract")
-        zero = output["document_outputs"]["family"].sum() * 0.0
+        zero_source = next(iter(output["token_outputs"].values()), None)
+        if zero_source is None:
+            zero_source = next(iter(output["prediction_outputs"].values()))
+        zero = zero_source.sum() * 0.0
         active_names = {task.name for task in active_tasks}
         task_losses = {task.name: zero for task in active_tasks}
         for name in DOCUMENT_TASK_NAMES[1:]:
+            if name not in enabled_document_tasks:
+                continue
             if name in active_names:
                 target = torch.tensor([item[f"{name}_label"] for item in batch], device=device)
                 task_losses[name] = nn.functional.cross_entropy(output["document_outputs"][name], target)
@@ -372,7 +404,7 @@ def main() -> None:
                 continue
             target = supervised_targets[:, :, task_index]
             prediction = output["token_outputs"][name].squeeze(-1)
-            if name in ORACLE_SUPERVISED_TASK_NAMES or name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES:
+            if name in ORACLE_SUPERVISED_TASK_NAMES or name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES or name in HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES:
                 task_losses[name] = nn.functional.binary_cross_entropy_with_logits(prediction[valid], target[valid])
             else:
                 task_losses[name] = nn.functional.smooth_l1_loss(prediction[valid], target[valid])
@@ -454,7 +486,7 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    model.eval(); predictions: dict[str, list[np.ndarray]] = {name: [] for name in DOCUMENT_TASK_NAMES[1:]}; states: list[np.ndarray] = []; family_states: list[np.ndarray] = []; family_valid_rows: list[np.ndarray] = []
+    model.eval(); predictions: dict[str, list[np.ndarray]] = {name: [] for name in enabled_document_tasks[1:]}; states: list[np.ndarray] = []; family_states: list[np.ndarray] = []; family_valid_rows: list[np.ndarray] = []
     family_correct = 0
     family_total = 0
     with torch.inference_mode():
@@ -494,13 +526,15 @@ def main() -> None:
                 family_valid[:, offset:offset + local_count] |= observed
             family_states.append(output["family_document_prototypes"].cpu().numpy())
             family_valid_rows.append(family_valid.cpu().numpy())
-            family_predictions = output["document_outputs"]["family"].argmax(dim=-1)
-            family_correct += int((family_predictions[family_valid] == family_labels[family_valid]).sum())
-            family_total += int(family_valid.sum())
+            if "family" in enabled_document_tasks:
+                family_predictions = output["document_outputs"]["family"].argmax(dim=-1)
+                family_correct += int((family_predictions[family_valid] == family_labels[family_valid]).sum())
+                family_total += int(family_valid.sum())
             for name in predictions: predictions[name].append(output["document_outputs"][name].argmax(dim=-1).cpu().numpy())
     task_accuracy = {name: float((np.concatenate(predictions[name]) == label_arrays[name]).mean()) for name in predictions}
-    task_accuracy["family"] = family_correct / max(1, family_total)
-    metrics = {"device": str(device), "samples": len(samples), "feature_families": feature_families, "target_families": target_families, "family_labels": family_names, "tasks": list(TEMPORAL_MTL_TASK_NAMES), "losses": losses, "best_loss": best_loss, "epochs_completed": len(losses), "patience": args.patience, "min_delta": args.min_delta, "task_accuracy": task_accuracy, "rates": ["annual", "quarterly", "daily", "sparse"], "backbone": config.backbone}
+    if "family" in enabled_document_tasks:
+        task_accuracy["family"] = family_correct / max(1, family_total)
+    metrics = {"device": str(device), "samples": len(samples), "feature_families": feature_families, "target_families": target_families, "family_labels": family_names, "tasks": list(expected_task_names), "losses": losses, "best_loss": best_loss, "epochs_completed": len(losses), "patience": args.patience, "min_delta": args.min_delta, "task_accuracy": task_accuracy, "rates": ["annual", "quarterly", "daily", "sparse"], "backbone": config.backbone, "document_tasks_disabled": args.disable_document_tasks}
     (output_dir / "training_summary.json").write_text(json.dumps(metrics, indent=2))
     torch.save({"state_dict": model.state_dict(), "metrics": metrics, "labels": label_names}, output_dir / "multirate_mtl_model.pt")
     embeddings = np.nan_to_num(np.concatenate(states), nan=0.0, posinf=0.0, neginf=0.0)
@@ -510,7 +544,7 @@ def main() -> None:
     for family_index, label in enumerate(family_names):
         indices = np.where(family_valid_array[:, family_index])[0]
         if len(indices):
-            for prototype_index, prototype_name in enumerate(("mean", "min", "max")):
+            for prototype_index, prototype_name in enumerate(DOCUMENT_PROTOTYPE_STATS):
                 start = prototype_index * config.d_model
                 stop = start + config.d_model
                 rows.append({"task": "family", "label": f"{label} [{prototype_name}]", "prototype": prototype_name, "support": int(len(indices)), "embedding": family_embeddings[indices, family_index, start:stop].mean(axis=0)})
@@ -523,7 +557,7 @@ def main() -> None:
         for label in label_names[name]:
             indices = np.where(np.asarray(label_names[name])[label_arrays[name]] == label)[0]
             if len(indices):
-                for prototype_index, prototype_name in enumerate(("mean", "min", "max")):
+                for prototype_index, prototype_name in enumerate(DOCUMENT_PROTOTYPE_STATS):
                     start = prototype_index * config.d_model
                     stop = start + config.d_model
                     rows.append({"task": name, "label": f"{label} [{prototype_name}]", "prototype": prototype_name, "support": int(len(indices)), "embedding": embeddings[indices, start:stop].mean(axis=0)})

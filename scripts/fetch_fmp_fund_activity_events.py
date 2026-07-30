@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "quant-warehouse"))
 
 from quant_warehouse.research_tools.fund_activity import (
     build_fund_holding_activity_events,
+    build_holder_activity_events,
     build_institutional_activity_events,
 )
 
@@ -70,6 +71,22 @@ def main() -> None:
                 summary_rows.extend(rows)
         if summary_rows:
             parts.append(build_institutional_activity_events(pd.DataFrame(summary_rows)))
+
+        holder_rows: list[dict[str, object]] = []
+        for year in range(args.start_year, args.end_year + 1):
+            for quarter in range(1, 5):
+                try:
+                    holder_rows.extend(_get(
+                        session,
+                        "https://financialmodelingprep.com/stable/institutional-ownership/extract-analytics/holder",
+                        params={"symbol": symbol, "year": year, "quarter": quarter, "page": 0, "limit": 100,
+                        },
+                        key=key,
+                    ))
+                except requests.RequestException:
+                    continue
+        if holder_rows:
+            parts.append(build_holder_activity_events(pd.DataFrame(holder_rows)))
 
         try:
             exposure = _get(
