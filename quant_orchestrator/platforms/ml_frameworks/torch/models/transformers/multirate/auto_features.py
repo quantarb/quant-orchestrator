@@ -9,6 +9,53 @@ from torch import nn
 
 
 AutoFeatureMode = Literal["temporal", "cross_sectional"]
+AGGREGATION_FUNCTIONS = ("mean", "min", "max", "rmse", "q25", "q50", "q75")
+
+
+class LearnedAggregationGate(nn.Module):
+    """Choose a differentiable mixture of family aggregation candidates."""
+
+    def __init__(self, d_model: int, aggregation_functions: tuple[str, ...] = AGGREGATION_FUNCTIONS) -> None:
+        super().__init__()
+        if not aggregation_functions:
+            raise ValueError("aggregation_functions must not be empty")
+        self.aggregation_functions = tuple(aggregation_functions)
+        self.network = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, len(self.aggregation_functions)),
+        )
+        self.family_logits: nn.Parameter | None = None
+
+    def configure_families(self, family_count: int) -> None:
+        if family_count <= 0:
+            raise ValueError("family_count must be positive")
+        self.family_logits = nn.Parameter(torch.zeros(family_count, len(self.aggregation_functions)))
+
+    def forward(
+        self,
+        candidates: torch.Tensor,
+        family_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if candidates.ndim != 4:
+            raise ValueError("candidates must have shape [batch, family, aggregation, d_model]")
+        if candidates.shape[2] != len(self.aggregation_functions):
+            raise ValueError("candidate aggregation dimension does not match the gate")
+        context = candidates.mean(dim=2)
+        weights = self.network(context)
+        if self.family_logits is not None:
+            if family_indices is None:
+                if candidates.shape[1] != self.family_logits.shape[0]:
+                    raise ValueError("candidate family dimension does not match configured families")
+                family_logits = self.family_logits
+            else:
+                family_logits = self.family_logits.index_select(0, family_indices)
+                if candidates.shape[1] != family_logits.shape[0]:
+                    raise ValueError("family index count does not match candidate family dimension")
+            weights = weights + family_logits.unsqueeze(0)
+        weights = torch.softmax(weights, dim=-1)
+        gated = (candidates * weights.unsqueeze(-1)).sum(dim=2)
+        return gated, weights
 
 
 class AutoFeatureEngineer(nn.Module):
@@ -33,6 +80,7 @@ class AutoFeatureEngineer(nn.Module):
         *,
         num_heads: int = 4,
         max_position: int = 512,
+        aggregation_functions: tuple[str, ...] = AGGREGATION_FUNCTIONS,
     ) -> None:
         super().__init__()
         if d_model % num_heads:
@@ -52,6 +100,24 @@ class AutoFeatureEngineer(nn.Module):
             nn.Linear(d_model * 4, d_model),
         )
         self.output_norm = nn.LayerNorm(d_model)
+        self.aggregation_gate = LearnedAggregationGate(d_model, aggregation_functions)
+
+    def gate_aggregations(
+        self,
+        candidates: tuple[torch.Tensor, ...],
+        family_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gate prototype candidates independently for every feature family."""
+        if len(candidates) != len(self.aggregation_gate.aggregation_functions):
+            raise ValueError("candidate count does not match configured aggregation functions")
+        if not candidates or candidates[0].ndim not in {2, 3}:
+            raise ValueError("candidates must contain [batch, d_model] or [batch, family, d_model] tensors")
+        family_axis = candidates[0].ndim == 3
+        stacked = torch.stack(candidates, dim=2 if family_axis else 1)
+        if not family_axis:
+            stacked = stacked.unsqueeze(1)
+        gated, weights = self.aggregation_gate(stacked, family_indices=family_indices)
+        return (gated[:, 0], weights[:, 0]) if not family_axis else (gated, weights)
 
     def cross_rate_features(self, rate_states: tuple[torch.Tensor, ...]) -> torch.Tensor:
         """Learn bidirectional interactions among the available rate states."""
@@ -139,4 +205,4 @@ class AutoFeatureEngineer(nn.Module):
         return output
 
 
-__all__ = ["AutoFeatureEngineer", "AutoFeatureMode"]
+__all__ = ["AGGREGATION_FUNCTIONS", "AutoFeatureEngineer", "AutoFeatureMode", "LearnedAggregationGate"]

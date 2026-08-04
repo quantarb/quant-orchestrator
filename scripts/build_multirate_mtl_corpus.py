@@ -5,10 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "quant-warehouse"))
 
 from quant_warehouse import Warehouse
 from quant_warehouse.research_tools.feature_family_eval import (
@@ -34,6 +39,30 @@ FAMILIES = (
     "financetoolkit.ft_ratios_profitability", "financetoolkit.ft_ratios_solvency",
     "financetoolkit.ft_ratios_valuation",
 )
+
+# These families are backed by FMP/OpenBB routes that accept an explicit
+# annual or quarterly period.  The corpus keeps both provider-period versions
+# as distinct feature families.
+DUAL_PERIOD_FAMILIES = frozenset({
+    "fmp.fmp_balance_mcap", "fmp.fmp_cash_mcap", "fmp.fmp_income_mcap",
+    "financetoolkit.ft_growth_balance", "financetoolkit.ft_growth_cash",
+    "financetoolkit.ft_growth_income", "financetoolkit.ft_ratios_efficiency",
+    "financetoolkit.ft_ratios_liquidity", "financetoolkit.ft_ratios_profitability",
+    "financetoolkit.ft_ratios_solvency", "financetoolkit.ft_ratios_valuation",
+})
+QUARTER_ONLY_FAMILIES = frozenset({"fmp.fmp_quarterly_financial_estimates"})
+
+
+def _canonical_issuer_key(profile: object | None, symbol: str) -> str:
+    """Build a stable issuer label independent of share-class symbols."""
+    cik = str(getattr(profile, "cik", None) or "").strip()
+    if cik and cik.lower() not in {"none", "nan"}:
+        return f"cik:{cik}"
+    company_name = str(getattr(profile, "company_name", None) or "").strip()
+    normalized_name = re.sub(r"\s+", " ", company_name).casefold()
+    if normalized_name and normalized_name not in {"none", "nan"}:
+        return f"name:{normalized_name}"
+    return f"symbol:{str(symbol).strip().upper()}"
 
 
 def _load_project_credentials() -> None:
@@ -164,6 +193,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", type=Path, required=True)
     parser.add_argument("--target-events", type=Path, required=True)
+    parser.add_argument(
+        "--fund-activity-events",
+        type=Path,
+        default=None,
+        help="Optional parquet fund_activity target events to append to target-events.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--chunk-size", type=int, default=100)
     parser.add_argument("--text-device", default="cuda")
@@ -182,9 +217,50 @@ def main() -> None:
     metadata_parts: list[pd.DataFrame] = []
     for start in range(0, len(symbols), max(1, args.chunk_size)):
         chunk = symbols[start:start + max(1, args.chunk_size)]
-        panel, metadata, _, _ = build_fundamental_feature_panel(
-            chunk, config, warehouse=warehouse, strategy_sources=FAMILIES, broadcast_to_target=False,
+        panel_parts: list[pd.DataFrame] = []
+        metadata_parts_for_chunk: list[pd.DataFrame] = []
+        dual_families = sorted(DUAL_PERIOD_FAMILIES)
+        for period in ("quarter", "annual"):
+            period_panel, period_metadata, _, _ = build_fundamental_feature_panel(
+                chunk,
+                config,
+                warehouse=warehouse,
+                strategy_sources=dual_families,
+                broadcast_to_target=False,
+                fundamental_period=period,
+                family_suffix="quarterly" if period == "quarter" else "annual",
+            )
+            panel_parts.append(period_panel)
+            metadata_parts_for_chunk.append(period_metadata)
+
+        quarterly_only_panel, quarterly_only_metadata, _, _ = build_fundamental_feature_panel(
+            chunk,
+            config,
+            warehouse=warehouse,
+            strategy_sources=sorted(QUARTER_ONLY_FAMILIES),
+            broadcast_to_target=False,
+            fundamental_period="quarter",
+            family_suffix="quarterly",
         )
+        panel_parts.append(quarterly_only_panel)
+        metadata_parts_for_chunk.append(quarterly_only_metadata)
+
+        non_period_families = sorted(set(FAMILIES).difference(DUAL_PERIOD_FAMILIES).difference(QUARTER_ONLY_FAMILIES))
+        non_period_panel, non_period_metadata, _, _ = build_fundamental_feature_panel(
+            chunk,
+            config,
+            warehouse=warehouse,
+            strategy_sources=non_period_families,
+            broadcast_to_target=False,
+        )
+        panel_parts.append(non_period_panel)
+        metadata_parts_for_chunk.append(non_period_metadata)
+
+        panel = panel_parts[0]
+        for part in panel_parts[1:]:
+            extra = part.drop(columns=["close", "daily_market_cap", *[c for c in part.columns if c.startswith("forward_return_")]], errors="ignore")
+            panel = panel.merge(extra, on=["symbol", "date"], how="outer", validate="one_to_one")
+        metadata = pd.concat(metadata_parts_for_chunk, ignore_index=True).drop_duplicates()
         values, families = _family_values(panel, metadata)
         daily_parts.append(values)
         metadata_parts.append(pd.DataFrame({"family": families}))
@@ -193,12 +269,18 @@ def main() -> None:
     families = sorted({str(value) for part in metadata_parts for value in part["family"]})
     for rate in ("daily", "quarterly", "annual"):
         _rate_table(daily, families, rate).to_parquet(output / f"{rate}.parquet", index=False)
-    target_families = _build_sparse_events(pd.read_parquet(args.target_events), output, args.text_device)
+    target_events = pd.read_parquet(args.target_events)
+    if args.fund_activity_events is not None:
+        fund_activity_events = pd.read_parquet(args.fund_activity_events)
+        target_events = pd.concat([target_events, fund_activity_events], ignore_index=True, sort=False)
+    target_families = _build_sparse_events(target_events, output, args.text_device)
     profiles = warehouse.catalog.query_symbol_profiles(provider="fmp", min_market_cap=0, country="", exchanges=(), exclude_etf=True, exclude_fund=True, limit=100_000)
+    profiles_by_symbol = {str(profile.symbol).strip().upper(): profile for profile in profiles}
     taxonomy = pd.DataFrame([
-        {"symbol": symbol, "sector": (next((p.sector for p in profiles if p.symbol == symbol), None) or "Unknown"),
+        {"symbol": symbol, "issuer": _canonical_issuer_key(profiles_by_symbol.get(symbol), symbol),
+         "sector": (getattr(profiles_by_symbol.get(symbol), "sector", None) or "Unknown"),
          "subsector": subsectors.get(symbol, "Unknown"),
-         "industry": (next((p.industry for p in profiles if p.symbol == symbol), None) or "Unknown")}
+         "industry": (getattr(profiles_by_symbol.get(symbol), "industry", None) or "Unknown")}
         for symbol in symbols
     ])
     taxonomy.to_csv(output / "taxonomy.csv", index=False)

@@ -12,6 +12,10 @@ from quant_orchestrator.platforms.ml_frameworks.torch import (
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import (
     CoverageAwareInput,
     MultiRateTransformer as NestedMultiRateTransformer,
+    TEMPORAL_MTL_TASK_NAMES,
+    add_subtoken_temporal_tasks,
+    SUBTOKEN_PREDICTION_TASK_NAMES,
+    TOKEN_PREDICTION_TASK_NAMES,
 )
 
 
@@ -21,6 +25,18 @@ def _tasks():
         MultiRateTaskSpec("sector", "document", output_dim=4, source="fused"),
         MultiRateTaskSpec("annual_context", "document", output_dim=2, source="annual"),
     )
+
+
+def test_subtoken_temporal_task_factory_defines_exact_contract():
+    labels = {name: ("a", "b") for name in ("issuer", "symbol", "industry", "sector", "subsector", "date")}
+    bundle = add_subtoken_temporal_tasks(({"row": 1},), ("feature_family", "target_family"), labels)
+    assert bundle.task_names == TEMPORAL_MTL_TASK_NAMES
+    assert len(bundle.corpus) == 1
+    assert len(bundle.document_tasks) == 7
+    assert len(bundle.supervised_tasks) == 22
+    assert len(bundle.prediction_tasks) == 16
+    assert {task.level for task in bundle.prediction_tasks if task.task_name in SUBTOKEN_PREDICTION_TASK_NAMES} == {"subtoken"}
+    assert {task.level for task in bundle.prediction_tasks if task.task_name in TOKEN_PREDICTION_TASK_NAMES} == {"token"}
 
 
 def test_temporal_mask_blocks_future_and_cross_sectional_mask_shares_dates():
@@ -173,6 +189,26 @@ def test_prediction_heads_support_token_and_subtoken_objectives():
     )
     assert output["prediction_outputs"]["next_daily_token"].shape == (2, 4, 3)
     assert output["prediction_outputs"]["masked_daily_family"].shape == (2, 4, 2, 2)
+
+
+def test_token_prediction_states_are_pooled_from_subtokens():
+    config = MultiRateTransformerConfig(d_model=8, num_heads=2, layers=1, document_pool="mean")
+    model = MultiRateTransformer(
+        {"annual": 2, "quarterly": 2, "daily": 2},
+        config=config,
+        feature_families={
+            "annual": {"a": 1, "b": 1},
+            "quarterly": {"a": 1, "b": 1},
+            "daily": {"a": 1, "b": 1},
+        },
+        prediction_tasks=(MultiRatePredictionTaskSpec("next_daily_token", "next_token", "token", output_dim=1, source="daily"),),
+    )
+    output = model(
+        torch.randn(1, 3, 2), torch.randn(1, 2, 2), torch.randn(1, 2, 2),
+        daily_family_presence=torch.tensor([[[1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]]),
+    )
+    assert output["token_states"].shape == (1, 3, 8)
+    assert output["prediction_outputs"]["next_daily_token"].shape == (1, 3, 1)
 
 
 def test_document_pooling_means_valid_subtokens_and_excludes_missing_families():

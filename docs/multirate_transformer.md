@@ -56,11 +56,10 @@ uses its finite-value mask automatically.
 Every rate is passed through `AutoFeatureEngineer` before the backbone. It
 shares one implementation across issuers, instruments, and asset classes:
 
-- endpoint feature families become tokens, so the model can learn within-family,
-  cross-family, cross-sectional, and temporal relationships in one attention
-  space;
-- same-date family/instrument tokens can interact in both directions, while
-  different-date interactions remain past-only;
+- endpoint feature families become tokens, with attention constrained to each
+  `(symbol, feature_family)` temporal document;
+- family documents do not attend to other families or symbols; cross-rate
+  fusion occurs only after each document has been pooled;
 - learned attention can discover useful lookbacks, ratios, ranks, and other
   transformations without hardcoded SMA/RSI/rank operators or materializing
   every feature combination;
@@ -76,10 +75,11 @@ boundary. The training entry point also supports small physical batches with
 `--grad-accumulation-steps`, plus configurable `--d-model`, `--num-heads`, and
 `--layers`.
 
-Document tasks can use `source="family"` to receive one representation per
-family document. A family classifier therefore uses the same document-task
-interface as industry, sector, and year heads. Symbol/year tasks consume the
-pooled cross-family symbol-year representation.
+The training entry point runs exactly these temporal tasks: family, industry,
+sector, subsector, and year document classification; next-token prediction for
+annual, quarterly, daily, and sparse rates; and masked-token prediction for
+those same four rates. Industry, sector, subsector, and year are labels on
+temporal documents; they do not create cross-sectional documents.
 
 These are learned latent features for the supervised tasks; they are not
 persisted as an unbounded set of generated columns.

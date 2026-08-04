@@ -29,12 +29,65 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.auto_features import (
     AutoFeatureEngineer,
+    AGGREGATION_FUNCTIONS,
 )
 
 
 BackboneName = Literal["encoder_only", "decoder_only", "encoder_decoder"]
 AttentionMode = Literal["temporal", "cross_sectional"]
 DocumentPool = Literal["last", "mean"]
+DOCUMENT_PROTOTYPE_STATS = ("mean", "min", "max", "rmse", "q25", "q50", "q75")
+
+
+def pool_prototype_statistics(
+    states: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Reduce ``[batch, rows, features]`` into reusable row prototypes.
+
+    This is intentionally independent of the transformer so the same reducer
+    can be used for collaborative-filtering matrices: rows may represent
+    users, assets, dates, or any other entities, while columns remain the
+    feature dimensions.
+    """
+    if states.ndim != 3 or states.shape[1] == 0:
+        raise ValueError("states must have shape [batch, rows, features] with non-empty rows")
+    clean = torch.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
+    valid = (
+        torch.ones(states.shape[:2], dtype=torch.bool, device=states.device)
+        if valid_mask is None else valid_mask.bool()
+    )
+    weights = valid.unsqueeze(-1).to(clean.dtype)
+    count = weights.sum(dim=1).clamp_min(1.0)
+    mean = (clean * weights).sum(dim=1) / count
+    min_values = clean.masked_fill(~valid.unsqueeze(-1), float("inf")).amin(dim=1)
+    max_values = clean.masked_fill(~valid.unsqueeze(-1), float("-inf")).amax(dim=1)
+    rmse_variance = (((clean - mean.unsqueeze(1)).square()) * weights).sum(dim=1) / count
+    rmse = torch.sqrt(rmse_variance.clamp_min(torch.finfo(states.dtype).eps))
+    # Keep the quantile path finite for autograd. ``nanquantile`` can produce
+    # NaN gradients for fully masked rows, even when its result is sanitized.
+    # Sorting finite values and interpolating valid positions avoids that.
+    sorted_values = clean.masked_fill(
+        ~valid.unsqueeze(-1), torch.finfo(states.dtype).max,
+    ).sort(dim=1).values
+    has_valid = valid.any(dim=1).unsqueeze(-1)
+    count = valid.sum(dim=1).clamp_min(1).to(states.dtype)
+    quantile_values = []
+    for quantile in (0.25, 0.50, 0.75):
+        position = quantile * (count - 1.0)
+        lower_index = position.floor().long().unsqueeze(1).unsqueeze(-1)
+        upper_index = position.ceil().long().unsqueeze(1).unsqueeze(-1)
+        lower = sorted_values.gather(1, lower_index.expand(-1, 1, states.shape[-1])).squeeze(1)
+        upper = sorted_values.gather(1, upper_index.expand(-1, 1, states.shape[-1])).squeeze(1)
+        quantile = lower + (upper - lower) * (position - position.floor()).unsqueeze(-1)
+        quantile_values.append(torch.where(has_valid, quantile, torch.zeros_like(quantile)))
+    return (
+        mean,
+        torch.nan_to_num(min_values, nan=0.0, posinf=0.0, neginf=0.0),
+        torch.nan_to_num(max_values, nan=0.0, posinf=0.0, neginf=0.0),
+        torch.nan_to_num(rmse, nan=0.0, posinf=0.0, neginf=0.0),
+        *(torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0) for values in quantile_values),
+    )
 PredictionObjective = Literal["next_token", "masked_token"]
 PredictionLevel = Literal["token", "subtoken"]
 RateName = Literal["annual", "quarterly", "daily", "sparse"]
@@ -94,6 +147,7 @@ class MultiRateTransformerConfig:
     document_pool: DocumentPool = "last"
     max_position: int = 512
     rates: tuple[str, ...] = ("annual", "quarterly", "daily", "sparse")
+    learned_aggregation_gate: bool = False
 
     def __post_init__(self) -> None:
         if self.d_model <= 0 or self.num_heads <= 0 or self.layers <= 0:
@@ -217,22 +271,31 @@ class MultiRateTransformer(nn.Module):
             name for rate in self.config.rates for name in self.coverage_inputs[rate].family_names
         ))
         self.family_indices = {name: index for index, name in enumerate(self.family_names)}
+        self.auto_feature_engineer.aggregation_gate.configure_families(len(self.family_names))
         self.family_document_fusion = nn.Sequential(
             nn.Linear(self.config.d_model * len(self.config.rates), self.config.d_model),
             nn.LayerNorm(self.config.d_model),
             nn.GELU(),
         )
+        self.document_prototype_count = len(DOCUMENT_PROTOTYPE_STATS)
+        self.family_document_prototype_count = self.document_prototype_count + int(self.config.learned_aggregation_gate)
+        self.document_prototype_dim = self.config.d_model * self.document_prototype_count
+        self.family_document_prototype_dim = self.config.d_model * self.family_document_prototype_count
         self.task_specs = tuple(tasks)
         self.prediction_task_specs = tuple(prediction_tasks)
         self.family_classification_head = (
-            nn.Linear(self.config.d_model, int(family_classification_dim))
+            nn.Linear(self.family_document_prototype_dim, int(family_classification_dim))
             if family_classification_dim is not None else None
         )
         names = [task.task_name for task in self.task_specs]
         if len(names) != len(set(names)):
             raise ValueError("task names must be unique")
         self.task_heads = nn.ModuleDict({
-            task.task_name: nn.Linear(self.config.d_model, task.output_dim)
+            task.task_name: nn.Linear(
+                (self.family_document_prototype_dim if task.source == "family" else self.document_prototype_dim)
+                if task.level == "document" else self.config.d_model,
+                task.output_dim,
+            )
             for task in self.task_specs
         })
         prediction_names = [task.task_name for task in self.prediction_task_specs]
@@ -309,6 +372,15 @@ class MultiRateTransformer(nn.Module):
         return clean.sum(dim=1) / valid.sum(dim=1).clamp_min(1)
 
     @staticmethod
+    def _pool_prototypes(
+        states: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Return all configured prototypes over valid temporal rows."""
+        valid = None if padding_mask is None else ~padding_mask.bool()
+        return pool_prototype_statistics(states, valid)
+
+    @staticmethod
     def _pool_subtokens(
         states: torch.Tensor,
         padding_mask: torch.Tensor | None,
@@ -328,12 +400,12 @@ class MultiRateTransformer(nn.Module):
         return (clean * weights).sum(dim=(1, 2)) / weights.sum(dim=(1, 2)).clamp_min(1.0)
 
     @staticmethod
-    def _pool_family_documents(
+    def _pool_subtoken_tokens(
         states: torch.Tensor,
         padding_mask: torch.Tensor | None,
         family_presence: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pool each family document separately; return states and validity."""
+    ) -> torch.Tensor:
+        """Pool family subtokens into one token state per temporal position."""
         if states.ndim != 4:
             raise ValueError("subtoken states must have shape [batch, sequence, family, d_model]")
         batch, length, family_count, _ = states.shape
@@ -344,12 +416,35 @@ class MultiRateTransformer(nn.Module):
             valid &= family_presence.bool()
         clean = torch.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
         weights = valid.unsqueeze(-1).to(clean.dtype)
-        pooled = (clean * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-        return pooled, valid.any(dim=1)
+        return (clean * weights).sum(dim=2) / weights.sum(dim=2).clamp_min(1.0)
+
+    @staticmethod
+    def _pool_family_documents(
+        states: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+        family_presence: torch.Tensor | None,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Pool each family document into the configured prototypes."""
+        if states.ndim != 4:
+            raise ValueError("subtoken states must have shape [batch, sequence, family, d_model]")
+        batch, length, family_count, _ = states.shape
+        valid = torch.ones((batch, length, family_count), dtype=torch.bool, device=states.device)
+        if padding_mask is not None:
+            valid &= ~padding_mask.bool().unsqueeze(-1)
+        if family_presence is not None:
+            valid &= family_presence.bool()
+        flat_states = states.permute(0, 2, 1, 3).reshape(batch * family_count, length, -1)
+        flat_valid = valid.permute(0, 2, 1).reshape(batch * family_count, length)
+        pooled = pool_prototype_statistics(flat_states, flat_valid)
+        return (
+            tuple(values.reshape(batch, family_count, -1) for values in pooled),
+            valid.any(dim=1),
+        )
 
     def _heads(
         self,
         *,
+        compute_document_outputs: bool,
         daily_states: torch.Tensor,
         annual_states: torch.Tensor,
         quarterly_states: torch.Tensor,
@@ -363,7 +458,11 @@ class MultiRateTransformer(nn.Module):
         daily_subtokens: torch.Tensor | None,
         sparse_subtokens: torch.Tensor | None,
         family_presence: Mapping[str, torch.Tensor | None],
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        token_states: Mapping[str, torch.Tensor],
+    ) -> tuple[
+        dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor,
+    ]:
         subtoken_states = {
             "annual": annual_subtokens,
             "quarterly": quarterly_subtokens,
@@ -376,15 +475,45 @@ class MultiRateTransformer(nn.Module):
             "daily": daily_padding_mask,
             "sparse": sparse_padding_mask,
         }
-        rate_states = {
-            rate: self._pool_subtokens(subtoken_states[rate], padding_masks[rate], family_presence[rate])
+        if not compute_document_outputs:
+            # Training runs that do not include document tasks should not pay
+            # for mean/min/max document prototype pooling. Keep the fused
+            # mean state because token-level heads still use it.
+            rate_states = {
+                rate: self._pool_subtoken_tokens(
+                    subtokens, padding_masks[rate], family_presence[rate],
+                ).mean(dim=1) if subtokens is not None else states.mean(dim=1)
+                for rate, subtokens, states in (
+                    ("annual", annual_subtokens, annual_states),
+                    ("quarterly", quarterly_subtokens, quarterly_states),
+                    ("daily", daily_subtokens, daily_states),
+                    ("sparse", sparse_subtokens, sparse_states),
+                ) if rate in self.config.rates and states is not None
+            }
+            fused = self.fusion(torch.cat(tuple(rate_states[rate] for rate in self.config.rates), dim=-1))
+            fused = fused + self.auto_feature_engineer.cross_rate_features(
+                tuple(rate_states[rate] for rate in self.config.rates)
+            )
+            token_outputs: dict[str, torch.Tensor] = {}
+            sources = dict(token_states)
+            sources["fused"] = fused
+            for task in self.task_specs:
+                if task.level == "token":
+                    token_outputs[task.task_name] = self.task_heads[task.task_name](sources[task.source])
+            return token_outputs, {}, fused, None, None, None
+        rate_prototypes = {
+            rate: self._pool_prototypes(
+                self._pool_subtoken_tokens(subtoken_states[rate], padding_masks[rate], family_presence[rate]),
+                None,
+            )
             if subtoken_states[rate] is not None
-            else self._pool(states, padding_masks[rate])
+            else self._pool_prototypes(states, padding_masks[rate])
             for rate, states in (
                 ("annual", annual_states), ("quarterly", quarterly_states),
                 ("daily", daily_states), ("sparse", sparse_states),
             ) if rate in self.config.rates
         }
+        rate_states = {rate: prototypes[0] for rate, prototypes in rate_prototypes.items()}
         family_documents: dict[str, torch.Tensor] = {}
         for rate, subtokens in subtoken_states.items():
             if subtokens is None:
@@ -392,30 +521,50 @@ class MultiRateTransformer(nn.Module):
             family_documents[rate], _ = self._pool_family_documents(
                 subtokens, padding_masks[rate], family_presence[rate],
             )
+            if self.config.learned_aggregation_gate:
+                family_indices = torch.tensor(
+                    [self.family_indices[name] for name in self.coverage_inputs[rate].family_names],
+                    device=daily_states.device,
+                    dtype=torch.long,
+                )
+                gated, _ = self.auto_feature_engineer.gate_aggregations(
+                    tuple(family_documents[rate]), family_indices=family_indices,
+                )
+                family_documents[rate] = (*family_documents[rate], gated)
         total_families = len(self.family_names)
-        family_parts = []
+        family_prototype_parts = [[] for _ in range(self.family_document_prototype_count)]
         for rate in self.config.rates:
-            part = torch.zeros(
-                (daily_states.shape[0], total_families, self.config.d_model),
-                device=daily_states.device, dtype=daily_states.dtype,
-            )
-            if rate in family_documents:
-                for local_index, name in enumerate(self.coverage_inputs[rate].family_names):
-                    part[:, self.family_indices[name]] = family_documents[rate][:, local_index]
-            family_parts.append(part)
-        family_document_state = self.family_document_fusion(torch.cat(family_parts, dim=-1))
+            for stat_index in range(self.family_document_prototype_count):
+                part = torch.zeros(
+                    (daily_states.shape[0], total_families, self.config.d_model),
+                    device=daily_states.device, dtype=daily_states.dtype,
+                )
+                if rate in family_documents:
+                    for local_index, name in enumerate(self.coverage_inputs[rate].family_names):
+                        part[:, self.family_indices[name]] = family_documents[rate][stat_index][:, local_index]
+                family_prototype_parts[stat_index].append(part)
+        family_document_prototypes = torch.cat(
+            [self.family_document_fusion(torch.cat(parts, dim=-1)) for parts in family_prototype_parts],
+            dim=-1,
+        )
+        family_document_state = family_document_prototypes[..., :self.config.d_model]
         ordered = tuple(rate_states[rate] for rate in self.config.rates)
         fused = self.fusion(torch.cat(ordered, dim=-1))
+        fused_prototypes = torch.cat(
+            [self.fusion(torch.cat([rate_prototypes[rate][stat_index] for rate in self.config.rates], dim=-1))
+             for stat_index in range(self.document_prototype_count)],
+            dim=-1,
+        )
         fused = fused + self.auto_feature_engineer.cross_rate_features(ordered)
         token_outputs: dict[str, torch.Tensor] = {}
         document_outputs: dict[str, torch.Tensor] = {}
-        sources = {
-            rate: states for rate, states in (("annual", annual_states), ("quarterly", quarterly_states), ("daily", daily_states))
-        }
-        if sparse_states is not None:
-            sources["sparse"] = sparse_states
+        sources = dict(token_states)
         sources["fused"] = fused
-        document_sources = {**rate_states, "fused": fused, "family": family_document_state}
+        document_sources = {
+            **{rate: torch.cat(rate_prototypes[rate], dim=-1) for rate in self.config.rates},
+            "fused": fused_prototypes,
+            "family": family_document_prototypes,
+        }
         for task in self.task_specs:
             source = document_sources[task.source] if task.level == "document" else sources[task.source]
             source = torch.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
@@ -423,7 +572,10 @@ class MultiRateTransformer(nn.Module):
                 token_outputs[task.task_name] = self.task_heads[task.task_name](source)
             else:
                 document_outputs[task.task_name] = self.task_heads[task.task_name](source)
-        return token_outputs, document_outputs, fused, family_document_state
+        return (
+            token_outputs, document_outputs, fused, family_document_state,
+            fused_prototypes, family_document_prototypes,
+        )
 
     def _prediction_heads(
         self,
@@ -462,6 +614,7 @@ class MultiRateTransformer(nn.Module):
         quarterly_modality_ids: torch.Tensor | None = None,
         sparse_family_presence: torch.Tensor | None = None,
         sparse_modality_ids: torch.Tensor | None = None,
+        compute_document_outputs: bool = True,
     ) -> dict[str, object]:
         """Encode a multi-rate window and return states plus task outputs.
 
@@ -497,11 +650,12 @@ class MultiRateTransformer(nn.Module):
         quarterly_mask = build_attention_mask(quarterly_dates, mode=attention_mode)
         sparse_mask = build_attention_mask(sparse_dates, mode=attention_mode) if sparse_dates is not None else None
 
-        # Document tasks and family classification are defined over mean
-        # subtoken embeddings; retain subtoken states whenever either class
-        # of task is present, not only when next/masked prediction is used.
+        # Document tasks and family classification use mean/min/max subtoken
+        # prototypes; retain subtoken states whenever either class of task is
+        # present, not only when next/masked prediction is used.
         need_subtokens = bool(
             self.prediction_task_specs
+            or any(task.level == "token" for task in self.task_specs)
             or any(task.level == "document" for task in self.task_specs)
             or self.family_classification_head is not None
         )
@@ -603,7 +757,26 @@ class MultiRateTransformer(nn.Module):
             "quarterly": self.coverage_inputs["quarterly"](quarterly_values, return_family_states=True)[2],
             "sparse": self.coverage_inputs["sparse"](sparse_values, return_family_states=True)[2] if sparse_values is not None else None,
         }
-        token_outputs, document_outputs, fused_document_state, family_document_state = self._heads(
+        token_states = {
+            rate: self._pool_subtoken_tokens(
+                subtoken_states,
+                {"annual": annual_padding_mask, "quarterly": quarterly_padding_mask,
+                 "daily": daily_padding_mask, "sparse": sparse_padding_mask}[rate],
+                family_presence[rate],
+            )
+            if subtoken_states is not None else states
+            for rate, subtoken_states, states in (
+                ("annual", annual_subtokens, annual_states),
+                ("quarterly", quarterly_subtokens, quarterly_states),
+                ("daily", daily_subtokens, daily_states),
+                ("sparse", sparse_subtokens, sparse_states),
+            ) if rate in self.config.rates and states is not None
+        }
+        (
+            token_outputs, document_outputs, fused_document_state, family_document_state,
+            fused_document_prototypes, family_document_prototypes,
+        ) = self._heads(
+            compute_document_outputs=compute_document_outputs,
             daily_states=daily_states,
             annual_states=annual_states,
             quarterly_states=quarterly_states,
@@ -617,19 +790,22 @@ class MultiRateTransformer(nn.Module):
             daily_subtokens=daily_subtokens,
             sparse_subtokens=sparse_subtokens,
             family_presence=family_presence,
+            token_states=token_states,
         )
         prediction_outputs = self._prediction_heads(
-            token_states={"daily": daily_states, "annual": annual_states, "quarterly": quarterly_states, "sparse": sparse_states},
+            token_states=token_states,
             subtoken_states={"daily": daily_subtokens, "annual": annual_subtokens, "quarterly": quarterly_subtokens, "sparse": sparse_subtokens},
         ) if need_subtokens else {}
         family_outputs = (
-            self.family_classification_head(fused_document_state)
-            if self.family_classification_head is not None else None
+            self.family_classification_head(fused_document_prototypes)
+            if self.family_classification_head is not None and fused_document_prototypes is not None else None
         )
         return {
-            "token_states": daily_states,
+            "token_states": token_states["daily"],
             "document_state": fused_document_state,
             "family_document_state": family_document_state,
+            "document_prototypes": fused_document_prototypes,
+            "family_document_prototypes": family_document_prototypes,
             "rate_states": {
                 "annual": annual_states,
                 "quarterly": quarterly_states,
@@ -646,6 +822,8 @@ class MultiRateTransformer(nn.Module):
 __all__ = [
     "AttentionMode",
     "BackboneName",
+    "DOCUMENT_PROTOTYPE_STATS",
+    "pool_prototype_statistics",
     "MultiRateTaskSpec",
     "MultiRatePredictionTaskSpec",
     "MultiRateTransformer",
