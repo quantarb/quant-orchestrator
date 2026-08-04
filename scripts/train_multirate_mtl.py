@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
     DOCUMENT_PROTOTYPE_STATS,
     MultiRateTransformer,
     MultiRateTransformerConfig,
+    Task,
     Trainer,
     add_subtoken_temporal_tasks,
 )
@@ -43,6 +45,24 @@ ANNUAL_WINDOW = 252
 QUARTERLY_WINDOW = 252
 DAILY_WINDOW = 252  # one trading year for daily self-supervision
 DEFAULT_EPOCHS = 20
+
+
+def matryoshka_alignment_loss(embedding: torch.Tensor, dimensions: tuple[int, ...]) -> torch.Tensor:
+    """Keep nested prefixes useful at multiple retrieval dimensions.
+
+    The full document representation remains trained by the existing MTL
+    objectives.  Each smaller normalized prefix is additionally aligned with
+    the corresponding prefix of the full representation, which is the MRL
+    objective used by downstream retrieval/coordinate consumers.
+    """
+    if not dimensions:
+        return embedding.sum() * 0.0
+    target = nn.functional.normalize(embedding.detach(), dim=-1)
+    losses = []
+    for dimension in dimensions:
+        prefix = nn.functional.normalize(embedding[:, :dimension], dim=-1)
+        losses.append(1.0 - (prefix * target[:, :dimension]).sum(dim=-1).mean())
+    return torch.stack(losses).mean()
 
 def _encode_labels(values: pd.Series) -> tuple[np.ndarray, list[str], dict[str, int]]:
     labels = sorted(values.astype(str).fillna("Unknown").unique())
@@ -111,6 +131,14 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--min-delta", type=float, default=1e-3)
+    parser.add_argument("--learned-aggregation-gate", action="store_true")
+    parser.add_argument(
+        "--mrl-dimensions", default="16,32,64,128",
+        help="Comma-separated nested embedding dimensions for MRL; empty disables MRL.",
+    )
+    parser.add_argument("--mrl-weight", type=float, default=0.25)
+    parser.add_argument("--train-end-date", help="Train only on document anchors before this YYYY-MM-DD date.")
+    parser.add_argument("--prediction-start-date", help="Export daily supervised-head scores on and after this YYYY-MM-DD date.")
     parser.add_argument(
         "--disable-document-tasks",
         action="store_true",
@@ -118,6 +146,11 @@ def main() -> None:
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    mrl_dimensions = tuple(sorted({int(value) for value in args.mrl_dimensions.split(",") if value.strip()}, key=int))
+    if mrl_dimensions and (mrl_dimensions[-1] != args.d_model or mrl_dimensions[0] < 1):
+        parser.error("--mrl-dimensions must be positive and include --d-model as its largest dimension")
+    if args.mrl_weight < 0:
+        parser.error("--mrl-weight must be non-negative")
     enabled_document_tasks = () if args.disable_document_tasks else DOCUMENT_TASK_NAMES
     if args.grad_accumulation_steps < 1:
         parser.error("--grad-accumulation-steps must be at least 1")
@@ -258,14 +291,12 @@ def main() -> None:
                         supervised_targets[offset + position, task_index] = values[task_name]
                         supervised_valid[offset + position, task_index] = True
         sample = {
-            "symbol": symbol, "year": int(anchor.year),
-            "year_quarter": f"{anchor.year}-Q{anchor.quarter}",
-            "year_month": f"{anchor.year}-{anchor.month:02d}",
-            "year_week": f"{anchor.isocalendar().year}-W{anchor.isocalendar().week:02d}",
+            "symbol": symbol, "date": anchor.strftime("%Y-%m-%d"),
             "issuer": str(taxonomy.loc[symbol, "issuer"]),
             "annual": annual_values, "annual_padding": annual_padding,
             "quarterly": quarterly_values, "quarterly_padding": quarterly_padding,
             "daily": daily_values, "daily_padding": daily_padding,
+            "daily_dates": pd.to_datetime(daily_dates).strftime("%Y-%m-%d").tolist(),
             "sparse": sparse_values, "sparse_padding": sparse_padding, "sparse_labels": sparse_labels,
             "sector": str(taxonomy.loc[symbol, "sector"]), "subsector": str(taxonomy.loc[symbol, "subsector"]),
             "industry": str(taxonomy.loc[symbol, "industry"]),
@@ -276,27 +307,29 @@ def main() -> None:
     frame = pd.DataFrame([{key: value for key, value in sample.items() if isinstance(value, str) or isinstance(value, int)} for sample in samples])
     label_arrays: dict[str, np.ndarray] = {}
     label_names: dict[str, list[str]] = {}
-    for task in DOCUMENT_TASK_NAMES[1:-4]:
+    for task in DOCUMENT_TASK_NAMES[1:]:
         label_arrays[task], label_names[task], _ = _encode_labels(frame[task])
-    years = sorted(frame["year"].unique())
-    year_map = {year: i for i, year in enumerate(years)}
-    label_arrays["year"] = frame["year"].map(year_map).to_numpy("int64"); label_names["year"] = [str(year) for year in years]
-    label_arrays["year_quarter"], label_names["year_quarter"], _ = _encode_labels(frame["year_quarter"])
-    label_arrays["year_month"], label_names["year_month"], _ = _encode_labels(frame["year_month"])
-    label_arrays["year_week"], label_names["year_week"], _ = _encode_labels(frame["year_week"])
     family_names = [*feature_families, *target_families]
     label_names["family"] = family_names
     for index, sample in enumerate(samples):
         for name in DOCUMENT_TASK_NAMES[1:]:
             sample[f"{name}_label"] = int(label_arrays[name][index])
 
+    train_samples = samples
+    if args.train_end_date:
+        train_end = pd.Timestamp(args.train_end_date)
+        train_samples = [sample for sample in samples if pd.Timestamp(sample["date"]) < train_end]
+        if not train_samples:
+            raise ValueError(f"no training samples exist before {args.train_end_date}")
+
     device = torch.device(args.device)
     config = MultiRateTransformerConfig(
         backbone="encoder_decoder", d_model=args.d_model, num_heads=args.num_heads,
         layers=args.layers, document_pool="mean", max_position=512,
+        learned_aggregation_gate=args.learned_aggregation_gate,
     )
     task_bundle = add_subtoken_temporal_tasks(
-        samples,
+        train_samples,
         family_names,
         label_names,
         batch_size=args.batch_size,
@@ -306,6 +339,8 @@ def main() -> None:
         if task.task_name in enabled_document_tasks or task.task_name not in DOCUMENT_TASK_NAMES
     )
     active_tasks = tuple(task for task in task_bundle.tasks if task.name in {spec.task_name for spec in model_tasks} or task.name in {spec.task_name for spec in task_bundle.prediction_tasks})
+    if mrl_dimensions:
+        active_tasks = (*active_tasks, Task("mrl", spec="matryoshka_document_alignment", loss_weight=args.mrl_weight))
     expected_task_names = tuple(enabled_document_tasks) + SUPERVISED_TARGET_TASK_NAMES + PREDICTION_TASK_NAMES
     model = MultiRateTransformer(
         {"annual": len(annual_value_columns), "quarterly": len(quarterly_value_columns), "daily": len(daily_value_columns), "sparse": len(sparse_value_columns)},
@@ -388,6 +423,8 @@ def main() -> None:
         zero = zero_source.sum() * 0.0
         active_names = {task.name for task in active_tasks}
         task_losses = {task.name: zero for task in active_tasks}
+        if "mrl" in active_names:
+            task_losses["mrl"] = matryoshka_alignment_loss(output["document_state"], mrl_dimensions)
         for name in DOCUMENT_TASK_NAMES[1:]:
             if name not in enabled_document_tasks:
                 continue
@@ -487,6 +524,8 @@ def main() -> None:
         model.load_state_dict(best_state)
 
     model.eval(); predictions: dict[str, list[np.ndarray]] = {name: [] for name in enabled_document_tasks[1:]}; states: list[np.ndarray] = []; family_states: list[np.ndarray] = []; family_valid_rows: list[np.ndarray] = []
+    prediction_rows: list[dict[str, object]] = []
+    prediction_start = pd.Timestamp(args.prediction_start_date) if args.prediction_start_date else None
     family_correct = 0
     family_total = 0
     with torch.inference_mode():
@@ -512,6 +551,20 @@ def main() -> None:
             quarterly_batch, quarterly_mask = context("quarterly", "quarterly_padding")
             sparse_batch, sparse_padding_mask = context("sparse", "sparse_padding")
             output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=torch.arange(DAILY_WINDOW, device=device), annual_dates=torch.arange(ANNUAL_WINDOW, device=device), quarterly_dates=torch.arange(QUARTERLY_WINDOW, device=device), sparse_dates=torch.arange(16, device=device))
+            if prediction_start is not None:
+                score_names = tuple(SUPERVISED_TARGET_TASK_NAMES)
+                score_arrays = {
+                    name: torch.sigmoid(output["token_outputs"][name].squeeze(-1)).cpu().numpy()
+                    for name in score_names
+                }
+                for row_index, item in enumerate(batch):
+                    dates = [pd.Timestamp(value) for value in item["daily_dates"]]
+                    offset = DAILY_WINDOW - len(dates)
+                    for date_index, date in enumerate(dates):
+                        if date < prediction_start:
+                            continue
+                        score_row = {name: float(values[row_index, offset + date_index]) for name, values in score_arrays.items()}
+                        prediction_rows.append({"symbol": item["symbol"], "date": date.strftime("%Y-%m-%d"), **score_row})
             states.append(output["document_prototypes"].cpu().numpy())
             family_labels = torch.arange(len(family_names), device=device).view(1, -1).expand(len(batch), -1)
             family_valid = torch.zeros((len(batch), len(family_names)), dtype=torch.bool, device=device)
@@ -534,9 +587,21 @@ def main() -> None:
     task_accuracy = {name: float((np.concatenate(predictions[name]) == label_arrays[name]).mean()) for name in predictions}
     if "family" in enabled_document_tasks:
         task_accuracy["family"] = family_correct / max(1, family_total)
-    metrics = {"device": str(device), "samples": len(samples), "feature_families": feature_families, "target_families": target_families, "family_labels": family_names, "tasks": list(expected_task_names), "losses": losses, "best_loss": best_loss, "epochs_completed": len(losses), "patience": args.patience, "min_delta": args.min_delta, "task_accuracy": task_accuracy, "rates": ["annual", "quarterly", "daily", "sparse"], "backbone": config.backbone, "document_tasks_disabled": args.disable_document_tasks}
+    metrics = {"device": str(device), "samples": len(samples), "training_samples": len(train_samples), "feature_families": feature_families, "target_families": target_families, "family_labels": family_names, "tasks": [*expected_task_names, *(["mrl"] if mrl_dimensions else [])], "losses": losses, "best_loss": best_loss, "epochs_completed": len(losses), "patience": args.patience, "min_delta": args.min_delta, "task_accuracy": task_accuracy, "rates": ["annual", "quarterly", "daily", "sparse"], "backbone": config.backbone, "document_tasks_disabled": args.disable_document_tasks, "learned_aggregation_gate": args.learned_aggregation_gate, "mrl": bool(mrl_dimensions), "mrl_dimensions": list(mrl_dimensions), "mrl_weight": args.mrl_weight, "train_end_date": args.train_end_date, "prediction_start_date": args.prediction_start_date}
     (output_dir / "training_summary.json").write_text(json.dumps(metrics, indent=2))
     torch.save({"state_dict": model.state_dict(), "metrics": metrics, "labels": label_names}, output_dir / "multirate_mtl_model.pt")
+    if prediction_rows:
+        pd.DataFrame(prediction_rows).sort_values(["date", "symbol"]).to_csv(output_dir / "supervised_predictions.csv", index=False)
+    if args.learned_aggregation_gate:
+        gate = model.auto_feature_engineer.aggregation_gate
+        if gate.family_logits is not None:
+            weights = torch.softmax(gate.family_logits.detach(), dim=-1).cpu().numpy()
+            gate_rows = [
+                {"feature_family": family, "aggregation": aggregation, "weight": float(weights[index, aggregation_index])}
+                for index, family in enumerate(model.family_names)
+                for aggregation_index, aggregation in enumerate(gate.aggregation_functions)
+            ]
+            pd.DataFrame(gate_rows).to_csv(output_dir / "aggregation_gate_weights.csv", index=False)
     embeddings = np.nan_to_num(np.concatenate(states), nan=0.0, posinf=0.0, neginf=0.0)
     family_embeddings = np.nan_to_num(np.concatenate(family_states), nan=0.0, posinf=0.0, neginf=0.0)
     family_valid_array = np.concatenate(family_valid_rows)
@@ -563,7 +628,27 @@ def main() -> None:
                     rows.append({"task": name, "label": f"{label} [{prototype_name}]", "prototype": prototype_name, "support": int(len(indices)), "embedding": embeddings[indices, start:stop].mean(axis=0)})
     if len(rows) >= 2:
         coordinates = TSNE(n_components=3, perplexity=min(30.0, len(rows) - 1), init="pca", learning_rate="auto", max_iter=1500, random_state=42).fit_transform(np.stack([row.pop("embedding") for row in rows]).astype("float32"))
-        plot = pd.DataFrame(rows); plot[["x", "y", "z"]] = coordinates; plot.to_csv(output_dir / "prototype_coordinates_3d.csv", index=False)
+        coordinates_path = output_dir / "prototype_coordinates_3d.csv"
+        plot = pd.DataFrame(rows); plot[["x", "y", "z"]] = coordinates; plot.to_csv(coordinates_path, index=False)
+
+        # Publish one mean-only visualization per completed model in the
+        # experiment-level folder, shared by all model scales.
+        common_plot_dir = output_dir.parent / "plots"
+        common_plot_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("generate_mtl_tsne_views.py")),
+                "--coordinates", str(coordinates_path),
+                "--output-dir", str(common_plot_dir),
+                "--title-prefix", f"{output_dir.name} learned family gate",
+                "--prototype", "mean",
+            ],
+            check=True,
+        )
+        (common_plot_dir / "prototype_embeddings_tsne_3d_mean.png").rename(
+            common_plot_dir / f"{output_dir.name}_tsne_3d_mean.png"
+        )
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.auto_features import (
     AutoFeatureEngineer,
+    AGGREGATION_FUNCTIONS,
 )
 
 
@@ -146,6 +147,7 @@ class MultiRateTransformerConfig:
     document_pool: DocumentPool = "last"
     max_position: int = 512
     rates: tuple[str, ...] = ("annual", "quarterly", "daily", "sparse")
+    learned_aggregation_gate: bool = False
 
     def __post_init__(self) -> None:
         if self.d_model <= 0 or self.num_heads <= 0 or self.layers <= 0:
@@ -269,16 +271,20 @@ class MultiRateTransformer(nn.Module):
             name for rate in self.config.rates for name in self.coverage_inputs[rate].family_names
         ))
         self.family_indices = {name: index for index, name in enumerate(self.family_names)}
+        self.auto_feature_engineer.aggregation_gate.configure_families(len(self.family_names))
         self.family_document_fusion = nn.Sequential(
             nn.Linear(self.config.d_model * len(self.config.rates), self.config.d_model),
             nn.LayerNorm(self.config.d_model),
             nn.GELU(),
         )
-        self.document_prototype_dim = self.config.d_model * len(DOCUMENT_PROTOTYPE_STATS)
+        self.document_prototype_count = len(DOCUMENT_PROTOTYPE_STATS)
+        self.family_document_prototype_count = self.document_prototype_count + int(self.config.learned_aggregation_gate)
+        self.document_prototype_dim = self.config.d_model * self.document_prototype_count
+        self.family_document_prototype_dim = self.config.d_model * self.family_document_prototype_count
         self.task_specs = tuple(tasks)
         self.prediction_task_specs = tuple(prediction_tasks)
         self.family_classification_head = (
-            nn.Linear(self.document_prototype_dim, int(family_classification_dim))
+            nn.Linear(self.family_document_prototype_dim, int(family_classification_dim))
             if family_classification_dim is not None else None
         )
         names = [task.task_name for task in self.task_specs]
@@ -286,7 +292,8 @@ class MultiRateTransformer(nn.Module):
             raise ValueError("task names must be unique")
         self.task_heads = nn.ModuleDict({
             task.task_name: nn.Linear(
-                self.document_prototype_dim if task.level == "document" else self.config.d_model,
+                (self.family_document_prototype_dim if task.source == "family" else self.document_prototype_dim)
+                if task.level == "document" else self.config.d_model,
                 task.output_dim,
             )
             for task in self.task_specs
@@ -514,10 +521,20 @@ class MultiRateTransformer(nn.Module):
             family_documents[rate], _ = self._pool_family_documents(
                 subtokens, padding_masks[rate], family_presence[rate],
             )
+            if self.config.learned_aggregation_gate:
+                family_indices = torch.tensor(
+                    [self.family_indices[name] for name in self.coverage_inputs[rate].family_names],
+                    device=daily_states.device,
+                    dtype=torch.long,
+                )
+                gated, _ = self.auto_feature_engineer.gate_aggregations(
+                    tuple(family_documents[rate]), family_indices=family_indices,
+                )
+                family_documents[rate] = (*family_documents[rate], gated)
         total_families = len(self.family_names)
-        family_prototype_parts = {stat: [] for stat in DOCUMENT_PROTOTYPE_STATS}
+        family_prototype_parts = [[] for _ in range(self.family_document_prototype_count)]
         for rate in self.config.rates:
-            for stat_index, stat in enumerate(DOCUMENT_PROTOTYPE_STATS):
+            for stat_index in range(self.family_document_prototype_count):
                 part = torch.zeros(
                     (daily_states.shape[0], total_families, self.config.d_model),
                     device=daily_states.device, dtype=daily_states.dtype,
@@ -525,9 +542,9 @@ class MultiRateTransformer(nn.Module):
                 if rate in family_documents:
                     for local_index, name in enumerate(self.coverage_inputs[rate].family_names):
                         part[:, self.family_indices[name]] = family_documents[rate][stat_index][:, local_index]
-                family_prototype_parts[stat].append(part)
+                family_prototype_parts[stat_index].append(part)
         family_document_prototypes = torch.cat(
-            [self.family_document_fusion(torch.cat(family_prototype_parts[stat], dim=-1)) for stat in DOCUMENT_PROTOTYPE_STATS],
+            [self.family_document_fusion(torch.cat(parts, dim=-1)) for parts in family_prototype_parts],
             dim=-1,
         )
         family_document_state = family_document_prototypes[..., :self.config.d_model]
@@ -535,7 +552,7 @@ class MultiRateTransformer(nn.Module):
         fused = self.fusion(torch.cat(ordered, dim=-1))
         fused_prototypes = torch.cat(
             [self.fusion(torch.cat([rate_prototypes[rate][stat_index] for rate in self.config.rates], dim=-1))
-             for stat_index in range(len(DOCUMENT_PROTOTYPE_STATS))],
+             for stat_index in range(self.document_prototype_count)],
             dim=-1,
         )
         fused = fused + self.auto_feature_engineer.cross_rate_features(ordered)

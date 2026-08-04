@@ -20,8 +20,7 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 
 
 DOCUMENT_TASK_NAMES = (
-    "family", "issuer", "symbol", "industry", "sector", "subsector", "year",
-    "year_quarter", "year_month", "year_week",
+    "family", "issuer", "symbol", "industry", "sector", "subsector", "date",
 )
 SUBTOKEN_PREDICTION_TASK_NAMES = (
     "next_annual_subtoken",
@@ -106,10 +105,9 @@ def add_subtoken_temporal_tasks(
 
     ``family_names`` contains the union of feature and target families.  The
     remaining document labels must contain ``issuer``, ``symbol``,
-    ``industry``, ``sector``, ``subsector``, ``year``, ``year_quarter``,
-    ``year_month``, and ``year_week``.  Calendar labels are combined period
-    labels such as ``2024-Q3``, ``2024-07``, and ISO ``2024-W27``.  Those labels
-    classify temporal documents; they are not cross-sectional document sources.
+    ``industry``, ``sector``, ``subsector``, and exact ``date`` labels such as
+    ``2024-07-31``.  These labels classify temporal documents; they are not
+    cross-sectional document sources.
     """
     corpus = Corpus(rows, name=corpus_name, batch_size=batch_size)
     required_labels = set(DOCUMENT_TASK_NAMES[1:])

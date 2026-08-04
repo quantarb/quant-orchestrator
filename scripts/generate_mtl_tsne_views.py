@@ -59,6 +59,7 @@ def main() -> None:
     parser.add_argument("--title-prefix", default="Historical MTL")
     parser.add_argument("--prototype", choices=("all", "mean", "min", "max", "rmse", "q25", "q50", "q75"), default="all")
     parser.add_argument("--aggregate-prototypes", action="store_true", help="Average the plotted prototype coordinates into one point per task and label.")
+    parser.add_argument("--derive-year-from-date", action="store_true", help="Aggregate exact-date prototype coordinates into derived calendar-year points.")
     args = parser.parse_args()
 
     frame = pd.read_csv(args.coordinates)
@@ -71,7 +72,18 @@ def main() -> None:
             .agg(x=("x", "mean"), y=("y", "mean"), z=("z", "mean"), support=("support", "sum"))
         )
         frame["prototype"] = "prototype_mean"
-    suffix = "_prototype_mean" if args.aggregate_prototypes else ("" if args.prototype == "all" else f"_{args.prototype}")
+    if args.derive_year_from_date:
+        date_frame = frame.loc[frame["task"].eq("date")].copy()
+        date_frame["year"] = date_frame["label"].str.extract(r"^(\d{4})", expand=False)
+        date_frame = date_frame.loc[date_frame["year"].notna()]
+        frame = (
+            date_frame.groupby("year", as_index=False)
+            .agg(x=("x", "mean"), y=("y", "mean"), z=("z", "mean"), support=("support", "sum"))
+            .rename(columns={"year": "label"})
+        )
+        frame["task"] = "year"
+        frame["prototype"] = "derived_from_date"
+    suffix = "_years_from_date" if args.derive_year_from_date else ("_prototype_mean" if args.aggregate_prototypes else ("" if args.prototype == "all" else f"_{args.prototype}"))
     target_labels = {
         str(label) for label in frame.loc[frame["task"].eq("family"), "label"]
         if str(label).startswith("equity.")
@@ -79,7 +91,7 @@ def main() -> None:
     _save_view(
         frame,
         args.output_dir / f"prototype_embeddings_tsne_3d{suffix}.png",
-        f"{args.title_prefix} — {'mean of prototype coordinates' if args.aggregate_prototypes else f'{args.prototype} prototype embeddings'}",
+        f"{args.title_prefix} — {'derived year prototypes from exact dates' if args.derive_year_from_date else ('mean of prototype coordinates' if args.aggregate_prototypes else f'{args.prototype} prototype embeddings')}",
         target_labels=target_labels,
     )
 
