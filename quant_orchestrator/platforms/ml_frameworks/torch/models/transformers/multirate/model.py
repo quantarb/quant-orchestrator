@@ -590,6 +590,16 @@ class MultiRateTransformer(nn.Module):
             outputs[task.task_name] = self.prediction_heads[task.task_name](source)
         return outputs
 
+    @staticmethod
+    def _cached_state(rate, cache, values, encoder, mask, padding_mask):
+        cached = cache.get(rate)
+        if cached is not None and "states" in cached:
+            states = cached["states"]
+            if states.shape[0] == 1 and values.shape[0] > 1:
+                states = states.expand(values.shape[0], *states.shape[1:])
+            return states
+        return encoder(values, mask=mask, src_key_padding_mask=padding_mask)
+
     def forward(
         self,
         daily_values: torch.Tensor,
@@ -614,6 +624,7 @@ class MultiRateTransformer(nn.Module):
         quarterly_modality_ids: torch.Tensor | None = None,
         sparse_family_presence: torch.Tensor | None = None,
         sparse_modality_ids: torch.Tensor | None = None,
+        rate_cache: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
         compute_document_outputs: bool = True,
     ) -> dict[str, object]:
         """Encode a multi-rate window and return states plus task outputs.
@@ -659,26 +670,29 @@ class MultiRateTransformer(nn.Module):
             or any(task.level == "document" for task in self.task_specs)
             or self.family_classification_head is not None
         )
+        rate_cache = rate_cache or {}
+
+        def cached_or_project(rate: str, values: torch.Tensor | None, family_presence, modality_ids, dates, padding):
+            cached = rate_cache.get(rate)
+            if cached is not None and "projected" in cached:
+                projected = cached["projected"]
+                subtokens = cached.get("subtokens")
+                batch = values.shape[0] if values is not None else projected.shape[0]
+                if projected.shape[0] == 1 and batch > 1:
+                    projected = projected.expand(batch, *projected.shape[1:])
+                    if subtokens is not None:
+                        subtokens = subtokens.expand(batch, *subtokens.shape[1:])
+                return (projected, subtokens) if need_subtokens else projected
+            return self._project(rate, values, family_presence, modality_ids, attention_mode, dates, padding, need_subtokens)
+
         daily_projected = self._project(
             "daily", daily_values, daily_family_presence, daily_modality_ids,
             attention_mode, daily_dates, daily_padding_mask,
             need_subtokens,
         )
-        annual_projected = self._project(
-            "annual", annual_values, annual_family_presence, annual_modality_ids,
-            attention_mode, annual_dates, annual_padding_mask,
-            need_subtokens,
-        )
-        quarterly_projected = self._project(
-            "quarterly", quarterly_values, quarterly_family_presence, quarterly_modality_ids,
-            attention_mode, quarterly_dates, quarterly_padding_mask,
-            need_subtokens,
-        )
-        sparse_projected = self._project(
-            "sparse", sparse_values, sparse_family_presence, sparse_modality_ids,
-            attention_mode, sparse_dates, sparse_padding_mask,
-            need_subtokens,
-        ) if sparse_values is not None else None
+        annual_projected = cached_or_project("annual", annual_values, annual_family_presence, annual_modality_ids, annual_dates, annual_padding_mask)
+        quarterly_projected = cached_or_project("quarterly", quarterly_values, quarterly_family_presence, quarterly_modality_ids, quarterly_dates, quarterly_padding_mask)
+        sparse_projected = cached_or_project("sparse", sparse_values, sparse_family_presence, sparse_modality_ids, sparse_dates, sparse_padding_mask) if sparse_values is not None else None
         if need_subtokens:
             daily_input, daily_subtokens = daily_projected
             annual_input, annual_subtokens = annual_projected
@@ -720,9 +734,9 @@ class MultiRateTransformer(nn.Module):
             daily_states = combined_states[:, quarterly_end:daily_end]
             sparse_states = combined_states[:, daily_end:] if sparse_input is not None else None
         elif self.config.backbone == "encoder_decoder":
-            annual_states = self.annual_encoder(annual_input, mask=annual_mask, src_key_padding_mask=annual_padding_mask)
-            quarterly_states = self.quarterly_encoder(quarterly_input, mask=quarterly_mask, src_key_padding_mask=quarterly_padding_mask)
-            sparse_states = self.encoders["sparse"](sparse_input, mask=sparse_mask, src_key_padding_mask=sparse_padding_mask) if sparse_input is not None else None
+            annual_states = self._cached_state("annual", rate_cache, annual_input, self.annual_encoder, annual_mask, annual_padding_mask)
+            quarterly_states = self._cached_state("quarterly", rate_cache, quarterly_input, self.quarterly_encoder, quarterly_mask, quarterly_padding_mask)
+            sparse_states = self._cached_state("sparse", rate_cache, sparse_input, self.encoders["sparse"], sparse_mask, sparse_padding_mask) if sparse_input is not None else None
             memory_parts = [annual_states, quarterly_states]
             if sparse_states is not None:
                 memory_parts.append(sparse_states)
@@ -811,6 +825,18 @@ class MultiRateTransformer(nn.Module):
                 "quarterly": quarterly_states,
                 "daily": daily_states,
                 "sparse": sparse_states,
+            },
+            "rate_cache": {
+                rate: {
+                    "projected": projected[0] if isinstance(projected, tuple) else projected,
+                    "subtokens": projected[1] if isinstance(projected, tuple) else None,
+                    "states": states,
+                }
+                for rate, projected, states in (
+                    ("annual", annual_projected, annual_states),
+                    ("quarterly", quarterly_projected, quarterly_states),
+                    ("sparse", sparse_projected, sparse_states),
+                ) if projected is not None and states is not None
             },
             "token_outputs": token_outputs,
             "document_outputs": document_outputs,
