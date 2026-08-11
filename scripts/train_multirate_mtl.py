@@ -342,8 +342,20 @@ def _add_option_state_features(
     return option_columns
 
 
-def _issuer_quartile_option_panel(panel: pd.DataFrame, taxonomy: pd.DataFrame) -> pd.DataFrame:
-    """Freeze Q25/Q50/Q75 DTE assignments independently per issuer."""
+def _issuer_dte_bin_option_panel(
+    panel: pd.DataFrame,
+    taxonomy: pd.DataFrame,
+    *,
+    bin_count: int,
+) -> pd.DataFrame:
+    """Freeze representative weighted DTE quantiles independently per issuer.
+
+    ``bin_count`` representative DTE groups are selected at the interior
+    quantiles of each issuer's first usable option date. For five bins this is
+    Q10/Q30/Q50/Q70/Q90, matching the prior three-bin Q25/Q50/Q75 behavior.
+    """
+    if bin_count < 1:
+        raise ValueError("option issuer DTE bin count must be at least 1")
     result = panel.copy()
     result["underlying_symbol"] = result["underlying_symbol"].astype(str).str.upper().str.strip()
     result["entry_date"] = pd.to_datetime(result["entry_date"], errors="coerce").dt.normalize()
@@ -369,11 +381,16 @@ def _issuer_quartile_option_panel(panel: pd.DataFrame, taxonomy: pd.DataFrame) -
         order = np.argsort(values)
         values, weights = values[order], weights[order]
         cumulative = np.cumsum(weights) / weights.sum()
-        targets = [int(values[np.searchsorted(cumulative, q, side="left")]) for q in (0.25, 0.50, 0.75)]
+        quantiles = np.linspace(
+            0.5 / bin_count,
+            1.0 - 0.5 / bin_count,
+            bin_count,
+        )
+        targets = [int(values[np.searchsorted(cumulative, q, side="left")]) for q in quantiles]
         targets = set(targets)
         selected.append(group.loc[group["dte"].astype(int).isin(targets)])
     if not selected:
-        raise ValueError("issuer-specific DTE quartile selection produced no option rows")
+        raise ValueError("issuer-specific DTE bin selection produced no option rows")
     return pd.concat(selected, ignore_index=True)
 
 
@@ -488,7 +505,13 @@ def main() -> None:
     parser.add_argument("--option-start-date", default="2025-01-01", help="Earliest option entry date used for features and supervision.")
     parser.add_argument("--option-end-date", help="Optional latest option entry date used for features and supervision.")
     parser.add_argument("--option-dte", type=int, nargs="+", help="Restrict option training documents to one or more frozen DTE groups.")
-    parser.add_argument("--option-issuer-quartiles", action="store_true", help="Freeze Q25/Q50/Q75 DTE assignments independently for each issuer.")
+    parser.add_argument(
+        "--option-issuer-dte-bins",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Freeze N representative weighted DTE groups independently for each issuer (5 uses Q10/Q30/Q50/Q70/Q90).",
+    )
     parser.add_argument("--country", default="US", help="Issuer country filter; empty disables it.")
     parser.add_argument("--currency", default="USD", help="Trading currency filter; empty disables it.")
     parser.add_argument("--exchanges", default="NYSE,NASDAQ,AMEX", help="Comma-separated allowed exchanges; empty disables it.")
@@ -545,10 +568,16 @@ def main() -> None:
     # Otherwise a DTE-105 run needlessly scans every synthetic option symbol
     # in the full daily table.
     issuer_quartile_panel = None
-    if (option_dtes or args.option_issuer_quartiles) and args.option_panel is not None:
-        selected_panel = _read_parquet_polars(args.option_panel, None if args.option_issuer_quartiles else ["symbol", "dte", "underlying_symbol"])
-        if args.option_issuer_quartiles:
-            issuer_quartile_panel = _issuer_quartile_option_panel(selected_panel, taxonomy)
+    if args.option_issuer_dte_bins < 0:
+        parser.error("--option-issuer-dte-bins must be non-negative")
+    if (option_dtes or args.option_issuer_dte_bins) and args.option_panel is not None:
+        selected_panel = _read_parquet_polars(args.option_panel, None if args.option_issuer_dte_bins else ["symbol", "dte", "underlying_symbol"])
+        if args.option_issuer_dte_bins:
+            issuer_quartile_panel = _issuer_dte_bin_option_panel(
+                selected_panel,
+                taxonomy,
+                bin_count=args.option_issuer_dte_bins,
+            )
             selected_panel = issuer_quartile_panel
             selected_symbols = set(selected_panel["symbol"].astype(str).str.upper())
             def keep_selected(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1395,6 +1424,7 @@ def main() -> None:
         "option_start_date": args.option_start_date if args.option_panel else None,
         "option_end_date": args.option_end_date if args.option_panel else None,
         "option_dte": sorted(option_dtes) if args.option_panel else None,
+        "option_issuer_dte_bins": args.option_issuer_dte_bins if args.option_panel else None,
         "option_features": list(OPTION_FEATURES) if option_columns else [],
         "option_supervised_tasks": list(OPTION_SUPERVISED_TASK_NAMES) if option_columns else [],
         "universe_filter": {"country": args.country, "currency": args.currency, "exchanges": sorted(exchanges), "symbols": sorted(universe_symbols), "currency_unresolved_symbols": sorted(unresolved_currency)},
