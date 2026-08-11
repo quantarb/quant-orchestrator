@@ -8,7 +8,7 @@ import re
 import sys
 import tempfile
 from time import perf_counter
-from typing import Literal
+from typing import Literal, Mapping
 
 import numpy as np
 import pandas as pd
@@ -750,12 +750,13 @@ def _build_oracle_trade_label_rows_sparse(
                     side = str(trade.get("side") or "").strip().lower()
                     if side not in {"long", "short"}:
                         continue
-                    entry_date = pd.to_datetime(
-                        getattr(trade.get("entry_row"), "name", None), errors="coerce"
-                    )
-                    exit_date = pd.to_datetime(
-                        getattr(trade.get("exit_row"), "name", None), errors="coerce"
-                    )
+                    def _row_date(row: object) -> object:
+                        if isinstance(row, Mapping):
+                            return row.get("date", row.get("datetime", row.get("timestamp")))
+                        return getattr(row, "name", None)
+
+                    entry_date = pd.to_datetime(_row_date(trade.get("entry_row")), errors="coerce")
+                    exit_date = pd.to_datetime(_row_date(trade.get("exit_row")), errors="coerce")
                     if pd.isna(entry_date) or pd.isna(exit_date):
                         continue
                     entry_date = pd.Timestamp(entry_date).normalize()
