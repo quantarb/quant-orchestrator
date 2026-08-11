@@ -9,7 +9,7 @@ between documents.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Hashable, Mapping, Sequence
 
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.model import (
     MultiRatePredictionTaskSpec,
@@ -100,6 +100,7 @@ def add_subtoken_temporal_tasks(
     *,
     batch_size: int = 1,
     corpus_name: str = "temporal",
+    batch_key: Callable[[Any], Hashable] | None = None,
 ) -> TemporalMTLTaskBundle:
     """Create shared corpus with co-trained token and subtoken task heads.
 
@@ -109,7 +110,7 @@ def add_subtoken_temporal_tasks(
     ``2024-07-31``.  These labels classify temporal documents; they are not
     cross-sectional document sources.
     """
-    corpus = Corpus(rows, name=corpus_name, batch_size=batch_size)
+    corpus = Corpus(rows, name=corpus_name, batch_size=batch_size, batch_key=batch_key)
     required_labels = set(DOCUMENT_TASK_NAMES[1:])
     missing = sorted(required_labels - set(label_names))
     if missing:

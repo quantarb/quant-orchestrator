@@ -7,6 +7,7 @@ from quant_orchestrator.platforms.ml_frameworks.torch import (
     MultiRateTaskSpec,
     MultiRateTransformer,
     MultiRateTransformerConfig,
+    IssuerContextCache,
     build_attention_mask,
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import (
@@ -123,6 +124,188 @@ def test_model_accepts_family_presence_and_nan_imputation_path():
         daily_family_presence=torch.tensor([[[0.0, 1.0]]]),
     )
     assert torch.isfinite(output["token_states"]).all()
+
+
+def test_four_rate_cache_reuses_all_intermediate_states():
+    config = MultiRateTransformerConfig(
+        backbone="encoder_decoder", rates=("annual", "quarterly", "daily", "sparse"),
+        d_model=12, num_heads=3, layers=1, dropout=0.0,
+    )
+    model = MultiRateTransformer(
+        {rate: 2 for rate in config.rates}, config=config, tasks=(),
+    ).eval()
+    values = {rate: torch.randn(1, length, 2) for rate, length in {
+        "annual": 2, "quarterly": 3, "daily": 4, "sparse": 2,
+    }.items()}
+    with torch.no_grad():
+        first = model(values["daily"], values["annual"], values["quarterly"], values["sparse"], compute_document_outputs=False)
+    assert set(first["rate_cache"]) == set(config.rates)
+
+    original_project = model._project
+    model._project = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cached rate was projected again"))
+    try:
+        with torch.no_grad():
+            second = model(
+                values["daily"], values["annual"], values["quarterly"], values["sparse"],
+                rate_cache=first["rate_cache"], compute_document_outputs=False,
+            )
+    finally:
+        model._project = original_project
+    assert torch.allclose(first["rate_states"]["daily"], second["rate_states"]["daily"])
+    assert torch.allclose(first["rate_states"]["annual"], second["rate_states"]["annual"])
+    assert torch.allclose(first["rate_states"]["quarterly"], second["rate_states"]["quarterly"])
+    assert torch.allclose(first["rate_states"]["sparse"], second["rate_states"]["sparse"])
+
+
+def test_real_1t_corpus_builds_and_reuses_multirate_cache():
+    from pathlib import Path
+    import pandas as pd
+
+    root = Path(__file__).parents[1] / "artifacts" / "multi-rate-mtl" / "inputs" / "1T"
+    paths = {rate: root / f"{rate}.parquet" for rate in ("daily", "annual", "quarterly")}
+    if not all(path.exists() for path in paths.values()):
+        pytest.skip("local 1T corpus is not available")
+    frames = {rate: pd.read_parquet(path) for rate, path in paths.items()}
+    common = set(frames["daily"].symbol.astype(str)) & set(frames["annual"].symbol.astype(str)) & set(frames["quarterly"].symbol.astype(str))
+    symbol = sorted(common)[0]
+    selected = [column for column in frames["daily"].columns if column.startswith("value__")][:8]
+    prediction_date = min(pd.to_datetime(frames[rate].loc[frames[rate].symbol.eq(symbol), "date"]).max() for rate in frames)
+    arrays = {}
+    lengths = {"daily": 8, "annual": 3, "quarterly": 4}
+    for rate, frame in frames.items():
+        rows = frame.loc[frame.symbol.eq(symbol) & pd.to_datetime(frame.date).le(prediction_date)].sort_values("date").tail(lengths[rate])
+        arrays[rate] = torch.tensor(rows[selected].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(), dtype=torch.float32).unsqueeze(0)
+    config = MultiRateTransformerConfig(
+        backbone="encoder_decoder", rates=("annual", "quarterly", "daily"),
+        d_model=16, num_heads=4, layers=1, dropout=0.0,
+    )
+    model = MultiRateTransformer({rate: len(selected) for rate in config.rates}, config=config, tasks=()).eval()
+    with torch.no_grad():
+        first = model(arrays["daily"], arrays["annual"], arrays["quarterly"], compute_document_outputs=False)
+        second = model(
+            arrays["daily"], arrays["annual"], arrays["quarterly"],
+            rate_cache=first["rate_cache"], compute_document_outputs=False,
+        )
+    assert set(first["rate_cache"]) == {"annual", "quarterly", "daily"}
+    assert torch.isfinite(second["token_states"]).all()
+    assert torch.allclose(first["rate_states"]["daily"], second["rate_states"]["daily"])
+
+
+def test_fixed_32_call_put_universe_reuses_issuer_states_for_real_daily_documents():
+    """Exercise fixed option instruments against real issuer rate documents."""
+    from pathlib import Path
+    import pandas as pd
+
+    corpus_root = Path(__file__).parents[1] / "artifacts" / "multi-rate-mtl" / "inputs" / "1T"
+    option_path = Path(__file__).parents[1] / "notebooks" / "ml_trading" / "mlruns" / "2" / "12019faf781b4160a92d52490d68f806" / "artifacts" / "option_panel" / "option_candidate_panel.parquet"
+    required = [corpus_root / f"{rate}.parquet" for rate in ("daily", "annual", "quarterly")]
+    if not option_path.exists() or not all(path.exists() for path in required):
+        pytest.skip("real option/1T corpus is not available")
+
+    options = pd.read_parquet(option_path)
+    options["entry_date"] = pd.to_datetime(options["entry_date"])
+    options["expiration"] = pd.to_datetime(options["expiration"])
+    # The source panel has calls and puts on different entry dates. Select
+    # backwards from the newest date that has at least 32 contracts for each
+    # side, then freeze that universe for the backward-running experiment.
+    frames = {rate: pd.read_parquet(corpus_root / f"{rate}.parquet") for rate in ("daily", "annual", "quarterly")}
+    coverage = {}
+    for symbol in options.symbol.astype(str).str.upper().unique():
+        counts = {}
+        for rate, frame in frames.items():
+            rows = frame.loc[frame.symbol.astype(str).str.upper().eq(symbol)]
+            counts[rate] = int(rows.shape[0])
+        # Daily coverage dominates, but all three streams must exist. This
+        # prevents selecting a high-DTE contract whose issuer history is thin.
+        coverage[symbol] = min(counts["daily"] / 100.0, counts["quarterly"] / 4.0, counts["annual"] / 2.0)
+
+    opening = options.loc[
+        options.entry_date.ge("2026-01-01")
+        & options.option_type.isin(("call", "put"))
+    ].copy()
+    selected_parts = []
+    for option_type in ("call", "put"):
+        side = opening.loc[opening.option_type.eq(option_type)]
+        eligible_dates = (
+            side.groupby("entry_date").size().loc[lambda values: values >= 32]
+        )
+        selection_date = eligible_dates.index.max()
+        dated = side.loc[side.entry_date.eq(selection_date)].copy()
+        dated["symbol_coverage"] = dated.symbol.astype(str).str.upper().map(coverage).fillna(0.0)
+        symbol_counts = dated.groupby("symbol").size()
+        eligible_symbols = symbol_counts.loc[symbol_counts >= 32].index
+        if len(eligible_symbols):
+            dated = dated.loc[dated.symbol.isin(eligible_symbols)]
+        chosen_symbol = (
+            dated.groupby("symbol", as_index=False)["symbol_coverage"]
+            .max().sort_values(["symbol_coverage", "symbol"], ascending=[False, True])
+            .iloc[0]["symbol"]
+        )
+        selected_parts.append(
+            dated.loc[dated.symbol.eq(chosen_symbol)]
+            .sort_values(["volume", "contract_symbol"], ascending=[False, True])
+            .head(32)
+        )
+    fixed = pd.concat(selected_parts, ignore_index=True)
+    assert len(fixed) == 64
+    assert fixed.contract_symbol.nunique() == 64
+    assert fixed.groupby("option_type").size().to_dict() == {"call": 32, "put": 32}
+
+    prediction_date = pd.Timestamp("2026-04-10")
+    value_columns = [column for column in frames["daily"].columns if column.startswith("value__")][:8]
+    arrays_by_issuer = {}
+    for issuer in fixed.symbol.astype(str).str.upper().unique():
+        arrays_by_issuer[issuer] = {}
+        for rate, length in (("daily", 8), ("annual", 3), ("quarterly", 4)):
+            frame = frames[rate]
+            rows = frame.loc[
+                frame.symbol.astype(str).str.upper().eq(issuer)
+                & pd.to_datetime(frame.date).le(prediction_date)
+            ].sort_values("date").tail(length)
+            arrays_by_issuer[issuer][rate] = torch.tensor(
+                rows[value_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(),
+                dtype=torch.float32,
+            ).unsqueeze(0)
+
+    config = MultiRateTransformerConfig(
+        backbone="encoder_decoder", rates=("annual", "quarterly", "daily"),
+        d_model=16, num_heads=4, layers=1, dropout=0.0,
+    )
+    model = MultiRateTransformer(
+        {"annual": 8, "quarterly": 8, "daily": 14}, config=config, tasks=()
+    ).eval()
+    issuer_cache = IssuerContextCache(max_entries=4)
+    outputs = []
+    with torch.no_grad():
+        for _, option in fixed.iterrows():
+            spot = max(float(option.get("underlying_spot_entry", 1.0)), 1e-6)
+            option_features = torch.tensor([
+                float(option.get("strike", spot)) / spot,
+                float(pd.to_numeric(option.get("volume"), errors="coerce") or 0.0),
+                float(option.get("dte", 0.0)) / 100.0,
+                float(option.get("moneyness", 0.0)),
+                float(option.get("spread_pct", 0.0)),
+                float(option.get("entry_mid", 0.0)) / spot,
+            ], dtype=torch.float32)
+            option_features[1] = torch.log1p(option_features[1].clamp_min(0.0))
+            issuer_arrays = arrays_by_issuer[str(option.symbol).upper()]
+            daily = torch.cat([
+                issuer_arrays["daily"], option_features.view(1, 1, -1).expand(1, issuer_arrays["daily"].shape[1], -1)
+            ], dim=-1)
+            outputs.append(model(
+                daily, arrays_by_issuer[str(option.symbol).upper()]["annual"], arrays_by_issuer[str(option.symbol).upper()]["quarterly"],
+                issuer_context_cache=issuer_cache,
+                issuer_context_key=(str(option.symbol).upper(), prediction_date.isoformat()),
+                compute_document_outputs=False,
+            ))
+    assert len(issuer_cache) == fixed.symbol.nunique()
+    for issuer, group in fixed.groupby(fixed.symbol.astype(str).str.upper()):
+        indices = list(group.index)
+        first = outputs[indices[0]]
+        assert all(torch.allclose(first["rate_states"]["annual"], outputs[index]["rate_states"]["annual"]) for index in indices)
+        assert all(torch.allclose(first["rate_states"]["quarterly"], outputs[index]["rate_states"]["quarterly"]) for index in indices)
+    instrument_states = torch.cat([output["instrument_states"][:, -1] for output in outputs], dim=0)
+    assert torch.unique(instrument_states, dim=0).shape[0] > 1
 
 
 def test_auto_feature_engineer_has_temporal_and_cross_sectional_paths():

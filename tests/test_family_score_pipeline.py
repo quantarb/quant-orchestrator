@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import pytest
 from quant_warehouse.lineage import build_dataset_lineage_manifest, write_dataset_lineage_manifest
 
@@ -77,7 +78,7 @@ def _labels() -> pd.DataFrame:
 
 def _lineage_paths(tmp_path):
     feature_manifest = build_dataset_lineage_manifest(
-        _feature_panel(),
+        pl.from_pandas(_feature_panel()),
         dataset_id="features",
         dataset_kind="feature_panel",
         provider="fmp",
@@ -86,7 +87,7 @@ def _lineage_paths(tmp_path):
         recipe={"families": ["quality", "value"]},
     )
     label_manifest = build_dataset_lineage_manifest(
-        _labels(),
+        pl.from_pandas(_labels()),
         dataset_id="labels",
         dataset_kind="target_panel",
         provider="fmp",

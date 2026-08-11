@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import pytest
 from quant_warehouse.lineage import build_dataset_lineage_manifest, write_dataset_lineage_manifest
 
@@ -50,7 +51,7 @@ def test_annual_wfo_uses_prior_rows_bounds_oos_and_restarts(tmp_path):
         }
     )
     lineage = build_dataset_lineage_manifest(
-        panel,
+        pl.from_pandas(panel),
         dataset_id="features",
         dataset_kind="feature_panel",
         provider="test",
@@ -168,7 +169,7 @@ def test_annual_wfo_fits_feature_selection_on_prior_year_training_rows(tmp_path)
         }
     )
     lineage = build_dataset_lineage_manifest(
-        panel,
+        pl.from_pandas(panel),
         dataset_id="features",
         dataset_kind="feature_panel",
         provider="test",

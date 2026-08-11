@@ -10,6 +10,18 @@ The reusable PyTorch implementation lives at
 - `decoder_only`: one self-attention stack over concatenated rate tokens;
 - `encoder_decoder`: annual and quarterly encoders with a daily decoder.
 
+The default `cacheable_rate_states=True` mode keeps the multi-rate structure
+while making annual, quarterly, daily, and sparse encoder states reusable.
+The final document/task fusion is still run per instrument. Use the
+`rate_cache` returned by one forward pass (or
+`MultiRateTransformer.rate_cache_from_output`) on subsequent passes. Annual,
+quarterly, and sparse cache keys should include issuer and as-of date; daily
+keys should additionally include instrument identity. `IssuerContextCache`
+provides a bounded inference-time LRU for issuer-level state mappings.
+
+This cache is inference-only. Training must recompute states so gradients flow
+through the encoders.
+
 All layouts use `build_attention_mask`:
 
 - both modes use the same date-causal policy: same-date tokens attend

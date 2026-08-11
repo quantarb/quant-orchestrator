@@ -717,7 +717,10 @@ def _build_oracle_trade_label_rows_sparse(
             start=config.start_date,
             end=config.end_date,
         )
-        if prices is None or prices.empty:
+        if prices is None:
+            continue
+        prices_empty = prices.is_empty() if hasattr(prices, "is_empty") else prices.empty
+        if prices_empty:
             continue
         price_frames[symbol] = prices
 

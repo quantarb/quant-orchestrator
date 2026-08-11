@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Hashable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -32,6 +32,7 @@ class Corpus:
     rows: Sequence[Any]
     name: str = "corpus"
     batch_size: int = 1
+    batch_key: Callable[[Any], Hashable] | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -41,9 +42,52 @@ class Corpus:
         return len(self.rows)
 
     def batches(self, *, seed: int, epoch: int) -> Iterator[list[Any]]:
+        if self.batch_key is not None:
+            groups: dict[Hashable, list[int]] = {}
+            for index, row in enumerate(self.rows):
+                groups.setdefault(self.batch_key(row), []).append(index)
+            group_values = list(groups.values())
+            np.random.default_rng(seed + epoch).shuffle(group_values)
+            pending: list[int] = []
+            for group in group_values:
+                if pending and len(pending) + len(group) > self.batch_size:
+                    yield [self.rows[index] for index in pending]
+                    pending = []
+                # A large context group is split, but never mixed with another
+                # context. This keeps shared issuer tokens in the same batch.
+                if len(group) > self.batch_size:
+                    if pending:
+                        yield [self.rows[index] for index in pending]
+                        pending = []
+                    for start in range(0, len(group), self.batch_size):
+                        yield [self.rows[index] for index in group[start:start + self.batch_size]]
+                else:
+                    pending.extend(group)
+            if pending:
+                yield [self.rows[index] for index in pending]
+            return
         order = np.random.default_rng(seed + epoch).permutation(len(self.rows))
         for start in range(0, len(order), self.batch_size):
             yield [self.rows[index] for index in order[start:start + self.batch_size]]
+
+    def batch_count(self) -> int:
+        if self.batch_key is None:
+            return (len(self.rows) + self.batch_size - 1) // self.batch_size
+        groups: dict[Hashable, int] = {}
+        for row in self.rows:
+            key = self.batch_key(row)
+            groups[key] = groups.get(key, 0) + 1
+        count = 0; pending = 0
+        for size in groups.values():
+            if size > self.batch_size:
+                if pending:
+                    count += 1; pending = 0
+                count += (size + self.batch_size - 1) // self.batch_size
+            elif pending and pending + size > self.batch_size:
+                count += 1; pending = size
+            else:
+                pending += size
+        return count + bool(pending)
 
 
 CorpusTaskGroup = tuple[Corpus, tuple[Task, ...]]
@@ -68,6 +112,7 @@ class Trainer:
         *,
         grad_accumulation_steps: int = 1,
         seed: int = 0,
+        autocast_dtype: torch.dtype | None = None,
     ) -> None:
         if not corpus_tasks:
             raise ValueError("at least one corpus/task group is required")
@@ -78,6 +123,8 @@ class Trainer:
         self.optimizer = optimizer
         self.grad_accumulation_steps = grad_accumulation_steps
         self.seed = seed
+        self.autocast_dtype = autocast_dtype
+        self.grad_scaler = torch.amp.GradScaler("cuda", enabled=autocast_dtype == torch.float16 and torch.cuda.is_available())
         self.current_epoch = 0
         self.current_step = 0
         self._validate_groups()
@@ -91,6 +138,11 @@ class Trainer:
                 raise ValueError(f"corpus {corpus.name!r} contains duplicate tasks")
 
     def batches(self, epoch: int) -> Iterator[tuple[list[Any], tuple[Task, ...]]]:
+        if len(self.corpus_tasks) == 1:
+            corpus, tasks = self.corpus_tasks[0]
+            for batch in corpus.batches(seed=self.seed, epoch=epoch):
+                yield batch, tasks
+            return
         grouped = [
             [(batch, tasks) for batch in corpus.batches(seed=self.seed, epoch=epoch)]
             for corpus, tasks in self.corpus_tasks
@@ -109,14 +161,18 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             total = 0.0
             count = 0
-            epoch_batches = list(self.batches(epoch))
-            for step_index, (batch, tasks) in enumerate(epoch_batches):
+            total_batches = sum(corpus.batch_count() for corpus, _ in self.corpus_tasks)
+            for step_index, (batch, tasks) in enumerate(self.batches(epoch)):
                 self.current_step = step_index
-                task_losses = step(self.model, batch, tasks)
+                if self.autocast_dtype is not None and next(self.model.parameters()).is_cuda:
+                    with torch.autocast(device_type="cuda", dtype=self.autocast_dtype):
+                        task_losses = step(self.model, batch, tasks)
+                else:
+                    task_losses = step(self.model, batch, tasks)
                 missing = {task.name for task in tasks} - set(task_losses)
                 if missing:
                     raise ValueError(f"step did not return losses for tasks: {sorted(missing)}")
-                loss = self.backward_step(task_losses, tasks, step_index, step_index + 1 == len(epoch_batches))
+                loss = self.backward_step(task_losses, tasks, step_index, step_index + 1 == total_batches)
                 total += float(loss.detach())
                 count += 1
             losses.append(total / max(1, count))
@@ -138,10 +194,20 @@ class Trainer:
         loss = sum(task.loss_weight * task_losses[task.name] for task in tasks)
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss for tasks {[task.name for task in tasks]}")
-        (loss / self.grad_accumulation_steps).backward()
+        scaled_loss = loss / self.grad_accumulation_steps
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
         if (step_index + 1) % self.grad_accumulation_steps == 0 or last:
+            if self.grad_scaler.is_enabled():
+                self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
+            if self.grad_scaler.is_enabled():
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
         return loss
 
