@@ -255,3 +255,36 @@ or a full-run speedup have been completed.
 The unchanged v6 checkpoint also has a [completed adjusted-price backtest](multirate-v6-backtest.md)
 for separate 2024 and 2025 folds, including the fixed policy, costs, exposure,
 and issuer-equity buy-and-hold comparison.
+
+### 100B run and per-epoch portfolio evaluation
+
+The 100B expansion uses the stored FMP market-cap snapshot, a US NASDAQ/NYSE
+profile filter, and min_market_cap=100,000,000,000. The coverage/identity audit
+retains 116 equity symbols representing 114 issuers. It excludes missing
+pre-2024 history, missing required statements/irregular observations, and three
+listed debt securities requiring separate issuer/contract taxonomy. The existing
+AAPL annual option cohorts are also requested; this is not a broad option-chain
+training expansion. See `artifacts/multirate_recovery/100B/universe_audit_v6.json`
+for every candidate and exclusion. The retained statement gaps are recorded
+explicitly; no observations are invented to fill them.
+
+The pipeline is configured for 12 epochs with the same v6 model/objectives,
+FP32 batch 128, full available stored history from the 1900 request floor, and
+exclusive training cutoff 2024-01-01. It builds and audits before training, then
+scores 2024–2025 after training. Check `run_status.json` for the actual stage;
+configuration alone does not establish that training started or completed.
+
+`monitor_multirate_epochs.py --backtest-anchored-hits` snapshots each completed
+epoch, scores the full 2024 calendar (overriding the small NTP sample cap), and
+runs the anchored percentile long and short equity books. It reports return,
+maximum drawdown, entry events, mean gross exposure, and return change versus
+the prior epoch. Inputs use a shared frozen snapshot of adjusted equity prices.
+Each epoch stores NTP metrics, scores, equity curves, target weights, and action
+tapes under `train_long_v6/epoch_validation/epoch_NNNN/`. Console tables are saved
+to `epoch_validation.log`; 2025 remains outside this epoch monitor.
+
+The portfolio uses strict rank >0.80 thresholds, top-20 capacity, allocation
+1/min(20, equity universe size), and next-session-close execution. No Oracle
+gate applies. These evaluation results do not update gradients or choose the
+saved checkpoint; checkpoint selection still uses training loss. Full-calendar
+inference/backtests add runtime and may contend with training for the GPU.

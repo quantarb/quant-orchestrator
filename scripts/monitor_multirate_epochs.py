@@ -12,6 +12,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from quant_orchestrator.research_tools.epoch_evaluation import (
     option, evaluation_command, last_epoch_batches, trend_report, format_epoch_report,
+    anchored_epoch_backtest, format_backtest_report,
 )
 
 
@@ -32,6 +33,7 @@ def main():
     parser.add_argument('--max-samples', type=int, default=256)
     parser.add_argument('--poll-seconds', type=float, default=10)
     parser.add_argument('--training-pid', type=int, help='Detect training exit without stopping or modifying it')
+    parser.add_argument('--backtest-anchored-hits', action='store_true', help='Score the full validation calendar and run ranked HITS long/short backtests after every epoch.')
     parser.add_argument('--once', action='store_true', help='Evaluate the latest complete epoch once; fail if none exists')
     args = parser.parse_args()
     command = json.loads(args.command_file.read_text())
@@ -46,7 +48,8 @@ def main():
     latest = training / 'multirate_mtl_checkpoint_latest.pt'
     args.output_dir.mkdir(parents=True, exist_ok=True)
     configuration = dict(command=command, validation_start=args.validation_start,
-                         validation_end=args.validation_end, max_samples=args.max_samples)
+                         validation_end=args.validation_end, max_samples=0 if args.backtest_anchored_hits else args.max_samples,
+                         backtest_anchored_hits=args.backtest_anchored_hits)
     config_path = args.output_dir / 'configuration.json'
     if config_path.exists() and json.loads(config_path.read_text()) != configuration:
         raise ValueError('Existing monitor output has a different validation configuration; select a new output directory')
@@ -54,6 +57,9 @@ def main():
     previous_reports = sorted(args.output_dir.glob('epoch_*/epoch_metrics.json'))
     previous = json.loads(previous_reports[-1].read_text()) if previous_reports else None
     completed = previous['epoch'] if previous else 0
+    previous_backtest = None
+    if previous_reports and args.backtest_anchored_hits:
+        previous_backtest = json.loads((previous_reports[-1].parent/"backtest_metrics.json").read_text())
     signature = None
     def status(stage, **details):
         temporary = args.output_dir / 'status.json.tmp'
@@ -82,13 +88,17 @@ def main():
                     snapshot.replace(checkpoint)
                     status('evaluating', epoch=epoch+1)
                     invocation = evaluation_command(command, checkpoint.resolve(), directory.resolve(),
-                        args.validation_start, args.validation_end, args.max_samples)
+                        args.validation_start, args.validation_end, 0 if args.backtest_anchored_hits else args.max_samples)
                     (directory / 'command.json').write_text(json.dumps(invocation, indent=2))
                     with (directory / 'inference.log').open('w') as log:
                         result = subprocess.run(invocation, stdout=log, stderr=subprocess.STDOUT)
                     if result.returncode:
                         raise RuntimeError(f'Epoch {epoch+1} evaluation failed; inspect {directory / "inference.log"}')
                     report = trend_report(epoch+1, json.loads((directory/'ntp_evaluation.json').read_text()), previous)
+                    if args.backtest_anchored_hits:
+                        status('backtesting', epoch=epoch+1)
+                        previous_backtest = anchored_epoch_backtest(command, directory, args.validation_start, args.validation_end, previous_backtest)
+                        print(f"backtest_epoch: {epoch+1}\n" + format_backtest_report(previous_backtest), flush=True)
                     (directory/'epoch_metrics.json').write_text(json.dumps(report, indent=2))
                     print(format_epoch_report(report), flush=True)
                     previous, completed = report, epoch+1

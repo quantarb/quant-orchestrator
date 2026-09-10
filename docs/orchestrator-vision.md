@@ -223,3 +223,5 @@ Polars replay of the older HITS daily-percentile equity policy, with separate
 long/short books and explicit next-session-close execution. The executed v6
 comparison and its fixed-weight accounting limits are documented in
 [multirate-v6-backtest.md](multirate-v6-backtest.md).
+The epoch monitor can additionally score the full validation calendar and print
+anchored HITS long/short portfolio returns after each immutable epoch checkpoint.
