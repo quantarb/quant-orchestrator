@@ -64,11 +64,6 @@ OPTION_FEATURES = (
     "mean_entry_bid",
     "mean_entry_ask",
 )
-# Options are instrument documents, not a separate target family. They use
-# the same Oracle/HITS/fund/holder supervised heads as equity documents.
-OPTION_SUPERVISED_TASK_NAMES: tuple[str, ...] = ()
-
-
 def matryoshka_alignment_loss(embedding: torch.Tensor, dimensions: tuple[int, ...]) -> torch.Tensor:
     """Keep nested prefixes useful at multiple retrieval dimensions.
 
@@ -1031,8 +1026,6 @@ def main() -> None:
             "quarterly_context_key": (source_symbol, rate_version("quarterly", quarterly_index, source_symbol, anchor)),
             "sector": str(taxonomy.loc[symbol, "sector"]), "subsector": str(taxonomy.loc[symbol, "subsector"]),
             "industry": str(taxonomy.loc[symbol, "industry"]),
-            "option_targets": np.nan_to_num(option_target_map.get((symbol, anchor.normalize()), np.zeros(2, dtype="float32")), nan=0.0).astype("float32"),
-            "option_valid": np.isfinite(option_target_map.get((symbol, anchor.normalize()), np.full(2, np.nan, dtype="float32"))),
         }
         samples.append(_LazySample(metadata, materialize) if args.stream_samples else {**metadata, **materialize()})
     if args.max_samples:
@@ -1179,14 +1172,10 @@ def main() -> None:
         task for task in task_bundle.document_tasks + task_bundle.supervised_tasks
         if task.task_name in enabled_document_tasks or task.task_name not in DOCUMENT_TASK_NAMES
     )
-    if option_columns:
-        model_tasks = (*model_tasks, *(MultiRateTaskSpec(name, level="token", output_dim=1, source="daily") for name in OPTION_SUPERVISED_TASK_NAMES))
     active_tasks = tuple(task for task in task_bundle.tasks if task.name in {spec.task_name for spec in model_tasks} or task.name in {spec.task_name for spec in task_bundle.prediction_tasks})
-    if option_columns:
-        active_tasks = (*active_tasks, *(Task(name, spec="option_return") for name in OPTION_SUPERVISED_TASK_NAMES))
     if mrl_dimensions:
         active_tasks = (*active_tasks, Task("mrl", spec="matryoshka_document_alignment", loss_weight=args.mrl_weight))
-    expected_task_names = tuple(enabled_document_tasks) + SUPERVISED_TARGET_TASK_NAMES + (OPTION_SUPERVISED_TASK_NAMES if option_columns else ()) + PREDICTION_TASK_NAMES
+    expected_task_names = tuple(enabled_document_tasks) + SUPERVISED_TARGET_TASK_NAMES + PREDICTION_TASK_NAMES
     model = MultiRateTransformer(
         {"annual": len(annual_value_columns), "quarterly": len(quarterly_value_columns), "daily": len(daily_value_columns), "sparse": len(sparse_value_columns)},
         config=config,
@@ -1336,14 +1325,6 @@ def main() -> None:
                 task_losses[name] = nn.functional.binary_cross_entropy_with_logits(prediction[valid], target[valid])
             else:
                 task_losses[name] = nn.functional.smooth_l1_loss(prediction[valid], target[valid])
-        if option_columns:
-            option_targets = stack("option_targets")
-            option_valid = stack("option_valid").bool()
-            for option_index, name in enumerate(OPTION_SUPERVISED_TASK_NAMES):
-                valid = option_valid[:, option_index]
-                if valid.any():
-                    prediction = output["token_outputs"][name][:, -1, 0]
-                    task_losses[name] = nn.functional.smooth_l1_loss(prediction[valid], option_targets[valid, option_index])
         family_labels = torch.arange(len(family_names), device=device).view(1, -1).expand(len(batch), -1)
         family_valid = torch.zeros((len(batch), len(family_names)), dtype=torch.bool, device=device)
         for rate in ("annual", "quarterly", "daily", "sparse"):
@@ -1506,11 +1487,6 @@ def main() -> None:
                     name: torch.sigmoid(output["token_outputs"][name].squeeze(-1)).cpu().numpy()
                     for name in score_names
                 }
-                if option_columns:
-                    score_arrays.update({
-                        name: output["token_outputs"][name].squeeze(-1).cpu().numpy()
-                        for name in OPTION_SUPERVISED_TASK_NAMES
-                    })
                 for row_index, item in enumerate(batch):
                     dates = [pd.Timestamp(value) for value in item["daily_dates"]]
                     offset = DAILY_WINDOW - len(dates)
@@ -1586,7 +1562,6 @@ def main() -> None:
         "option_dte": sorted(option_dtes) if args.option_panel else None,
         "option_issuer_dte_bins": args.option_issuer_dte_bins if args.option_panel else None,
         "option_features": list(OPTION_FEATURES) if option_columns else [],
-        "option_supervised_tasks": list(OPTION_SUPERVISED_TASK_NAMES) if option_columns else [],
         "universe_filter": {"country": args.country, "currency": args.currency, "exchanges": sorted(exchanges), "symbols": sorted(universe_symbols), "currency_unresolved_symbols": sorted(unresolved_currency)},
     })
     metrics["context_cache"] = {
