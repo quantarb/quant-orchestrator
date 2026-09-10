@@ -210,6 +210,7 @@ The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
 within-step issuer encoding. See the [streaming milestone](multirate-streaming-milestone.md) for the
 training contract, verification commands, and remaining real-data limits.
 Its intended decision is instrument selection conditional on issuer state and
-date, across asset classes. Independent instrument predictions currently exist;
-within-issuer comparison training and comparable warehouse outcome targets are
+date, across asset classes, using instrument-specific Oracle actions and HITS
+scores as the primary supervised targets. These predictions are wired to issuer
+context; multi-asset chronological evaluation and issuer-context ablation are
 still needed, as described in that milestone.

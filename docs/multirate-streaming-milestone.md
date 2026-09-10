@@ -31,28 +31,36 @@ routing; PyTorch supplies attention, automatic differentiation, and optimization
 
 ## Instrument selection objective
 
-The user's intended decision is to select the appropriate instrument given an
-issuer's state at a date. Issuer identity is reference metadata; predicting its
-identity does not establish instrument-selection skill. The current independent
-Oracle/HITS predictions and self-supervised tasks are auxiliary foundations;
-there is no implemented cross-instrument selection objective yet.
+The trading objective is to learn each instrument's Oracle actions and HITS
+scores conditional on issuer state, instrument history, and asset class. These
+are the primary supervised targets. Masked-token and next-observation tasks
+support representation learning. Issuer identity is metadata; predicting its
+identity does not establish trading skill.
 
-The next training change needs issuer/date candidate groups, an instrument
-utility head, and a comparison loss within each group. Warehouse-prepared
-outcomes must use a declared common horizon, capital convention, and outcome
-criterion. The criterion (raw return, risk-adjusted return, or a mandate) still
-needs to be settled. Do not silently compare asset-specific Oracle/HITS labels
-as if they were interchangeable utilities. Candidate eligibility must use only
-information available at the decision date, and label availability must precede
-the training cutoff. Event-only selection groups must remain separate from the
-full-calendar scoring universe.
+The trainer already applies Oracle binary classification losses and HITS
+regression losses to the fused instrument representation. Tests demonstrate
+that an instrument loss reaches the issuer encoders. The recorded smoke run
+contains supervised observations for equity and synthetic option baskets only;
+nonzero gradients establish an optimization path, not useful generalization or
+optimal trading. Oracle optimality is relative to the label generator's
+execution assumptions and constraints.
 
-Chronological evaluation should measure the chosen instrument's realized utility
-and regret versus eligible alternatives, alongside per-asset coverage and
-simple selection baselines. Actual debt/preferred instruments need their own
-histories and terms; adjusted price paths alone do not validate complete coupon,
-redemption, credit, or execution economics. Keep group assembly in bounded
-Polars partitions and issuer-context reuse inside a gradient-preserving step.
+Use warehouse-generated HITS and Oracle labels from each instrument's own
+history, with event-only supervision and label availability before the training
+cutoff. Do not copy equity labels onto debt, preferred shares, or options. A new
+utility head or common fixed-horizon target is not required by this objective.
+Comparing predicted HITS scores across instruments still requires checking the
+label generator's normalization and graph scope. Full-calendar scoring and
+strategy evaluation remain separate from supervised event rows.
+
+The next evidence needed is a multi-issuer, multi-asset chronological run with
+per-class Oracle/HITS evaluation and issuer-context ablation. Compare the full
+model with an otherwise matched model trained without issuer context; merely
+observing gradients cannot show that issuer information improves predictions.
+Actual debt/preferred instruments need their own histories and terms; adjusted
+price paths alone do not validate complete coupon, redemption, credit, or
+execution economics. Keep data assembly in bounded Polars partitions and issuer
+context reuse inside a gradient-preserving step.
 
 ## Memory contract
 
