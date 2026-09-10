@@ -41,7 +41,8 @@ Current reusable code placement:
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.
 
 The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
-within-step issuer encoding. Corpora now require explicit `asset_class` metadata;
-the historical smoke taxonomy must be annotated before reuse. Oracle/HITS
-training is wired; broader asset-class validation remains pending. See the [streaming milestone](../docs/multirate-streaming-milestone.md) for the
-training contract, verification commands, and remaining real-data limits.
+within-step issuer encoding. Oracle/HITS supervise instrument-specific decisions.
+Masked and next-observation objectives reconstruct individual values at token
+and subtoken levels, using both whole-observation and individual-value masking.
+See the [reconstruction contract](../docs/multirate-reconstruction.md) for the objective details, checkpoint
+requirements, executed diagnostic scope, and longer-history 1T experiment.

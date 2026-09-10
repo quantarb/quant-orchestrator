@@ -1,336 +1,93 @@
-"""Build annual, quarterly, daily, and sparse-event MTL input tables."""
+"""Build a bounded Polars multi-rate corpus from stored warehouse observations."""
 
-from __future__ import annotations
-
+from datetime import datetime
 import argparse
 import json
-import os
-import re
-import sys
 from pathlib import Path
-
-import numpy as np
-import pandas as pd
+import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "quant-warehouse"))
-
-from quant_warehouse import Warehouse
-from quant_warehouse.research_tools.feature_family_eval import (
-    FamilyEvaluationConfig,
-    build_fundamental_feature_panel,
-)
-from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.text_embeddings import (
-    canonical_row_text,
-    encode_frozen_text_rows,
-)
 
 
-FAMILIES = (
-    "fmp.economic_indicators", "fmp.fmp_balance_mcap", "fmp.fmp_cash_mcap",
-    "fmp.fmp_company_news", "fmp.fmp_daily_ev_multiple", "fmp.fmp_daily_ev_yield",
-    "fmp.fmp_daily_mcap_multiple", "fmp.fmp_daily_mcap_yield", "fmp.fmp_employee_count",
-    "fmp.fmp_esg_scores", "fmp.fmp_historical_ratings", "fmp.fmp_income_mcap",
-    "fmp.fmp_institutional_position_summary", "fmp.fmp_quarterly_financial_estimates",
-    "fmp.industry_pe", "fmp.industry_performance", "fmp.sector_pe", "fmp.sector_performance",
-    "fmp.time_calendar", "fmp.treasury_rates", "financetoolkit.ft_growth_balance",
-    "financetoolkit.ft_growth_cash", "financetoolkit.ft_growth_income",
-    "financetoolkit.ft_ratios_efficiency", "financetoolkit.ft_ratios_liquidity",
-    "financetoolkit.ft_ratios_profitability", "financetoolkit.ft_ratios_solvency",
-    "financetoolkit.ft_ratios_valuation",
-)
-
-# These families are backed by FMP/OpenBB routes that accept an explicit
-# annual or quarterly period.  The corpus keeps both provider-period versions
-# as distinct feature families.
-DUAL_PERIOD_FAMILIES = frozenset({
-    "fmp.fmp_balance_mcap", "fmp.fmp_cash_mcap", "fmp.fmp_income_mcap",
-    "financetoolkit.ft_growth_balance", "financetoolkit.ft_growth_cash",
-    "financetoolkit.ft_growth_income", "financetoolkit.ft_ratios_efficiency",
-    "financetoolkit.ft_ratios_liquidity", "financetoolkit.ft_ratios_profitability",
-    "financetoolkit.ft_ratios_solvency", "financetoolkit.ft_ratios_valuation",
-})
-QUARTER_ONLY_FAMILIES = frozenset({"fmp.fmp_quarterly_financial_estimates"})
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        print("error: " + json.dumps(message))
+        self.print_help(sys.stdout)
+        raise SystemExit(2)
 
 
-def _canonical_issuer_key(profile: object | None, symbol: str) -> str:
-    """Build a stable issuer label independent of share-class symbols."""
-    cik = str(getattr(profile, "cik", None) or "").strip()
-    if cik and cik.lower() not in {"none", "nan"}:
-        return f"cik:{cik}"
-    company_name = str(getattr(profile, "company_name", None) or "").strip()
-    normalized_name = re.sub(r"\s+", " ", company_name).casefold()
-    if normalized_name and normalized_name not in {"none", "nan"}:
-        return f"name:{normalized_name}"
-    return f"symbol:{str(symbol).strip().upper()}"
-
-
-def _load_project_credentials() -> None:
-    """Load the shared project .env before invoking OpenBB/FMP."""
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        return
-    project_root = Path(__file__).resolve().parents[2]
-    candidates = (
-        project_root / "quant-warehouse" / ".env",
-        project_root / "optimal_trader" / ".env",
-        project_root / ".env",
+def main():
+    parser = Parser(
+        description=__doc__,
+        epilog="Example: python scripts/build_multirate_mtl_corpus.py --instrument-roster roster.csv --output-dir artifacts/corpus --end-date 2025-12-31 --option-issuers AAPL",
     )
-    for path in candidates:
-        if path.exists():
-            load_dotenv(path, override=False)
-
-
-def _subsector_map(symbols: tuple[str, ...]) -> dict[str, str]:
-    """Read FMP/OpenBB ``subSector`` classifications for the symbol universe."""
-    _load_project_credentials()
-    try:
-        from quant_warehouse.ingest.constituent_fetch import fetch_index_constituents
-
-        rows = fetch_index_constituents(("sp500", "nasdaq", "dowjones"))
-    except Exception as exc:
-        print(f"warning: unable to load OpenBB/FMP subsectors: {exc}", flush=True)
-        return {}
-    wanted = set(symbols)
-    result: dict[str, str] = {}
-    for row in rows:
-        symbol = str(row.get("symbol") or row.get("ticker") or "").strip().upper()
-        subsector = str(
-            row.get("subSector") or row.get("sub_sector") or row.get("subsector") or ""
-        ).strip()
-        if symbol in wanted and subsector and subsector.lower() not in {"nan", "none"}:
-            result.setdefault(symbol, subsector)
-    return result
-
-
-def _family_values(panel: pd.DataFrame, metadata: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    base = panel[["symbol", "date"]].copy()
-    base["symbol"] = base["symbol"].astype(str).str.upper()
-    families: list[str] = []
-    for family, group in metadata.groupby("family", sort=True):
-        columns = [str(value) for value in group.feature if str(value) in panel.columns]
-        if not columns:
-            continue
-        numeric = panel[columns].apply(pd.to_numeric, errors="coerce")
-        token = pd.DataFrame({
-            "symbol": base["symbol"], "date": pd.to_datetime(base["date"], errors="coerce"),
-            f"value__{family}": numeric.mean(axis=1),
-            f"presence__{family}": numeric.notna().any(axis=1).astype("float32"),
-        })
-        base = base.merge(token, on=["symbol", "date"], how="left", validate="one_to_one")
-        families.append(str(family))
-    return base.sort_values(["symbol", "date"]).reset_index(drop=True), families
-
-
-def _rate_table(daily: pd.DataFrame, families: list[str], rate: str) -> pd.DataFrame:
-    work = daily.copy()
-    if rate == "daily":
-        return work
-    dates = pd.to_datetime(work["date"])
-    work["_period"] = dates.dt.to_period("Q" if rate == "quarterly" else "Y").astype(str)
-    group_columns = ["symbol", "_period"]
-    aggregations: dict[str, str] = {f"value__{family}": "mean" for family in families}
-    aggregations.update({f"presence__{family}": "max" for family in families})
-    out = work.groupby(group_columns, sort=True).agg(aggregations).reset_index()
-    dates_by_period = work.groupby(group_columns, sort=True)["date"].max().rename("date").reset_index()
-    out = out.merge(dates_by_period, on=group_columns, how="left", validate="one_to_one")
-    return out.drop(columns=["_period"], errors="ignore").sort_values(["symbol", "date"]).reset_index(drop=True)
-
-
-def _build_sparse_events(events: pd.DataFrame, output: Path, device: str) -> list[str]:
-    if events.empty:
-        empty = pd.DataFrame({
-            "symbol": pd.Series(dtype="string"),
-            "date": pd.Series(dtype="datetime64[ns]"),
-            "event_date": pd.Series(dtype="datetime64[ns]"),
-            "target_family": pd.Series(dtype="string"),
-            "signal_value": pd.Series(dtype="float32"),
-            **{f"text_{index}": pd.Series(dtype="float32") for index in range(7)},
-        })
-        empty.to_parquet(output / "sparse_events.parquet", index=False)
-        return []
-    events = events.copy()
-    # Rebuilding a corpus from an already encoded sparse-event table should
-    # preserve its frozen text vectors rather than treating them as raw
-    # numeric event fields and embedding an empty string again.
-    encoded_columns = {"symbol", "date", "target_family", "event_date", "signal_value", *[f"text_{i}" for i in range(7)]}
-    if encoded_columns.issubset(events.columns):
-        encoded = events[list(encoded_columns)].copy()
-        encoded["symbol"] = encoded["symbol"].astype(str).str.upper()
-        encoded["date"] = pd.to_datetime(encoded["date"], errors="coerce", utc=True)
-        encoded["event_date"] = pd.to_datetime(encoded["event_date"], errors="coerce", utc=True)
-        encoded = encoded.loc[encoded["event_date"].notna() & encoded["target_family"].notna()]
-        encoded.sort_values(["symbol", "date", "event_date"]).to_parquet(output / "sparse_events.parquet", index=False)
-        return sorted(encoded["target_family"].astype(str).unique())
-    events["symbol"] = events["symbol"].astype(str).str.upper()
-    events["event_date"] = pd.to_datetime(events["event_date"], errors="coerce", utc=True)
-    if "reported_date" in events:
-        events["reported_date"] = pd.to_datetime(events["reported_date"], errors="coerce", utc=True)
-    events = events.loc[events["event_date"].notna() & events["target_family"].notna()].copy()
-    target_families = sorted(events["target_family"].astype(str).unique())
-    excluded = {"symbol", "event_date", "reported_date", "target_family", "raw_json", "source_event_id"}
-    text_columns = [
-        column for column in events.columns
-        if column not in excluded
-        and not pd.api.types.is_numeric_dtype(events[column])
-        and not pd.api.types.is_datetime64_any_dtype(events[column])
-    ]
-    numeric_columns = [
-        column for column in events.columns
-        if column not in excluded and pd.api.types.is_numeric_dtype(events[column])
-    ]
-    events["signal_value"] = events[numeric_columns].apply(pd.to_numeric, errors="coerce").mean(axis=1) if numeric_columns else 0.0
-    events["event_text"] = canonical_row_text(events, text_columns) if text_columns else ""
-    text_values = encode_frozen_text_rows(
-        events["event_text"].tolist(), model_name="axiotic/ogma-small", device=device, local_files_only=True,
-    )[:, :7]
-    rows: list[dict[str, object]] = []
-    for index, event in events.reset_index(drop=True).iterrows():
-        availability = event.get("reported_date") if pd.notna(event.get("reported_date")) else event["event_date"]
-        row = {"symbol": event["symbol"], "date": availability, "target_family": str(event["target_family"]), "event_date": event["event_date"]}
-        row["signal_value"] = float(event["signal_value"]) if pd.notna(event["signal_value"]) else 0.0
-        for dimension, value in enumerate(text_values[index]):
-            row[f"text_{dimension}"] = float(value)
-        rows.append(row)
-    sparse = pd.DataFrame(rows).sort_values(["symbol", "date", "event_date"]).reset_index(drop=True)
-    sparse.to_parquet(output / "sparse_events.parquet", index=False)
-    return target_families
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", type=Path, help="Optional symbol file; omitted by default so the universe is discovered from FMP profiles.")
-    parser.add_argument("--target-events", type=Path, help="Optional raw target-event parquet; omitted by default.")
     parser.add_argument(
-        "--fund-activity-events",
+        "--instrument-roster",
         type=Path,
-        default=None,
-        help="Optional parquet fund_activity target events to append to target-events.",
+        required=True,
+        help="CSV with symbol, underlying_symbol, issuer, asset_class and instrument terms",
     )
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--chunk-size", type=int, default=100)
-    parser.add_argument("--text-device", default="cuda")
-    parser.add_argument("--start-date", default="1900-01-01")
-    parser.add_argument("--market-cap-min", type=float, default=10_000_000_000)
-    parser.add_argument("--country", default="US")
-    parser.add_argument("--exchanges", default="NYSE,NASDAQ,AMEX")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="New output directory; existing corpora are never overwritten",
+    )
+    parser.add_argument(
+        "--start-date", default="1900-01-01",
+        help="Inclusive observation start (YYYY-MM-DD); default 1900-01-01 reads all available stored history",
+    )
+    parser.add_argument("--end-date", required=True, help="Inclusive observation end (YYYY-MM-DD)")
+    parser.add_argument(
+        "--option-issuers",
+        default="",
+        help="Comma-separated issuers for actual annual call/put cohorts; default none",
+    )
+    parser.add_argument(
+        "--options-start-year",
+        type=int,
+        default=2023,
+        help="First annual option cohort; default 2023",
+    )
+    if len(sys.argv) == 1:
+        print("bin: " + json.dumps(str(Path(__file__).resolve())))
+        print("description: Build a Polars multi-rate corpus from stored warehouse data")
+        print("help: Run with --help for required inputs and an example")
+        return
     args = parser.parse_args()
-    warehouse = Warehouse()
-    if args.symbols is not None:
-        symbols = tuple(sorted(pd.read_csv(args.symbols)["symbol"].astype(str).str.upper().unique()))
-    else:
-        exchanges = tuple(value.strip().upper() for value in args.exchanges.split(",") if value.strip())
-        profiles = warehouse.catalog.query_symbol_profiles(
-            provider="fmp", min_market_cap=args.market_cap_min, country=args.country,
-            exchanges=exchanges, exclude_etf=True, exclude_fund=True, limit=100_000,
+    try:
+        start, end = datetime.fromisoformat(args.start_date), datetime.fromisoformat(args.end_date)
+    except ValueError:
+        parser.error("Use ISO dates for --start-date and --end-date")
+    if start >= end or not args.instrument_roster.is_file() or args.output_dir.exists():
+        parser.error(
+            "Require start before end, an existing roster file, and a new output directory"
         )
-        symbols = tuple(sorted({str(profile.symbol).strip().upper() for profile in profiles if str(profile.symbol).strip()}))
-        print(f"discovered FMP universe: {len(symbols)} symbols", flush=True)
-    if not symbols:
-        raise RuntimeError("No symbols available from the requested FMP universe")
-    subsectors = _subsector_map(symbols)
-    output = args.output_dir
-    output.mkdir(parents=True, exist_ok=True)
-    profiles = warehouse.catalog.query_symbol_profiles(
-        provider="fmp", min_market_cap=args.market_cap_min, country=args.country,
-        exchanges=tuple(value.strip().upper() for value in args.exchanges.split(",") if value.strip()),
-        exclude_etf=True, exclude_fund=True,
-        limit=100_000,
-    )
-    valid_symbols = {str(profile.symbol).strip().upper() for profile in profiles}
-    symbols = tuple(symbol for symbol in symbols if symbol in valid_symbols)
-    if not symbols:
-        raise RuntimeError("No eligible US $10B+ symbols overlap the requested symbol file")
-    print(f"feature build universe: {len(symbols)} eligible US $10B+ symbols", flush=True)
-    config = FamilyEvaluationConfig(
-        market_cap_min=0, country="", exchanges=(), screen_limit=100_000,
-        start_date=args.start_date,
-    )
-    daily_parts: list[pd.DataFrame] = []
-    metadata_parts: list[pd.DataFrame] = []
-    for start in range(0, len(symbols), max(1, args.chunk_size)):
-        chunk = symbols[start:start + max(1, args.chunk_size)]
-        panel_parts: list[pd.DataFrame] = []
-        metadata_parts_for_chunk: list[pd.DataFrame] = []
-        dual_families = sorted(DUAL_PERIOD_FAMILIES)
-        for period in ("quarter", "annual"):
-            period_panel, period_metadata, _, _ = build_fundamental_feature_panel(
-                chunk,
-                config,
-                warehouse=warehouse,
-                strategy_sources=dual_families,
-                broadcast_to_target=True,
-                fundamental_period=period,
-                family_suffix="quarterly" if period == "quarter" else "annual",
-            )
-            panel_parts.append(period_panel)
-            metadata_parts_for_chunk.append(period_metadata)
+    import polars as pl
+    from quant_orchestrator.research_tools.multirate_corpus import build_fresh_corpus
 
-        quarterly_only_panel, quarterly_only_metadata, _, _ = build_fundamental_feature_panel(
-            chunk,
-            config,
-            warehouse=warehouse,
-            strategy_sources=sorted(QUARTER_ONLY_FAMILIES),
-            broadcast_to_target=True,
-            fundamental_period="quarter",
-            family_suffix="quarterly",
+    try:
+        manifest = build_fresh_corpus(
+            args.output_dir,
+            roster=pl.read_csv(args.instrument_roster),
+            start=args.start_date,
+            end=args.end_date,
+            options_start_year=args.options_start_year,
+            option_issuers=tuple(
+                s.strip().upper() for s in args.option_issuers.split(",") if s.strip()
+            ),
         )
-        panel_parts.append(quarterly_only_panel)
-        metadata_parts_for_chunk.append(quarterly_only_metadata)
-
-        non_period_families = sorted(set(FAMILIES).difference(DUAL_PERIOD_FAMILIES).difference(QUARTER_ONLY_FAMILIES))
-        non_period_panel, non_period_metadata, _, _ = build_fundamental_feature_panel(
-            chunk,
-            config,
-            warehouse=warehouse,
-            strategy_sources=non_period_families,
-            broadcast_to_target=True,
+    except Exception as exc:
+        print(
+            "error: " + json.dumps(str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
         )
-        panel_parts.append(non_period_panel)
-        metadata_parts_for_chunk.append(non_period_metadata)
-
-        panel = panel_parts[0]
-        for part in panel_parts[1:]:
-            extra = part.drop(columns=["close", "daily_market_cap", *[c for c in part.columns if c.startswith("forward_return_")]], errors="ignore")
-            panel = panel.merge(extra, on=["symbol", "date"], how="outer", validate="one_to_one")
-        metadata = pd.concat(metadata_parts_for_chunk, ignore_index=True).drop_duplicates()
-        values, families = _family_values(panel, metadata)
-        daily_parts.append(values)
-        metadata_parts.append(pd.DataFrame({"family": families}))
-        print(f"processed {min(start + len(chunk), len(symbols))}/{len(symbols)}", flush=True)
-    daily = pd.concat(daily_parts, ignore_index=True).sort_values(["symbol", "date"]).reset_index(drop=True)
-    families = sorted({str(value) for part in metadata_parts for value in part["family"]})
-    # Keep the live feature schema aligned with the 2024 checkpoint.  Macro
-    # context is optional for scoring, but the checkpoint has these two input
-    # families; neutral values preserve the learned tensor layout.
-    for family in ("economic_indicators", "treasury_rates"):
-        value_column = f"value__{family}"
-        presence_column = f"presence__{family}"
-        if value_column not in daily.columns:
-            daily[value_column] = 0.0
-        if presence_column not in daily.columns:
-            daily[presence_column] = 0.0
-        families.append(family)
-    families = sorted(set(families))
-    for rate in ("daily", "quarterly", "annual"):
-        _rate_table(daily, families, rate).to_parquet(output / f"{rate}.parquet", index=False)
-    target_events = pd.read_parquet(args.target_events) if args.target_events is not None else pd.DataFrame()
-    if args.fund_activity_events is not None:
-        fund_activity_events = pd.read_parquet(args.fund_activity_events)
-        target_events = pd.concat([target_events, fund_activity_events], ignore_index=True, sort=False)
-    target_families = _build_sparse_events(target_events, output, args.text_device)
-    profiles = warehouse.catalog.query_symbol_profiles(provider="fmp", min_market_cap=0, country="", exchanges=(), exclude_etf=True, exclude_fund=True, limit=100_000)
-    profiles_by_symbol = {str(profile.symbol).strip().upper(): profile for profile in profiles}
-    taxonomy = pd.DataFrame([
-        {"symbol": symbol, "asset_class": "equity", "issuer": _canonical_issuer_key(profiles_by_symbol.get(symbol), symbol),
-         "sector": (getattr(profiles_by_symbol.get(symbol), "sector", None) or "Unknown"),
-         "subsector": subsectors.get(symbol, "Unknown"),
-         "industry": (getattr(profiles_by_symbol.get(symbol), "industry", None) or "Unknown")}
-        for symbol in symbols
-    ])
-    taxonomy.to_csv(output / "taxonomy.csv", index=False)
-    (output / "manifest.json").write_text(json.dumps({"symbols": len(symbols), "feature_families": families, "target_families": target_families}, indent=2))
+        print(
+            "help: Inspect warehouse coverage and use a new --output-dir after repairing the input"
+        )
+        raise SystemExit(1) from None
+    print("status: complete")
+    print("manifest: " + json.dumps(str(args.output_dir / "manifest.json")))
+    print("asset_classes: " + json.dumps(",".join(manifest["asset_classes"])))
 
 
 if __name__ == "__main__":

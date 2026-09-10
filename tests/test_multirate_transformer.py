@@ -33,7 +33,9 @@ def _tasks():
 
 def test_subtoken_temporal_task_factory_defines_exact_contract():
     labels = {name: ("a", "b") for name in ("issuer", "symbol", "industry", "sector", "subsector", "date")}
-    bundle = add_subtoken_temporal_tasks(({"row": 1},), ("feature_family", "target_family"), labels)
+    bundle = add_subtoken_temporal_tasks(({"row": 1},), ("feature_family", "target_family"), labels,
+        feature_dimensions={rate: (1, 3) for rate in ("annual", "quarterly", "daily", "sparse")})
+    assert all(task.output_dim == (4 if task.level == "token" else 3) for task in bundle.prediction_tasks)
     assert bundle.task_names == TEMPORAL_MTL_TASK_NAMES
     assert len(bundle.corpus) == 1
     assert len(bundle.document_tasks) == 7

@@ -27,7 +27,10 @@ from torch import nn
 from quant_warehouse import Warehouse
 from quant_orchestrator.research_tools.streaming_context import StreamingContext
 from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups
-from quant_orchestrator.research_tools.multirate_objectives import next_observation_targets
+from quant_orchestrator.research_tools.multirate_objectives import (
+    RECONSTRUCTION_CONTRACT, reconstruction_mask, reconstruction_targets, family_channels,
+)
+from quant_orchestrator.research_tools.multirate_audit import verify_corpus_files
 
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import (
     DOCUMENT_PROTOTYPE_STATS,
@@ -581,12 +584,17 @@ def _add_executable_option_return(options: pl.DataFrame) -> pl.DataFrame:
 
 
 def main() -> None:
+    global ANNUAL_WINDOW, QUARTERLY_WINDOW, DAILY_WINDOW
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, help="Load an existing multirate_mtl_model.pt for inference without optimizer steps.")
     parser.add_argument("--inference-only", action="store_true", help="Skip training and export predictions from --checkpoint.")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--annual-window", type=int, default=252)
+    parser.add_argument("--quarterly-window", type=int, default=252)
+    parser.add_argument("--daily-window", type=int, default=252)
+    parser.add_argument("--issuer-context", choices=("full", "none"), default="full", help="Train a matched ablation without annual/quarterly or issuer daily/irregular context")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument(
@@ -679,6 +687,7 @@ def main() -> None:
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    args.reconstruction_contract = RECONSTRUCTION_CONTRACT
     torch.manual_seed(args.seed)
     if args.context_memmap_dir is not None:
         parser.error("--context-memmap-dir is obsolete; bounded Polars windows use --context-cache-size")
@@ -711,6 +720,7 @@ def main() -> None:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = json.loads((root / "manifest.json").read_text())
+    input_fingerprint = verify_corpus_files(root, manifest)
     feature_families = list(manifest["feature_families"])
     target_families = list(manifest["target_families"])
     # The four-rate architecture keeps a sparse stream even for a fresh
@@ -729,6 +739,15 @@ def main() -> None:
         # The checkpoint defines the sparse target schema used by its task
         # heads. Fresh live data may contain only a subset of those events.
         target_families = list(checkpoint_metrics.get("target_families", target_families))
+    if checkpoint_payload:
+        if checkpoint_payload.get("configuration", {}).get("reconstruction_contract") != RECONSTRUCTION_CONTRACT:
+            raise ValueError("Checkpoint uses obsolete averaged reconstruction heads; retrain with individual-value objectives")
+        for key in ('annual_window', 'quarterly_window', 'daily_window', 'issuer_context'):
+            if key in checkpoint_payload['configuration']:
+                setattr(args, key, checkpoint_payload['configuration'][key])
+    if min(args.annual_window, args.quarterly_window, args.daily_window) < 2:
+        parser.error('Rate windows must contain at least two observations')
+    ANNUAL_WINDOW, QUARTERLY_WINDOW, DAILY_WINDOW = args.annual_window, args.quarterly_window, args.daily_window
     taxonomy = pl.read_csv(root / "taxonomy.csv").with_columns(
         pl.col("symbol").cast(pl.String).str.to_uppercase().str.strip_chars()
     )
@@ -910,6 +929,10 @@ def main() -> None:
         *[pl.col(column).mean().alias(column) for column in sparse_value_columns],
     )
 
+    if args.issuer_context == 'none':
+        # Preserve supervised outcomes; remove issuer feature events only.
+        sparse = sparse.filter(pl.col('target_family').is_in([
+            'equity.strategy.hits_graph', 'equity.strategy.oracle_trades']))
     # Standardize numeric rate values using the available corpus while
     # retaining NaN for coverage-aware missingness handling.
     rate_columns = {"annual": annual_value_columns, "quarterly": quarterly_value_columns, "daily": daily_value_columns}
@@ -935,12 +958,6 @@ def main() -> None:
             for index, column in enumerate(columns)
         ])
     annual, quarterly, daily = (normalized_tables[name] for name in ("annual", "quarterly", "daily"))
-    sparse_mean_values, sparse_scale_values = _normalization_stats(
-        sparse, ["signal_value"], cutoff=args.train_end_date, saved=saved_norms.get("sparse"), symbols=normalization_symbols,
-    )
-    norms["sparse"] = (sparse_mean_values, sparse_scale_values)
-    sparse_mean, sparse_scale = sparse_mean_values[0], sparse_scale_values[0]
-    sparse = sparse.with_columns(((pl.col("signal_value").cast(pl.Float32) - sparse_mean) / sparse_scale).alias("signal_value"))
     raw_sparse_columns = ["signal_value", *[f"text_{i}" for i in range(7)]]
     sparse_value_columns: list[str] = []
     # Construct the wide family-specific sparse matrix in Polars.  Assigning
@@ -959,6 +976,15 @@ def main() -> None:
             )
             sparse_value_columns.append(output_column)
     sparse = sparse.with_columns(sparse_wide_columns)
+    sparse_means, sparse_scales = _normalization_stats(
+        sparse, sparse_value_columns, cutoff=args.train_end_date,
+        saved=saved_norms.get('sparse'), symbols=normalization_symbols,
+    )
+    norms['sparse'] = (sparse_means, sparse_scales)
+    sparse = sparse.with_columns([
+        ((pl.col(column).cast(pl.Float64) - sparse_means[index]) / sparse_scales[index]).cast(pl.Float32).alias(column)
+        for index, column in enumerate(sparse_value_columns)
+    ])
 
     # Build immutable columnar indexes once. All subsequent sample windows use
     # these arrays instead of repeatedly filtering Pandas frames.
@@ -1112,6 +1138,12 @@ def main() -> None:
                 if len(dates):
                     result[-len(dates):] = dates
                 return result
+            if args.issuer_context == 'none':
+                annual_values = torch.full_like(torch.as_tensor(annual_values), float('nan'))
+                quarterly_values = torch.full_like(torch.as_tensor(quarterly_values), float('nan'))
+                annual_padding = torch.ones(ANNUAL_WINDOW, dtype=torch.bool)
+                quarterly_padding = torch.ones(QUARTERLY_WINDOW, dtype=torch.bool)
+                annual_dates = quarterly_dates = []
             return {
                 "issuer_daily": issuer_daily, "issuer_daily_padding": issuer_daily_padding,
                 "issuer_daily_timestamps": timestamps(issuer_daily_dates, DAILY_WINDOW),
@@ -1239,7 +1271,7 @@ def main() -> None:
     ]
     if train_symbols is not None and not train_samples:
         raise ValueError("train symbol file does not match any corpus samples")
-    if args.train_end_date:
+    if args.train_end_date and not args.inference_only:
         train_end = _as_datetime(args.train_end_date)
         train_samples = [sample for sample in train_samples if _as_datetime(sample["date"]) < train_end]
         if not train_samples:
@@ -1310,10 +1342,15 @@ def main() -> None:
         cacheable_rate_states=not args.legacy_rate_fusion,
         attention_backend=args.attention_backend,
     )
+    reconstruction_widths = {
+        **{rate: tuple(feature_family_dimensions.values()) for rate in ("annual", "quarterly", "daily")},
+        "sparse": (len(raw_sparse_columns),) * len(target_families),
+    }
     task_bundle = add_subtoken_temporal_tasks(
         train_samples,
         family_names,
         label_names,
+        feature_dimensions=reconstruction_widths,
         batch_size=args.batch_size,
         # This is part of the Multi-Rate training contract.  Issuer/date
         # contexts must remain together so annual and quarterly encoder states
@@ -1377,6 +1414,8 @@ def main() -> None:
     if args.checkpoint_every_batches < 0:
         parser.error("--checkpoint-every-batches must be non-negative")
     def issuer_inputs(batch, stack):
+        if args.issuer_context == "none":
+            return {}
         keys = {}
         ids = []
         for item in batch:
@@ -1436,32 +1475,11 @@ def main() -> None:
             else:
                 batch_values, padding = masked_batches[rate]
             raw = stack(rate)
-            if rate == "sparse":
-                raw_shape = raw.shape
-                target_valid = torch.isfinite(raw).reshape(*raw_shape[:2], len(target_families), len(raw_sparse_columns)).any(dim=-1)
-                selected = target_valid & ~padding.unsqueeze(-1)
-                selected &= torch.rand((*target_valid.shape[:2], 1), device=device, generator=mask_rng).lt(0.15)
-                expanded = selected.unsqueeze(-1).expand(*raw_shape[:2], len(target_families), len(raw_sparse_columns)).reshape(raw_shape)
-                batch_values = batch_values.clone(); batch_values[expanded] = float("nan")
-            else:
-                target_valid = torch.isfinite(raw)
-                family_valid = []
-                offset = 0
-                for family in feature_families:
-                    width = feature_family_dimensions[family]
-                    family_valid.append(target_valid[:, :, offset:offset + width].any(dim=-1))
-                    offset += width
-                family_valid = torch.stack(family_valid, dim=-1)
-                selected = family_valid & ~padding.unsqueeze(-1)
-                selected &= torch.rand((*selected.shape[:2], 1), device=device, generator=mask_rng).lt(0.15)
-                expanded = []
-                offset = 0
-                for family in feature_families:
-                    width = feature_family_dimensions[family]
-                    expanded.append(selected[:, :, feature_families.index(family)].unsqueeze(-1).expand(-1, -1, width))
-                    offset += width
-                expanded = torch.cat(expanded, dim=-1)
-                batch_values = batch_values.clone(); batch_values[expanded] = float("nan")
+            selected, whole_selected, family_selected, feature_selected = reconstruction_mask(
+                raw, stack(f"{rate}_padding").bool(), widths=reconstruction_widths[rate], generator=mask_rng,
+            )
+            batch_values = batch_values.clone()
+            batch_values[selected] = float("nan")
             if rate in {"annual", "quarterly"}:
                 representatives = {}
                 first = []
@@ -1472,6 +1490,13 @@ def main() -> None:
                 first = torch.tensor(first, device=device)
                 batch_values = batch_values.index_select(0, first)
                 selected = selected.index_select(0, first)
+                whole_selected = whole_selected.index_select(0, first)
+                family_selected = family_selected.index_select(0, first)
+                feature_selected = feature_selected.index_select(0, first)
+            if module.training:
+                task_observations[f"masked_{rate}_whole_observation_values"] += int(whole_selected.sum())
+                task_observations[f"masked_{rate}_whole_family_values"] += int(family_selected.sum())
+                task_observations[f"masked_{rate}_individual_values"] += int(feature_selected.sum())
             masked_batches[rate] = (batch_values, padding); masked_positions[rate] = selected
         daily_batch, daily_mask = masked_batches["daily"]
         annual_batch, annual_mask = masked_batches["annual"]
@@ -1500,6 +1525,10 @@ def main() -> None:
             daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, DAILY_WINDOW),
             rate_context_ids=rate_context_ids,
             issuer_streams=issuer_inputs(batch, stack),
+            **{f"{rate}_family_presence": family_channels(
+                torch.isfinite(stack(rate)) & ~stack(f"{rate}_padding").bool().unsqueeze(-1),
+                reconstruction_widths[rate],
+            ).any(-1) for rate in reconstruction_widths},
             compute_document_outputs=not args.disable_document_tasks,
         )
         if tuple(output["document_outputs"]) + tuple(output["token_outputs"]) + tuple(output["prediction_outputs"]) != expected_task_names:
@@ -1558,66 +1587,20 @@ def main() -> None:
         if "family" in active_names and family_valid.any():
             task_losses["family"] = nn.functional.cross_entropy(output["document_outputs"]["family"][family_valid], family_labels[family_valid])
         for rate in ("annual", "quarterly", "daily", "sparse"):
-            raw_target = stack(rate)
-            if rate == "sparse":
-                raw_shape = raw_target.shape
-                family_raw = raw_target.reshape(*raw_shape[:2], len(target_families), len(raw_sparse_columns))
-                family_valid = torch.isfinite(family_raw)
-                target_valid = family_valid.any(dim=-1)
-                target = (
-                    (torch.nan_to_num(family_raw) * family_valid).sum(dim=-1)
-                    / family_valid.sum(dim=-1).clamp_min(1)
-                )
-            else:
-                raw_valid = torch.isfinite(raw_target)
-                family_values = []
-                family_valid_parts = []
-                offset = 0
-                for family in feature_families:
-                    width = feature_family_dimensions[family]
-                    local_valid = raw_valid[:, :, offset:offset + width]
-                    family_valid_parts.append(local_valid.any(dim=-1))
-                    family_values.append(
-                        (torch.nan_to_num(raw_target[:, :, offset:offset + width]) * local_valid).sum(dim=-1)
-                        / local_valid.sum(dim=-1).clamp_min(1)
-                    )
-                    offset += width
-                target_valid = torch.stack(family_valid_parts, dim=-1)
-                target = torch.stack(family_values, dim=-1)
-            token_valid = target_valid.any(dim=-1)
-            token_target = (
-                (torch.nan_to_num(target) * target_valid).sum(dim=-1)
-                / target_valid.sum(dim=-1).clamp_min(1)
+            targets = reconstruction_targets(
+                stack(rate), stack(f"{rate}_padding").bool(), stack(f"{rate}_timestamps"),
+                masked_positions[rate], reconstruction_widths[rate],
             )
-            padding = stack(f"{rate}_padding").bool()
-            timestamps = stack(f"{rate}_timestamps")
-            next_target, valid_next = next_observation_targets(target, target_valid & ~padding.unsqueeze(-1), timestamps)
-            next_token_target, valid_next_token = next_observation_targets(
-                token_target.unsqueeze(-1), (token_valid & ~padding).unsqueeze(-1), timestamps,
-            )
-            next_token_target = next_token_target.squeeze(-1)
-            valid_next_token = valid_next_token.squeeze(-1)
-            if module.training:
-                task_observations[f"next_{rate}_subtoken"] += int(valid_next.sum())
-                task_observations[f"next_{rate}_token"] += int(valid_next_token.sum())
-            next_subtoken_name = f"next_{rate}_subtoken"
-            next_token_name = f"next_{rate}_token"
-            next_subtoken_prediction = output["prediction_outputs"][next_subtoken_name].squeeze(-1)
-            if next_subtoken_name in active_names and valid_next.any():
-                task_losses[next_subtoken_name] = nn.functional.mse_loss(next_subtoken_prediction[valid_next], next_target[valid_next])
-            next_token_prediction = output["prediction_outputs"][next_token_name].squeeze(-1)
-            if next_token_name in active_names and valid_next_token.any():
-                task_losses[next_token_name] = nn.functional.mse_loss(next_token_prediction[valid_next_token], next_token_target[valid_next_token])
-            masked_valid = masked_positions[rate]
-            masked_subtoken_name = f"masked_{rate}_subtoken"
-            masked_token_name = f"masked_{rate}_token"
-            masked_subtoken_prediction = output["prediction_outputs"][masked_subtoken_name].squeeze(-1)
-            if masked_subtoken_name in active_names and masked_valid.any():
-                task_losses[masked_subtoken_name] = nn.functional.mse_loss(masked_subtoken_prediction[masked_valid], target[masked_valid])
-            masked_token_valid = masked_valid.any(dim=-1) & token_valid
-            masked_token_prediction = output["prediction_outputs"][masked_token_name].squeeze(-1)
-            if masked_token_name in active_names and masked_token_valid.any():
-                task_losses[masked_token_name] = nn.functional.mse_loss(masked_token_prediction[masked_token_valid], token_target[masked_token_valid])
+            for objective, (target, valid) in targets.items():
+                kind, level = objective.split("_")
+                name = f"{kind}_{rate}_{level}"
+                prediction = output["prediction_outputs"][name]
+                if prediction.shape != target.shape:
+                    raise ValueError(f"Reconstruction shape mismatch for {name}: {prediction.shape} != {target.shape}")
+                if name in active_names and valid.any():
+                    task_losses[name] = nn.functional.mse_loss(prediction[valid], target[valid])
+                if module.training:
+                    task_observations[name] += int(valid.sum())
         if module.training:
             for name, loss in task_losses.items():
                 task_loss_sums[name] += float(loss.detach())
@@ -1878,6 +1861,7 @@ def main() -> None:
         "option_features": list(OPTION_FEATURES) if option_columns else [],
         "universe_filter": {"country": args.country, "currency": args.currency, "exchanges": sorted(exchanges), "symbols": sorted(universe_symbols), "currency_unresolved_symbols": sorted(unresolved_currency)},
     })
+    metrics["input_fingerprint"] = input_fingerprint
     metrics["context_cache"] = {
         "size_per_rate": args.context_cache_size,
         "hits": context_cache_hits,

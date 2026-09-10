@@ -421,7 +421,8 @@ simulation = simulate_return_paths(returns, iterations=1000, horizon=252, block_
 ```
 
 The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
-within-step issuer encoding. Instrument types are explicit and label coverage is
-checked per asset class. Oracle/HITS supervise issuer-conditioned instrument
-predictions; broader asset-class and trading validation remain pending. See the [streaming milestone](docs/multirate-streaming-milestone.md) for the
-training contract, verification commands, and remaining real-data limits.
+within-step issuer encoding. Oracle/HITS supervise instrument-specific decisions.
+Masked and next-observation objectives reconstruct individual values at token
+and subtoken levels, using both whole-observation and individual-value masking.
+See the [reconstruction contract](docs/multirate-reconstruction.md) for the objective details, checkpoint
+requirements, executed diagnostic scope, and longer-history 1T experiment.

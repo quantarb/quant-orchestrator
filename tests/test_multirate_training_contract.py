@@ -192,3 +192,13 @@ def test_batched_transformer_engine_mask_preserves_individual_dates():
     assert blocked.shape == (2, 1, 2, 2)
     assert bool(blocked[0, 0, 0, 1])
     assert not bool(blocked[1, 0, 0, 1])
+
+
+def test_sparse_channels_fit_independent_scales_without_future_values():
+    from scripts.train_multirate_mtl import _normalization_stats
+    frame = pl.DataFrame({'date': [datetime(2023, 1, 1), datetime(2023, 1, 2), datetime(2025, 1, 1)],
+                          'insider__text_0': [1e6, 3e6, 1e12], 'hits__text_0': [0.1, 0.3, 0.9]})
+    mean, scale = _normalization_stats(frame, ['insider__text_0','hits__text_0'], cutoff='2024-01-01')
+    assert mean == pytest.approx([2e6, .2])
+    assert scale == pytest.approx([1e6, .1])
+    assert [(v-m)/s for v,m,s in zip([3e6,.3],mean,scale)] == pytest.approx([1.,1.])

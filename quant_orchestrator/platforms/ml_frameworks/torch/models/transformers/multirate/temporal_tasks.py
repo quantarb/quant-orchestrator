@@ -98,6 +98,7 @@ def add_subtoken_temporal_tasks(
     family_names: Sequence[str],
     label_names: Mapping[str, Sequence[str]],
     *,
+    feature_dimensions: Mapping[str, Sequence[int]],
     batch_size: int = 1,
     corpus_name: str = "temporal",
     batch_key: Callable[[Any], Hashable] | None = None,
@@ -110,6 +111,10 @@ def add_subtoken_temporal_tasks(
     ``2024-07-31``.  These labels classify temporal documents; they are not
     cross-sectional document sources.
     """
+    if set(feature_dimensions) != {"annual", "quarterly", "daily", "sparse"} or any(
+        not widths or min(widths) < 1 for widths in feature_dimensions.values()
+    ):
+        raise ValueError("Positive feature-family widths are required for every rate")
     corpus = Corpus(rows, name=corpus_name, batch_size=batch_size, batch_key=batch_key)
     required_labels = set(DOCUMENT_TASK_NAMES[1:])
     missing = sorted(required_labels - set(label_names))
@@ -134,7 +139,7 @@ def add_subtoken_temporal_tasks(
             task_name,
             objective="next_token" if task_name.startswith("next_") else "masked_token",
             level="token" if task_name.endswith("_token") else "subtoken",
-            output_dim=1,
+            output_dim=(sum if task_name.endswith("_token") else max)(feature_dimensions[task_name.split("_")[1]]),
             source=task_name.split("_")[1],
         )
         for task_name in PREDICTION_TASK_NAMES

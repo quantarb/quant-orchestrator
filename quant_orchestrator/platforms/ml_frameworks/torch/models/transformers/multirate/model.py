@@ -648,6 +648,10 @@ class MultiRateTransformer(nn.Module):
         outputs: dict[str, torch.Tensor] = {}
         for task in self.prediction_task_specs:
             source = subtoken_states[task.source] if task.level == "subtoken" else token_states[task.source]
+            if task.level == "subtoken" and task.objective == "masked_token":
+                # Temporal next-family prediction stays within its own family.
+                # Hidden-family reconstruction additionally uses other features.
+                source = source + token_states[task.source].unsqueeze(-2)
             source = torch.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
             outputs[task.task_name] = self.prediction_heads[task.task_name](source)
         return outputs
@@ -1066,8 +1070,13 @@ class MultiRateTransformer(nn.Module):
             token_states=supervised_states,
         )
         prediction_outputs = self._prediction_heads(
-            token_states=token_states,
-            subtoken_states={"daily": daily_subtokens, "annual": annual_subtokens, "quarterly": quarterly_subtokens, "sparse": sparse_subtokens},
+            # Encoded rate context remains informative when the entire query
+            # observation is hidden. Family identity remains in each subtoken.
+            token_states=encoded_rates,
+            subtoken_states={rate: subtokens
+                for rate, subtokens in {"daily": daily_subtokens, "annual": annual_subtokens,
+                    "quarterly": quarterly_subtokens, "sparse": sparse_subtokens}.items()
+                if rate in encoded_rates and subtokens is not None},
         ) if need_subtokens else {}
         family_outputs = (
             self.family_classification_head(fused_document_prototypes)

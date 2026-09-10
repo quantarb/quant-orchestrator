@@ -207,10 +207,8 @@ Still missing:
 - Do not require every strategy to be implemented in every engine.
 
 The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
-within-step issuer encoding. See the [streaming milestone](multirate-streaming-milestone.md) for the
-training contract, verification commands, and remaining real-data limits.
-Its intended decision is instrument selection conditional on issuer state and
-date, across asset classes, using instrument-specific Oracle actions and HITS
-scores as the primary supervised targets. These predictions are wired to issuer
-context; multi-asset chronological evaluation and issuer-context ablation are
-still needed, as described in that milestone.
+within-step issuer encoding. Oracle/HITS supervise instrument-specific decisions.
+Masked and next-observation objectives reconstruct individual values at token
+and subtoken levels, using both whole-observation and individual-value masking.
+See the [reconstruction contract](multirate-reconstruction.md) for the objective details, checkpoint
+requirements, executed diagnostic scope, and longer-history 1T experiment.

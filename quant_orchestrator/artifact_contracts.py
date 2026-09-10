@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import pandas as pd
+import polars as pl
 
 
 ARTIFACT_SCHEMA_VERSION = 1
@@ -23,10 +24,10 @@ TRADE_LIST_ARTIFACT_NAME = "trade_list"
 
 @dataclass(frozen=True)
 class StrategyArtifactBundle:
-    feature_panel: pd.DataFrame | None = None
-    scored_panel: pd.DataFrame | None = None
-    action_tape: pd.DataFrame | None = None
-    trade_list: pd.DataFrame | None = None
+    feature_panel: pd.DataFrame | pl.DataFrame | None = None
+    scored_panel: pd.DataFrame | pl.DataFrame | None = None
+    action_tape: pd.DataFrame | pl.DataFrame | None = None
+    trade_list: pd.DataFrame | pl.DataFrame | None = None
     summary: Mapping[str, Any] = field(default_factory=dict)
     strategy_name: str = ""
     base_path: Path | None = None
@@ -59,7 +60,10 @@ def write_strategy_artifacts(
             continue
         validated = validate_strategy_artifact_frame(name, frame, required_columns=required)
         path = out_dir / f"{name}.parquet"
-        validated.to_parquet(path, index=False)
+        if isinstance(validated, pl.DataFrame):
+            validated.write_parquet(path)
+        else:
+            validated.to_parquet(path, index=False)
         paths[name] = path
         manifest_artifacts[name] = {
             "path": path.name,
@@ -142,6 +146,8 @@ def validate_strategy_artifact_frame(
     *,
     required_columns: tuple[str, ...],
 ) -> pd.DataFrame:
+    if isinstance(frame, pl.DataFrame):
+        return _validate_polars_artifact(artifact_name, frame, required_columns)
     if frame is None:
         raise TypeError(f"{artifact_name} artifact frame is None")
     out = _frame_with_date_symbol_columns(frame)
@@ -295,3 +301,32 @@ def _frame_with_date_symbol_columns(frame: pd.DataFrame) -> pd.DataFrame:
     elif isinstance(out.index, pd.DatetimeIndex) and "date" not in out.columns:
         out = out.reset_index(names="date")
     return out.loc[:, ~out.columns.duplicated()].copy()
+
+
+def _validate_polars_artifact(name, frame, required):
+    missing = set(required) - set(frame.columns)
+    if missing and not frame.is_empty():
+        raise ValueError(f'{name} artifact missing required columns: {sorted(missing)}')
+    out = frame.with_columns([pl.lit(None).alias(column) for column in missing])
+    for column in ('date', 'entry_date', 'exit_date'):
+        if column in out.columns:
+            value = pl.col(column)
+            if out.schema[column] == pl.String:
+                value = value.str.to_datetime(strict=False)
+            out = out.with_columns(value.cast(pl.Datetime('ns')).alias(column))
+    if 'symbol' in out.columns:
+        out = out.with_columns(pl.col('symbol').cast(pl.String).str.strip_chars().str.to_uppercase())
+        if out.filter(pl.col('symbol').is_null() | (pl.col('symbol') == '')).height:
+            raise ValueError('Artifact contains empty symbols')
+    if name == TRADE_LIST_ARTIFACT_NAME and not out.is_empty():
+        if out['trade_id'].null_count() or out['trade_id'].n_unique() != out.height:
+            raise ValueError('Trade IDs must be nonnull and unique')
+        if out.filter(~pl.col('side').is_in(list(TRADE_LIST_SIDES)) | pl.col('side').is_null()).height:
+            raise ValueError('Invalid trade side')
+        if out.filter(pl.col('entry_date').is_null() | pl.col('exit_date').is_null() | (pl.col('exit_date') < pl.col('entry_date'))).height:
+            raise ValueError('Invalid trade entry/exit dates')
+        for column in TRADE_LIST_NON_NEGATIVE_COLUMNS:
+            if column in out.columns and out.filter(~pl.col(column).is_finite() | (pl.col(column) < 0) | pl.col(column).is_null()).height:
+                raise ValueError(f'Invalid {column}')
+    order = [c for c in ('date','entry_date','symbol','action') if c in out.columns]
+    return out.sort(order) if order else out
