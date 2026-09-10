@@ -97,8 +97,8 @@ def main() -> None:
     parser.add_argument("--corpus", type=Path, required=True)
     parser.add_argument("--option-panel", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--train-symbols-file", type=Path, required=True)
-    parser.add_argument("--test-symbols-file", type=Path, required=True)
+    parser.add_argument("--train-symbols-file", type=Path)
+    parser.add_argument("--test-symbols-file", type=Path)
     parser.add_argument("--option-start-date", default="2025-01-01")
     parser.add_argument("--max-contracts", type=int, default=32)
     parser.add_argument("--group-by-dte", action=argparse.BooleanOptionalAction, default=True)
@@ -107,8 +107,12 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     root = args.corpus
     manifest = json.loads((root / "manifest.json").read_text())
-    train_symbols = set(pl.read_csv(args.train_symbols_file).get_column("symbol").cast(pl.String).str.to_uppercase())
-    test_symbols = set(pl.read_csv(args.test_symbols_file).get_column("symbol").cast(pl.String).str.to_uppercase())
+    if args.train_symbols_file and args.test_symbols_file:
+        train_symbols = set(pl.read_csv(args.train_symbols_file).get_column("symbol").cast(pl.String).str.to_uppercase())
+        test_symbols = set(pl.read_csv(args.test_symbols_file).get_column("symbol").cast(pl.String).str.to_uppercase())
+    else:
+        all_symbols = sorted(pl.read_csv(root / "taxonomy.csv").get_column("symbol").cast(pl.String).str.to_uppercase())
+        train_symbols, test_symbols = set(all_symbols), set()
     base_symbols = train_symbols | test_symbols
     if args.raw_warehouse:
         options = _load_raw_first_day(base_symbols, start_year=int(args.option_start_date[:4]), end_year=2026)

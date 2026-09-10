@@ -94,6 +94,7 @@ class Corpus:
 CorpusTaskGroup = tuple[Corpus, tuple[Task, ...]]
 LossStep = Callable[[nn.Module, list[Any], tuple[Task, ...]], Mapping[str, torch.Tensor]]
 EpochEnd = Callable[[int, float], bool]
+BatchEnd = Callable[[int, int, int, float], None]
 
 
 class Trainer:
@@ -167,7 +168,14 @@ class Trainer:
         for index in order:
             yield pending[index]
 
-    def fit(self, epochs: int, step: LossStep, *, on_epoch_end: EpochEnd | None = None) -> list[float]:
+    def fit(
+        self,
+        epochs: int,
+        step: LossStep,
+        *,
+        on_epoch_end: EpochEnd | None = None,
+        on_batch_end: BatchEnd | None = None,
+    ) -> list[float]:
         """Run shared-gradient training and return mean loss per epoch."""
         losses: list[float] = []
         for epoch in range(epochs):
@@ -192,6 +200,8 @@ class Trainer:
                 loss = self.backward_step(task_losses, tasks, step_index, step_index + 1 == total_batches)
                 total += float(loss.detach())
                 count += 1
+                if on_batch_end is not None:
+                    on_batch_end(epoch, step_index + 1, total_batches, float(loss.detach()))
             losses.append(total / max(1, count))
             if on_epoch_end is not None and on_epoch_end(epoch, losses[-1]):
                 break

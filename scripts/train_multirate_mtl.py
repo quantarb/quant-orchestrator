@@ -513,6 +513,10 @@ def main() -> None:
     parser.add_argument("--inference-only", action="store_true", help="Skip training and export predictions from --checkpoint.")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--progress-every-batches", type=int, default=100,
+        help="Print training progress every N batches; 0 disables batch progress logging.",
+    )
     parser.add_argument("--grad-accumulation-steps", type=int, default=1)
     parser.add_argument(
         "--context-cache-size", type=int, default=4096,
@@ -529,8 +533,8 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--min-delta", type=float, default=1e-3)
     parser.add_argument(
-        "--validation-fraction", type=float, default=0.2,
-        help="Chronological holdout fraction for validation-loss early stopping; 0 reproduces training-loss stopping.",
+        "--validation-fraction", type=float, default=0.0,
+        help="Chronological holdout fraction; 0 (the default) trains on every sample with no validation split.",
     )
     parser.add_argument("--learned-aggregation-gate", action="store_true")
     parser.add_argument(
@@ -1215,6 +1219,8 @@ def main() -> None:
     best_state: dict[str, torch.Tensor] | None = None
     stale_epochs = 0
     validation_losses: list[float] = []
+    if args.progress_every_batches < 0:
+        parser.error("--progress-every-batches must be non-negative")
     def training_step(module: torch.nn.Module, batch: list[dict[str, object]], active_tasks):
         def stack(name: str) -> torch.Tensor:
             return torch.from_numpy(np.stack([item[name] for item in batch])).to(device)
@@ -1442,7 +1448,33 @@ def main() -> None:
             return True
         return False
 
-    losses = [] if args.inference_only else trainer.fit(args.epochs, training_step, on_epoch_end=epoch_end)
+    training_started = perf_counter()
+
+    def training_progress(epoch: int, batch_index: int, total_batches: int, batch_loss: float) -> None:
+        interval = args.progress_every_batches
+        if interval <= 0 or (batch_index % interval and batch_index != total_batches):
+            return
+        elapsed = perf_counter() - training_started
+        rate = batch_index / max(elapsed, 1e-6)
+        remaining = (total_batches - batch_index) / max(rate, 1e-6)
+        samples_done = min(len(train_samples), batch_index * args.batch_size)
+        memory = ""
+        if device.type == "cuda":
+            memory = f" cuda_gb={torch.cuda.memory_allocated(device) / 1024**3:.2f}"
+        print(
+            f"[multirate-train] epoch={epoch + 1}/{args.epochs} "
+            f"batch={batch_index}/{total_batches} samples={samples_done}/{len(train_samples)} "
+            f"loss={batch_loss:.6f} elapsed_s={elapsed:.1f} "
+            f"batches_per_s={rate:.2f} eta_s={remaining:.1f}{memory}",
+            flush=True,
+        )
+
+    losses = [] if args.inference_only else trainer.fit(
+        args.epochs,
+        training_step,
+        on_epoch_end=epoch_end,
+        on_batch_end=training_progress,
+    )
 
     if best_state is not None:
         model.load_state_dict(best_state)
