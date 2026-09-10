@@ -246,3 +246,8 @@ predictions. Throughput gains were modest (about 1.4% and 3.1% relative to the
 repeated FP32 baseline), so the full run retained its existing configuration.
 The batch-256 check performed half as many optimizer updates; its epoch loss
 is not directly comparable as a quality result.
+
+The completed v6 run has a [measured failure diagnosis and training profile](multirate-v6-diagnosis.md).
+It identifies pooled price scaling, unseen constant option attributes, and
+CPU sample preparation as repair priorities; it does not claim those repairs
+or a full-run speedup have been completed.
