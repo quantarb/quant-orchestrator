@@ -209,6 +209,16 @@ def main() -> None:
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     warehouse = Warehouse()
+    profiles = warehouse.catalog.query_symbol_profiles(
+        provider="fmp", min_market_cap=10_000_000_000, country="US",
+        exchanges=("NYSE", "NASDAQ", "AMEX"), exclude_etf=True, exclude_fund=True,
+        limit=100_000,
+    )
+    valid_symbols = {str(profile.symbol).strip().upper() for profile in profiles}
+    symbols = tuple(symbol for symbol in symbols if symbol in valid_symbols)
+    if not symbols:
+        raise RuntimeError("No eligible US $10B+ symbols overlap the requested symbol file")
+    print(f"feature build universe: {len(symbols)} eligible US $10B+ symbols", flush=True)
     config = FamilyEvaluationConfig(
         market_cap_min=0, country="", exchanges=(), screen_limit=100_000,
         start_date=args.start_date,
@@ -226,7 +236,7 @@ def main() -> None:
                 config,
                 warehouse=warehouse,
                 strategy_sources=dual_families,
-                broadcast_to_target=False,
+                broadcast_to_target=True,
                 fundamental_period=period,
                 family_suffix="quarterly" if period == "quarter" else "annual",
             )
@@ -238,7 +248,7 @@ def main() -> None:
             config,
             warehouse=warehouse,
             strategy_sources=sorted(QUARTER_ONLY_FAMILIES),
-            broadcast_to_target=False,
+            broadcast_to_target=True,
             fundamental_period="quarter",
             family_suffix="quarterly",
         )
@@ -251,7 +261,7 @@ def main() -> None:
             config,
             warehouse=warehouse,
             strategy_sources=non_period_families,
-            broadcast_to_target=False,
+            broadcast_to_target=True,
         )
         panel_parts.append(non_period_panel)
         metadata_parts_for_chunk.append(non_period_metadata)
@@ -267,6 +277,18 @@ def main() -> None:
         print(f"processed {min(start + len(chunk), len(symbols))}/{len(symbols)}", flush=True)
     daily = pd.concat(daily_parts, ignore_index=True).sort_values(["symbol", "date"]).reset_index(drop=True)
     families = sorted({str(value) for part in metadata_parts for value in part["family"]})
+    # Keep the live feature schema aligned with the 2024 checkpoint.  Macro
+    # context is optional for scoring, but the checkpoint has these two input
+    # families; neutral values preserve the learned tensor layout.
+    for family in ("economic_indicators", "treasury_rates"):
+        value_column = f"value__{family}"
+        presence_column = f"presence__{family}"
+        if value_column not in daily.columns:
+            daily[value_column] = 0.0
+        if presence_column not in daily.columns:
+            daily[presence_column] = 0.0
+        families.append(family)
+    families = sorted(set(families))
     for rate in ("daily", "quarterly", "annual"):
         _rate_table(daily, families, rate).to_parquet(output / f"{rate}.parquet", index=False)
     target_events = pd.read_parquet(args.target_events)

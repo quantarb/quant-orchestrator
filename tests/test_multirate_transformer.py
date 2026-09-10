@@ -18,6 +18,9 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
     SUBTOKEN_PREDICTION_TASK_NAMES,
     TOKEN_PREDICTION_TASK_NAMES,
 )
+from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.transformer_engine import (
+    _blocked_mask,
+)
 
 
 def _tasks():
@@ -53,6 +56,17 @@ def test_temporal_mask_blocks_future_and_cross_sectional_mask_shares_dates():
 
 def test_multirate_model_is_owned_by_nested_transformer_module():
     assert MultiRateTransformer is NestedMultiRateTransformer
+
+
+def test_transformer_engine_backend_is_optional_and_explicit():
+    config = MultiRateTransformerConfig(attention_backend="transformer_engine")
+    assert config.attention_backend == "transformer_engine"
+    mask = _blocked_mask(
+        torch.tensor([[0.0, float("-inf")], [0.0, 0.0]]),
+        torch.tensor([[False, True]]),
+        batch_size=1, query_length=2, key_length=2, device=torch.device("cpu"),
+    )
+    assert mask.tolist() == [[[[False, True], [False, True]]]]
 
 
 @pytest.mark.parametrize("backbone", ["encoder_only", "decoder_only", "encoder_decoder"])

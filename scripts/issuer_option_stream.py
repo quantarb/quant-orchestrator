@@ -10,7 +10,10 @@ from collections.abc import Iterator
 
 import pandas as pd
 
-from scripts.build_annual_option_documents import _load_raw_first_day, _select
+from quant_orchestrator.research_tools.option_training import (
+    group_option_contracts_by_dte,
+    load_first_trading_day_option_chains,
+)
 
 
 def iter_frozen_dte_documents(
@@ -22,10 +25,10 @@ def iter_frozen_dte_documents(
 ) -> Iterator[tuple[str, pd.DataFrame]]:
     """Yield ``(issuer, documents)`` one underlying at a time."""
     for symbol in sorted({str(value).upper() for value in symbols}):
-        raw = _load_raw_first_day({symbol}, start_year=start_year, end_year=end_year)
+        raw = load_first_trading_day_option_chains({symbol}, start_year=start_year, end_year=end_year)
         if raw.empty:
             continue
-        selected = _select(raw, max_contracts=0, group_by_dte=True)
+        selected = group_option_contracts_by_dte(raw)
         selected["underlying_symbol"] = selected["symbol"].astype(str).str.upper()
         if dte is not None:
             selected = selected.loc[pd.to_numeric(selected["dte"], errors="coerce").eq(dte)].copy()

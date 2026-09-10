@@ -23,7 +23,10 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 )
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.temporal_tasks import HITS_SUPERVISED_TASK_NAMES, ORACLE_SUPERVISED_TASK_NAMES
 from scripts.backtest_dte_event_driven import _build_daily_quotes
-from scripts.build_annual_option_documents import _load_raw_first_day, _select
+from quant_orchestrator.research_tools.option_training import (
+    group_option_contracts_by_dte,
+    load_first_trading_day_option_chains,
+)
 from quant_warehouse.platforms.data_providers.fmp.target_engineering import (
     HitsLabelSpec, LabelBuildSpec, build_oracle_labels, build_return_and_speed_hits_labels,
 )
@@ -47,10 +50,10 @@ def norm_date(values):
 
 
 def make_groups(symbol: str, start_year: int, end_year: int, dte: int) -> pd.DataFrame:
-    raw = _load_raw_first_day({symbol}, start_year=start_year, end_year=end_year)
+    raw = load_first_trading_day_option_chains({symbol}, start_year=start_year, end_year=end_year)
     if raw.empty:
         return pd.DataFrame()
-    selected = _select(raw, max_contracts=0, group_by_dte=True)
+    selected = group_option_contracts_by_dte(raw)
     selected = selected.loc[pd.to_numeric(selected["dte"], errors="coerce").eq(dte)].copy()
     if selected.empty:
         return selected

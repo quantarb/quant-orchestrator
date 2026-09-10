@@ -35,6 +35,7 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 
 
 BackboneName = Literal["encoder_only", "decoder_only", "encoder_decoder"]
+AttentionBackend = Literal["pytorch", "transformer_engine"]
 AttentionMode = Literal["temporal", "cross_sectional"]
 DocumentPool = Literal["last", "mean"]
 DOCUMENT_PROTOTYPE_STATS = ("mean", "min", "max", "rmse", "q25", "q50", "q75")
@@ -150,6 +151,7 @@ class MultiRateTransformerConfig:
     rates: tuple[str, ...] = ("annual", "quarterly", "daily", "sparse")
     learned_aggregation_gate: bool = False
     cacheable_rate_states: bool = True
+    attention_backend: AttentionBackend = "pytorch"
 
     def __post_init__(self) -> None:
         if self.d_model <= 0 or self.num_heads <= 0 or self.layers <= 0:
@@ -160,6 +162,8 @@ class MultiRateTransformerConfig:
             raise ValueError("document_pool must be 'last' or 'mean'")
         if self.max_position <= 0:
             raise ValueError("max_position must be positive")
+        if self.attention_backend not in {"pytorch", "transformer_engine"}:
+            raise ValueError("attention_backend must be 'pytorch' or 'transformer_engine'")
         if self.rates not in {
             ("annual", "quarterly", "daily"),
             ("annual", "quarterly", "daily", "sparse"),
@@ -235,7 +239,10 @@ def build_attention_mask(
     return torch.zeros((length, length), device=device).masked_fill(~allowed, float("-inf"))
 
 
-def _encoder(config: MultiRateTransformerConfig) -> nn.TransformerEncoder:
+def _encoder(config: MultiRateTransformerConfig) -> nn.Module:
+    if config.attention_backend == "transformer_engine":
+        from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.transformer_engine import TransformerEngineEncoder
+        return TransformerEngineEncoder(config)
     layer = nn.TransformerEncoderLayer(
         d_model=config.d_model,
         nhead=config.num_heads,
@@ -247,7 +254,10 @@ def _encoder(config: MultiRateTransformerConfig) -> nn.TransformerEncoder:
     return nn.TransformerEncoder(layer, num_layers=config.layers)
 
 
-def _decoder(config: MultiRateTransformerConfig) -> nn.TransformerDecoder:
+def _decoder(config: MultiRateTransformerConfig) -> nn.Module:
+    if config.attention_backend == "transformer_engine":
+        from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.transformer_engine import TransformerEngineDecoder
+        return TransformerEngineDecoder(config)
     layer = nn.TransformerDecoderLayer(
         d_model=config.d_model,
         nhead=config.num_heads,

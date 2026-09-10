@@ -365,7 +365,8 @@ def _issuer_dte_bin_option_panel(
     ask_name = "entry_ask" if "entry_ask" in result else "ask"
     result["_bid"] = pd.to_numeric(result.get(bid_name), errors="coerce")
     result["_ask"] = pd.to_numeric(result.get(ask_name), errors="coerce")
-    result["_weight"] = pd.to_numeric(result.get("dte_contract_count", 1), errors="coerce").fillna(1.0)
+    weight_source = result["dte_contract_count"] if "dte_contract_count" in result else pd.Series(1.0, index=result.index)
+    result["_weight"] = pd.to_numeric(weight_source, errors="coerce").fillna(1.0)
     result = result.dropna(subset=["_issuer", "entry_date", "dte"])
     selected: list[pd.DataFrame] = []
     for issuer, group in result.groupby("_issuer", sort=True):
@@ -391,7 +392,65 @@ def _issuer_dte_bin_option_panel(
         selected.append(group.loc[group["dte"].astype(int).isin(targets)])
     if not selected:
         raise ValueError("issuer-specific DTE bin selection produced no option rows")
-    return pd.concat(selected, ignore_index=True)
+
+    selected_panel = pd.concat(selected, ignore_index=True)
+    # Collapse the selected strike grid into one synthetic contract per
+    # underlying/date/type/DTE. The model therefore sees the mean of the
+    # original contract-level features during training, while live inference
+    # can pass one real contract through the same feature columns unchanged.
+    group_cols = ["underlying_symbol", "entry_date", "option_type", "dte"]
+    if "side" in selected_panel.columns:
+        group_cols.append("side")
+    selected_panel["dte"] = selected_panel["dte"].round().astype(int)
+    # Preserve the executable economics of the bucket.  A plain arithmetic
+    # mean lets illiquid contracts influence the synthetic quote as much as
+    # liquid contracts.  Use traded volume when available and open interest
+    # as a fallback; if neither exists, every valid contract gets equal
+    # weight.  Bid and ask are kept separate so later labels can use the ask
+    # for long entries and the bid for short entries.
+    volume = pd.to_numeric(selected_panel.get("volume"), errors="coerce") if "volume" in selected_panel else pd.Series(np.nan, index=selected_panel.index)
+    open_interest = pd.to_numeric(selected_panel.get("open_interest"), errors="coerce") if "open_interest" in selected_panel else pd.Series(np.nan, index=selected_panel.index)
+    selected_panel["_quote_weight"] = volume.clip(lower=0).fillna(0.0)
+    selected_panel.loc[selected_panel["_quote_weight"].le(0), "_quote_weight"] = open_interest.clip(lower=0).fillna(0.0)
+    selected_panel.loc[selected_panel["_quote_weight"].le(0), "_quote_weight"] = 1.0
+
+    # Keep the heavy tabular aggregation in Polars.  Conversion back to
+    # pandas is deliberately limited to this compatibility boundary because
+    # the downstream sample builder ultimately materializes NumPy tensors.
+    selected_pl = pl.from_pandas(selected_panel, include_index=False)
+    numeric_cols = [name for name, dtype in zip(selected_pl.columns, selected_pl.dtypes) if dtype.is_numeric() and name != "dte"]
+    quote_columns = [name for name in ("entry_bid", "entry_ask", "bid", "ask", "mid") if name in selected_pl.columns]
+    aggregations: list[pl.Expr] = [
+        pl.col(column).mean().alias(column)
+        for column in numeric_cols
+        if column not in {"_quote_weight", *quote_columns}
+    ]
+    for column in selected_pl.columns:
+        if column in group_cols or column in numeric_cols or column in quote_columns or column in {"symbol", "contract_symbol", "_quote_weight"}:
+            continue
+        aggregations.append(pl.col(column).first().alias(column))
+    for column in quote_columns:
+        value = pl.col(column).cast(pl.Float64, strict=False)
+        valid = value.gt(0) & pl.col("_quote_weight").gt(0)
+        weighted_sum = pl.when(valid).then(value * pl.col("_quote_weight")).otherwise(0.0).sum()
+        weight_sum = pl.when(valid).then(pl.col("_quote_weight")).otherwise(0.0).sum()
+        aggregations.append(
+            pl.when(weight_sum.gt(0)).then(weighted_sum / weight_sum)
+            .otherwise(None).alias(column)
+        )
+    aggregated = selected_pl.group_by(group_cols, maintain_order=True).agg(aggregations)
+    counts = selected_pl.group_by(group_cols, maintain_order=True).len(name="synthetic_contract_count")
+    aggregated = aggregated.join(counts, on=group_cols, how="left").to_pandas()
+    option_code = aggregated["option_type"].astype(str).str[:1].str.upper()
+    underlying = aggregated["underlying_symbol"].astype(str).str.upper().str.strip()
+    aggregated["symbol"] = (
+        "OPT_SYNTH_" + underlying + "_" + option_code + "_DTE" + aggregated["dte"].astype(str)
+    )
+    aggregated["contract_symbol"] = aggregated["symbol"]
+    if "expiration" in aggregated.columns:
+        aggregated["expiration"] = aggregated["entry_date"] + pd.to_timedelta(aggregated["dte"], unit="D")
+    aggregated["synthetic_option"] = True
+    return aggregated
 
 
 def _filter_universe(
@@ -490,6 +549,14 @@ def main() -> None:
     )
     parser.add_argument("--mrl-weight", type=float, default=0.25)
     parser.add_argument("--mixed-precision", action="store_true", help="Use CUDA autocast (float16 with GradScaler).")
+    parser.add_argument(
+        "--attention-backend", choices=("pytorch", "transformer_engine"), default="pytorch",
+        help="Transformer attention implementation; transformer_engine requires quant-orchestrator[cuda-te].",
+    )
+    parser.add_argument(
+        "--fp8", action="store_true",
+        help="Use Transformer Engine FP8 autocasting; requires --attention-backend transformer_engine.",
+    )
     parser.add_argument("--compile-model", action="store_true", help="Compile the model with torch.compile.")
     parser.add_argument("--optimizer", choices=("adamw", "adamw8bit"), default="adamw")
     parser.add_argument("--skip-embeddings", action="store_true", help="Do not retain or write evaluation embeddings.")
@@ -530,6 +597,10 @@ def main() -> None:
         "--stream-samples", action="store_true",
         help="Keep sample metadata in memory and materialize rate arrays only per batch.",
     )
+    parser.add_argument(
+        "--max-samples", type=int, default=0,
+        help="Optional deterministic cap on samples for a fast end-to-end smoke run.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     if args.inference_only and args.checkpoint is None:
@@ -548,6 +619,10 @@ def main() -> None:
         parser.error("--context-cache-size must be non-negative")
     if args.mixed_precision and args.device == "cpu":
         parser.error("--mixed-precision requires a CUDA device")
+    if args.attention_backend == "transformer_engine" and not args.device.startswith("cuda"):
+        parser.error("--attention-backend transformer_engine requires a CUDA device")
+    if args.fp8 and args.attention_backend != "transformer_engine":
+        parser.error("--fp8 requires --attention-backend transformer_engine")
     option_dtes = set(args.option_dte or ())
     root = args.corpus
     output_dir = args.output_dir
@@ -555,6 +630,13 @@ def main() -> None:
     manifest = json.loads((root / "manifest.json").read_text())
     feature_families = list(manifest["feature_families"])
     target_families = list(manifest["target_families"])
+    checkpoint_payload = None
+    if args.inference_only and args.checkpoint is not None:
+        checkpoint_payload = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        checkpoint_metrics = checkpoint_payload.get("metrics", {}) if isinstance(checkpoint_payload, dict) else {}
+        # The checkpoint defines the sparse target schema used by its task
+        # heads. Fresh live data may contain only a subset of those events.
+        target_families = list(checkpoint_metrics.get("target_families", target_families))
     taxonomy = pd.read_csv(root / "taxonomy.csv").set_index("symbol")
     taxonomy.index = taxonomy.index.astype(str).str.upper()
     # Presence columns are useful for corpus diagnostics but are not model
@@ -811,6 +893,16 @@ def main() -> None:
             [{"symbol": symbol, "date": date} for symbol, date in option_target_map]
         ))
     anchors = pd.concat(anchor_parts, ignore_index=True).drop_duplicates().sort_values(["symbol", "date"])
+    # Exact-date inference must retain the requested daily anchor. Regular
+    # training anchors are intentionally reduced to one date per symbol/year,
+    # but that reduction would otherwise discard a current EOD scoring date.
+    if args.inference_only and args.prediction_start_date and args.prediction_start_date != "1900-01-01":
+        requested_anchor_date = pd.Timestamp(args.prediction_start_date).normalize()
+        exact_daily_anchors = daily.loc[
+            pd.to_datetime(daily["date"]).dt.normalize().eq(requested_anchor_date),
+            ["symbol", "date"],
+        ]
+        anchors = pd.concat([anchors, exact_daily_anchors], ignore_index=True).drop_duplicates().sort_values(["symbol", "date"])
     anchors["year"] = pd.to_datetime(anchors["date"]).dt.year
     target_index = pd.MultiIndex.from_tuples(option_target_map.keys(), names=["symbol", "date"])
     regular_candidates = anchors.loc[~anchors.set_index(["symbol", "date"]).index.isin(target_index)]
@@ -828,6 +920,13 @@ def main() -> None:
         anchors = pd.concat([regular_anchors, option_daily_anchors, option_anchors], ignore_index=True).drop_duplicates(["symbol", "date"])
     else:
         anchors = pd.concat([regular_anchors, option_daily_anchors], ignore_index=True).drop_duplicates(["symbol", "date"])
+    if args.inference_only and args.prediction_start_date and args.prediction_start_date != "1900-01-01":
+        requested_anchor_date = pd.Timestamp(args.prediction_start_date).normalize()
+        exact_daily_anchors = daily.loc[
+            pd.to_datetime(daily["date"]).dt.normalize().eq(requested_anchor_date),
+            ["symbol", "date"],
+        ]
+        anchors = pd.concat([anchors, exact_daily_anchors], ignore_index=True).drop_duplicates(["symbol", "date"])
     empty_annual = annual.iloc[0:0]
     empty_quarterly = quarterly.iloc[0:0]
     empty_daily = daily.iloc[0:0]
@@ -936,18 +1035,32 @@ def main() -> None:
             "option_valid": np.isfinite(option_target_map.get((symbol, anchor.normalize()), np.full(2, np.nan, dtype="float32"))),
         }
         samples.append(_LazySample(metadata, materialize) if args.stream_samples else {**metadata, **materialize()})
+    if args.max_samples:
+        if args.max_samples < 1:
+            parser.error("--max-samples must be positive when provided")
+        samples = sorted(samples, key=lambda item: (pd.Timestamp(item["date"]), str(item["symbol"])))[:args.max_samples]
     frame = pd.DataFrame([{key: value for key, value in sample.items() if isinstance(value, str) or isinstance(value, int)} for sample in samples])
     label_arrays: dict[str, np.ndarray] = {}
     label_names: dict[str, list[str]] = {}
     for task in DOCUMENT_TASK_NAMES[1:]:
         label_arrays[task], label_names[task], _ = _encode_labels(frame[task])
+    if checkpoint_payload is not None and isinstance(checkpoint_payload.get("labels"), dict):
+        checkpoint_labels = checkpoint_payload["labels"]
+        for task in DOCUMENT_TASK_NAMES[1:]:
+            if task in checkpoint_labels:
+                label_names[task] = list(checkpoint_labels[task])
     if option_columns:
         feature_families = [*feature_families, "options"]
     feature_family_dimensions = {family: 1 for family in feature_families if family != "options"}
     if option_columns:
         feature_family_dimensions["options"] = len(option_columns)
     family_names = [*feature_families, *target_families]
-    label_names["family"] = family_names
+    label_names["family"] = (
+        list(checkpoint_payload["labels"]["family"])
+        if checkpoint_payload is not None and isinstance(checkpoint_payload.get("labels"), dict)
+        and "family" in checkpoint_payload["labels"]
+        else family_names
+    )
     for index, sample in enumerate(samples):
         for name in DOCUMENT_TASK_NAMES[1:]:
             sample[f"{name}_label"] = int(label_arrays[name][index])
@@ -968,6 +1081,22 @@ def main() -> None:
         evaluation_samples = [sample for sample in samples if str(sample["symbol"]).upper() in test_symbols]
         if not evaluation_samples:
             raise ValueError("test symbol file does not match any corpus samples")
+    if args.inference_only:
+        if args.prediction_start_date and args.prediction_start_date != "1900-01-01":
+            requested_date = pd.Timestamp(args.prediction_start_date).normalize()
+            evaluation_samples = [sample for sample in evaluation_samples if pd.Timestamp(sample["date"]).normalize() == requested_date]
+            if not evaluation_samples:
+                raise ValueError(f"No feature samples exist for requested inference date {requested_date.date()}")
+            symbols_on_date = {str(sample["symbol"]).upper() for sample in evaluation_samples}
+            print(f"[multirate-inference] exact-date evaluation set: {len(symbols_on_date)} symbols on {requested_date.date()}", flush=True)
+        else:
+            latest_by_symbol: dict[str, dict[str, object]] = {}
+            for sample in evaluation_samples:
+                symbol = str(sample["symbol"]).upper()
+                if symbol not in latest_by_symbol or pd.Timestamp(sample["date"]) > pd.Timestamp(latest_by_symbol[symbol]["date"]):
+                    latest_by_symbol[symbol] = sample
+            evaluation_samples = sorted(latest_by_symbol.values(), key=lambda item: (pd.Timestamp(item["date"]), str(item["symbol"])))
+            print(f"[multirate-inference] latest-per-symbol evaluation set: {len(evaluation_samples)} symbols", flush=True)
     train_samples = samples if train_symbols is None else [
         sample for sample in samples if str(sample["symbol"]).upper() in train_symbols
     ]
@@ -1009,12 +1138,35 @@ def main() -> None:
         print(json.dumps({"samples": len(samples), "context_cache": cache_metrics}, indent=2), flush=True)
         return
 
+    # Inference must recreate the checkpoint architecture.  Live notebooks
+    # commonly use CLI defaults, while smoke/production checkpoints may have
+    # different width or depth.  Prefer explicit metadata and fall back to
+    # the state-dict shapes for older checkpoints.
+    if checkpoint_payload is not None:
+        checkpoint_metrics = checkpoint_payload.get("metrics", {}) if isinstance(checkpoint_payload, dict) else {}
+        state_dict = checkpoint_payload.get("state_dict", {}) if isinstance(checkpoint_payload, dict) else {}
+        checkpoint_width = checkpoint_metrics.get("d_model")
+        if checkpoint_width is None and isinstance(state_dict, dict):
+            weight = state_dict.get("task_heads.oracle_is_buy.weight")
+            if weight is not None and getattr(weight, "ndim", 0) == 2:
+                checkpoint_width = int(weight.shape[1])
+        if checkpoint_width:
+            args.d_model = int(checkpoint_width)
+        layer_keys = [key for key in state_dict if key.startswith("encoders.annual.layers.")] if isinstance(state_dict, dict) else []
+        if layer_keys:
+            args.layers = max(int(key.split(".layers.", 1)[1].split(".", 1)[0]) for key in layer_keys) + 1
+        if args.d_model % args.num_heads:
+            args.num_heads = max(divisor for divisor in range(1, args.num_heads + 1) if args.d_model % divisor == 0)
+        if checkpoint_metrics.get("document_tasks_disabled"):
+            enabled_document_tasks = ()
+
     device = torch.device(args.device)
     config = MultiRateTransformerConfig(
         backbone="encoder_decoder", d_model=args.d_model, num_heads=args.num_heads,
         layers=args.layers, document_pool="mean", max_position=512,
         learned_aggregation_gate=args.learned_aggregation_gate,
         cacheable_rate_states=not args.legacy_rate_fusion,
+        attention_backend=args.attention_backend,
     )
     task_bundle = add_subtoken_temporal_tasks(
         train_samples,
@@ -1048,7 +1200,7 @@ def main() -> None:
         prediction_tasks=task_bundle.prediction_tasks,
     ).to(device)
     if args.checkpoint is not None:
-        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        checkpoint = checkpoint_payload or torch.load(args.checkpoint, map_location=device, weights_only=True)
         model.load_state_dict(checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint)
     if args.compile_model:
         if not hasattr(torch, "compile"):
@@ -1068,6 +1220,7 @@ def main() -> None:
         optimizer,
         grad_accumulation_steps=args.grad_accumulation_steps,
         autocast_dtype=torch.float16 if args.mixed_precision else None,
+        transformer_engine_fp8=args.fp8,
     )
     best_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
@@ -1326,6 +1479,12 @@ def main() -> None:
         eval_batch_size = min(args.batch_size, 64)
         for start in range(0, len(evaluation_samples), eval_batch_size):
             batch = evaluation_samples[start:start + eval_batch_size]
+            if args.inference_only:
+                batch_symbols = ",".join(dict.fromkeys(str(item.get("symbol", "?")) for item in batch))
+                print(
+                    f"[multirate-inference] scoring symbols {start + 1}-{start + len(batch)}/{len(evaluation_samples)}: {batch_symbols}",
+                    flush=True,
+                )
             def stack(name: str) -> torch.Tensor: return torch.from_numpy(np.stack([item[name] for item in batch])).to(device)
             def context(name: str, padding_name: str) -> tuple[torch.Tensor, torch.Tensor]:
                 values = stack(name); padding = stack(padding_name).bool()
@@ -1413,6 +1572,7 @@ def main() -> None:
         "cacheable_rate_states": config.cacheable_rate_states,
         "group_context_batches": args.group_context_batches,
         "mixed_precision": args.mixed_precision,
+        "fp8": args.fp8,
         "compile_model": args.compile_model,
         "optimizer": args.optimizer,
         "skip_embeddings": args.skip_embeddings,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Hashable, Iterator, Mapping, Sequence
 
@@ -113,6 +114,7 @@ class Trainer:
         grad_accumulation_steps: int = 1,
         seed: int = 0,
         autocast_dtype: torch.dtype | None = None,
+        transformer_engine_fp8: bool = False,
     ) -> None:
         if not corpus_tasks:
             raise ValueError("at least one corpus/task group is required")
@@ -124,6 +126,19 @@ class Trainer:
         self.grad_accumulation_steps = grad_accumulation_steps
         self.seed = seed
         self.autocast_dtype = autocast_dtype
+        self.transformer_engine_fp8 = bool(transformer_engine_fp8)
+        self.fp8_autocast = None
+        self.fp8_recipe = None
+        if self.transformer_engine_fp8:
+            try:
+                import transformer_engine.pytorch as te
+                from transformer_engine.common.recipe import DelayedScaling
+            except (ImportError, OSError) as exc:
+                raise RuntimeError(
+                    "transformer_engine_fp8=True requires transformer_engine[pytorch]"
+                ) from exc
+            self.fp8_autocast = te.autocast
+            self.fp8_recipe = DelayedScaling()
         self.grad_scaler = torch.amp.GradScaler("cuda", enabled=autocast_dtype == torch.float16 and torch.cuda.is_available())
         self.current_epoch = 0
         self.current_step = 0
@@ -164,10 +179,12 @@ class Trainer:
             total_batches = sum(corpus.batch_count() for corpus, _ in self.corpus_tasks)
             for step_index, (batch, tasks) in enumerate(self.batches(epoch)):
                 self.current_step = step_index
-                if self.autocast_dtype is not None and next(self.model.parameters()).is_cuda:
-                    with torch.autocast(device_type="cuda", dtype=self.autocast_dtype):
-                        task_losses = step(self.model, batch, tasks)
-                else:
+                context = nullcontext()
+                if self.transformer_engine_fp8:
+                    context = self.fp8_autocast(enabled=True, recipe=self.fp8_recipe)
+                elif self.autocast_dtype is not None and next(self.model.parameters()).is_cuda:
+                    context = torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
+                with context:
                     task_losses = step(self.model, batch, tasks)
                 missing = {task.name for task in tasks} - set(task_losses)
                 if missing:

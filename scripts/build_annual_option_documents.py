@@ -9,6 +9,11 @@ from pathlib import Path
 
 import polars as pl
 
+from quant_orchestrator.research_tools.option_training import (
+    group_option_contracts_by_dte,
+    load_first_trading_day_option_chains,
+)
+
 
 def _date_expr(name: str) -> pl.Expr:
     return pl.col(name).cast(pl.Datetime, strict=False).dt.replace_time_zone(None).dt.truncate("1d")
@@ -29,41 +34,8 @@ def _weighted_quote(quote: str, volume: str, alias: str) -> pl.Expr:
 
 
 def _load_raw_first_day(symbols: set[str], *, start_year: int, end_year: int) -> pl.DataFrame:
-    """Read first-session chains without converting warehouse frames."""
-    from quant_warehouse.platforms.data_providers.thetadata.options import read_thetadata_eod_option_chain
-
-    frames: list[pl.DataFrame] = []
-    columns = [
-        "snapshot_date", "underlying_symbol", "contract_symbol", "expiration",
-        "option_type", "strike", "bid", "ask", "mid", "volume", "open_interest",
-    ]
-    for symbol in sorted(symbols):
-        for year in range(start_year, end_year + 1):
-            start = f"{year}-01-01"
-            end = f"{year}-01-11"
-            chain = read_thetadata_eod_option_chain(
-                symbol, start_date=start, end_date=end, columns=columns,
-            )
-            if chain is None or chain.is_empty():
-                continue
-            chain = chain.with_columns(_date_expr("snapshot_date"), _date_expr("expiration"))
-            first = chain.select(pl.col("snapshot_date").drop_nulls().min()).item()
-            if first is None:
-                continue
-            chain = chain.filter(pl.col("snapshot_date") == first)
-            if chain.is_empty():
-                continue
-            frames.append(
-                chain.with_columns(
-                    pl.lit(symbol).alias("symbol"),
-                    pl.lit(first).alias("entry_date"),
-                    pl.col("option_type").cast(pl.String).str.to_lowercase().str.strip_chars(),
-                    pl.when(pl.col("option_type").cast(pl.String).str.to_lowercase() == "call")
-                    .then(pl.lit("long")).otherwise(pl.lit("short")).alias("side"),
-                    (pl.col("expiration") - pl.lit(first)).dt.total_days().cast(pl.Int64).alias("dte"),
-                )
-            )
-    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+    """Compatibility wrapper for the canonical package implementation."""
+    return load_first_trading_day_option_chains(symbols, start_year=start_year, end_year=end_year)
 
 
 def _select(options: pl.DataFrame, *, max_contracts: int, group_by_dte: bool) -> pl.DataFrame:
@@ -96,20 +68,7 @@ def _select(options: pl.DataFrame, *, max_contracts: int, group_by_dte: bool) ->
             .group_by(["symbol", "year", "option_type"], maintain_order=True)
             .head(max_contracts)
         )
-    groups = options.group_by(["symbol", "year", "option_type", "dte"], maintain_order=True).agg(
-        pl.col("snapshot_date").first(), pl.col("underlying_symbol").first(),
-        pl.col("expiration").first(), pl.col("strike").first(), pl.col("bid").first(),
-        pl.col("ask").first(), pl.col("mid").first(), pl.col("volume").mean(),
-        pl.col("open_interest").mean(), pl.col("entry_date").first(), pl.col("side").first(),
-        pl.col("contract_symbol").first().alias("contract_symbol_example"),
-        pl.col("contract_symbol").n_unique().alias("dte_contract_count"),
-        pl.col("contract_symbol").sort().str.join(",").alias("dte_contracts"),
-        _weighted_quote("bid", "volume", "entry_bid"),
-        _weighted_quote("ask", "volume", "entry_ask"),
-    )
-    return groups.with_columns(
-        pl.concat_str([pl.lit("DTE_"), pl.col("dte").cast(pl.String)]).alias("contract_symbol")
-    ).drop("contract_symbol_example")
+    return group_option_contracts_by_dte(options)
 
 
 def _expand_documents(base: pl.DataFrame, options: pl.DataFrame, name: str, base_symbols: set[str]) -> pl.DataFrame:

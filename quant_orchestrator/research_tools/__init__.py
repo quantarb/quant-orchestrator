@@ -63,6 +63,10 @@ from quant_orchestrator.research_tools.option_meta_ranker import (
     score_option_meta_ranker,
     train_option_meta_ranker,
 )
+from quant_orchestrator.research_tools.option_training import (
+    group_option_contracts_by_dte,
+    load_first_trading_day_option_chains,
+)
 from quant_orchestrator.research_tools.options_experiment import (
     OptopsyExecutionConfig,
     OptionExperimentArtifacts,
@@ -119,6 +123,8 @@ __all__ = [
     "OptionFamilyRankerResult",
     "OptionMetaRankerConfig",
     "OptionMetaRankerResult",
+    "group_option_contracts_by_dte",
+    "load_first_trading_day_option_chains",
     "OptionMvBasketConfig",
     "OptionRetrievalConfig",
     "OptionRuntimeEstimate",

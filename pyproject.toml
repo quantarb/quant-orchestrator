@@ -32,6 +32,10 @@ cuda = [
     "cudf-cu12>=26.4,<27",
     "cuml-cu12>=26.4,<27",
 ]
+cuda-te = [
+    "torch>=2.5",
+    "transformer_engine[pytorch]>=2.18,<3",
+]
 backtesting = [
     "backtesting>=0.3.3",
     "lean>=1.0.0",
@@ -52,6 +56,7 @@ all = [
     "cupy-cuda12x!=14.0.0,>=14,<15",
     "cudf-cu12>=26.4,<27",
     "cuml-cu12>=26.4,<27",
+    "transformer_engine[pytorch]>=2.18,<3",
     "zipline-reloaded==3.1.1",
     "nautilus-trader==1.228.0",
 ]

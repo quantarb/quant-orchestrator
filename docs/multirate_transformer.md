@@ -95,3 +95,24 @@ temporal documents; they do not create cross-sectional documents.
 
 These are learned latent features for the supervised tasks; they are not
 persisted as an unbounded set of generated columns.
+
+## NVIDIA Transformer Engine backend
+
+CUDA training can opt into NVIDIA Transformer Engine for the encoder and
+decoder attention/MLP stacks without changing the coverage, date-mask, task,
+or rate-cache contracts:
+
+```bash
+pip install 'quant-orchestrator[cuda-te]'
+python scripts/train_multirate_mtl.py \
+  --attention-backend transformer_engine \
+  --fp8 \
+  ...
+```
+
+The default backend remains PyTorch. Transformer Engine is loaded lazily, so
+CPU installations and existing PyTorch workflows do not require the optional
+CUDA dependency. Its arbitrary boolean masks preserve the same-date
+bidirectional and future-date-blocked policy. Benchmark both backends before
+using FP8 in a production experiment; compare validation loss and downstream
+strategy metrics in addition to throughput and memory.
