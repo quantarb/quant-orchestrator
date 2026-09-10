@@ -6,6 +6,43 @@ import pytest
 from scripts.train_multirate_mtl import _IndexedTable, _as_datetime
 from quant_orchestrator.research_tools.multirate_validation import validate_supervision
 from quant_orchestrator.research_tools.streaming_context import StreamingContext
+from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups
+
+
+def test_issuer_linkage_does_not_turn_debt_and_preferred_into_options():
+    taxonomy = pl.DataFrame({
+        'symbol': ['A', 'A_CALL', 'A_NOTE', 'A_PREF'],
+        'underlying_symbol': ['A'] * 4,
+        'asset_class': ['equity', 'option', 'note_bond', 'preferred'],
+    })
+    assert instrument_asset_groups(taxonomy) == {
+        'equity': {'A'}, 'option': {'A_CALL'},
+        'note_bond': {'A_NOTE'}, 'preferred': {'A_PREF'},
+    }
+
+
+def test_instrument_type_cannot_be_guessed_from_issuer_linkage():
+    with pytest.raises(ValueError, match='asset_class'):
+        instrument_asset_groups(pl.DataFrame({'symbol': ['A_NOTE'], 'underlying_symbol': ['A']}))
+
+
+def test_equity_events_cannot_satisfy_bond_label_coverage():
+    events = pl.DataFrame({
+        'symbol': ['A'], 'date': [datetime(2023, 12, 31)],
+        'event_date': [datetime(2023, 1, 2)],
+        'target_family': ['equity.strategy.oracle_trades'],
+        'signal_value': [1.], **{f'text_{i}': [0.] for i in range(7)},
+    })
+    store = StreamingSupervision(events.lazy())
+    with pytest.raises(ValueError, match='note_bond'):
+        store.coverage(symbols_by_asset={'equity': {'A'}, 'note_bond': {'A_NOTE'}},
+                       required_tasks=('oracle_is_buy',))
+    debt_events = events.with_columns(pl.lit('A_NOTE').alias('symbol'))
+    store = StreamingSupervision(pl.concat([events, debt_events]).lazy())
+    assert store.coverage(symbols_by_asset={'equity': {'A'}, 'note_bond': {'A_NOTE'}},
+                          required_tasks=('oracle_is_buy',)) == {
+        'equity': {'oracle_is_buy': 1}, 'note_bond': {'oracle_is_buy': 1},
+    }
 
 
 @pytest.mark.parametrize("unit", ["ns", "us", "ms"])

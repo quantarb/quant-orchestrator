@@ -9,6 +9,23 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
 )
 
 
+def instrument_asset_groups(taxonomy: pl.DataFrame) -> dict[str, set[str]]:
+    """Use explicit security types; issuer linkage does not identify an option."""
+    required = {'symbol', 'asset_class'}
+    if required - set(taxonomy.columns):
+        raise ValueError('Instrument taxonomy requires symbol and asset_class columns')
+    groups: dict[str, set[str]] = {}
+    seen = set()
+    for symbol, asset in taxonomy.select('symbol', 'asset_class').iter_rows():
+        if not symbol or not asset or asset != asset.strip().lower():
+            raise ValueError('Instrument taxonomy requires nonempty symbols and lowercase asset_class values')
+        if symbol in seen:
+            raise ValueError(f'Duplicate instrument taxonomy symbol: {symbol}')
+        seen.add(symbol)
+        groups.setdefault(asset, set()).add(symbol)
+    return groups
+
+
 class StreamingSupervision:
     def __init__(self, events: pl.LazyFrame, *, cutoff: datetime | None = None):
         if cutoff is not None:
@@ -39,9 +56,9 @@ class StreamingSupervision:
             return {} if default is None else default
         return {task: rows[task][0] for task in self.tasks if rows[task][0] is not None}
 
-    def coverage(self, *, equity_symbols, option_symbols, required_tasks):
+    def coverage(self, *, symbols_by_asset, required_tasks):
         counts = {}
-        for asset, symbols in [('equity', equity_symbols), ('option', option_symbols)]:
+        for asset, symbols in sorted(symbols_by_asset.items()):
             if not symbols:
                 continue
             row = self.scan.filter(pl.col('symbol').is_in(list(symbols))).select(pl.col(task).count() for task in required_tasks).collect(engine='streaming').row(0, named=True)

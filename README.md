@@ -421,5 +421,7 @@ simulation = simulate_return_paths(returns, iterations=1000, horizon=252, block_
 ```
 
 The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
-within-step issuer encoding. See the [streaming milestone](docs/multirate-streaming-milestone.md) for the
+within-step issuer encoding. Instrument types are explicit and label coverage is
+checked per asset class. Within-issuer instrument-selection training remains to
+be implemented. See the [streaming milestone](docs/multirate-streaming-milestone.md) for the
 training contract, verification commands, and remaining real-data limits.

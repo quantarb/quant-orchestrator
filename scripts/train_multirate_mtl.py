@@ -26,7 +26,7 @@ from torch import nn
 
 from quant_warehouse import Warehouse
 from quant_orchestrator.research_tools.streaming_context import StreamingContext
-from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision
+from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups
 from quant_orchestrator.research_tools.multirate_objectives import next_observation_targets
 
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import (
@@ -819,12 +819,12 @@ def main() -> None:
     sparse = normalize_table(sparse)
     option_columns: list[str] = []
     option_target_map: dict[tuple[str, datetime], torch.Tensor] = {}
-    option_document_symbols: set[str] = set()
+    symbols_by_asset = instrument_asset_groups(taxonomy)
+    option_document_symbols = symbols_by_asset.get("option", set())
     option_document_start_dates: dict[str, datetime] = {}
     source_symbol_by_symbol: dict[str, str] = {}
     if "underlying_symbol" in taxonomy.columns:
         source_symbol_by_symbol = dict(taxonomy.select("symbol", "underlying_symbol").iter_rows())
-        option_document_symbols = {symbol for symbol, source in source_symbol_by_symbol.items() if symbol != source}
     option_entry_anchors = pl.DataFrame({"symbol": pl.Series([], dtype=pl.String), "date": pl.Series([], dtype=pl.Datetime)})
     if args.option_panel is not None:
         option_panel = issuer_quartile_panel if issuer_quartile_panel is not None else _read_parquet_polars(args.option_panel)
@@ -890,8 +890,7 @@ def main() -> None:
     )
     if not args.inference_only:
         coverage = supervised_target_map.coverage(
-            equity_symbols=set(taxonomy["symbol"].to_list()) - option_document_symbols,
-            option_symbols=option_document_symbols,
+            symbols_by_asset=instrument_asset_groups(taxonomy),
             required_tasks=(*ORACLE_SUPERVISED_TASK_NAMES, *HITS_SUPERVISED_TASK_NAMES),
         )
         (output_dir / "supervision_coverage.json").write_text(json.dumps(coverage, indent=2))
@@ -1132,7 +1131,7 @@ def main() -> None:
         metadata = {
             "symbol": symbol, "date": anchor.strftime("%Y-%m-%d"),
             "issuer": str(taxonomy_by_symbol[symbol]["issuer"]),
-            "asset_class": str(taxonomy_by_symbol[symbol].get("asset_class") or ("option" if symbol in option_document_symbols else "equity")),
+            "asset_class": str(taxonomy_by_symbol[symbol]["asset_class"]),
             "issuer_context_key": (source_symbol, _epoch_ns(anchor)),
             "annual_context_key": (source_symbol, rate_version("annual", annual_index, source_symbol, anchor)),
             "quarterly_context_key": (source_symbol, rate_version("quarterly", quarterly_index, source_symbol, anchor)),

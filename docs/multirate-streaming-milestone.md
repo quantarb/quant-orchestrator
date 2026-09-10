@@ -24,6 +24,35 @@ routing; PyTorch supplies attention, automatic differentiation, and optimization
 - Persistent rate caches are inference-only. They retain subtoken states and
   reject changed inputs/windows or changed model parameters. Training reuse
   retains the autograd graph within one forward/backward step.
+- Instrument taxonomy requires an explicit `asset_class` for every symbol.
+  Issuer linkage does not imply an option: `equity`, `option`, `note_bond`,
+  `preferred`, and other supplied classes have separate adapters and supervision
+  coverage checks. This is schema support, not evidence of training on every class.
+
+## Instrument selection objective
+
+The user's intended decision is to select the appropriate instrument given an
+issuer's state at a date. Issuer identity is reference metadata; predicting its
+identity does not establish instrument-selection skill. The current independent
+Oracle/HITS predictions and self-supervised tasks are auxiliary foundations;
+there is no implemented cross-instrument selection objective yet.
+
+The next training change needs issuer/date candidate groups, an instrument
+utility head, and a comparison loss within each group. Warehouse-prepared
+outcomes must use a declared common horizon, capital convention, and outcome
+criterion. The criterion (raw return, risk-adjusted return, or a mandate) still
+needs to be settled. Do not silently compare asset-specific Oracle/HITS labels
+as if they were interchangeable utilities. Candidate eligibility must use only
+information available at the decision date, and label availability must precede
+the training cutoff. Event-only selection groups must remain separate from the
+full-calendar scoring universe.
+
+Chronological evaluation should measure the chosen instrument's realized utility
+and regret versus eligible alternatives, alongside per-asset coverage and
+simple selection baselines. Actual debt/preferred instruments need their own
+histories and terms; adjusted price paths alone do not validate complete coupon,
+redemption, credit, or execution economics. Keep group assembly in bounded
+Polars partitions and issuer-context reuse inside a gradient-preserving step.
 
 ## Memory contract
 
@@ -56,6 +85,11 @@ apply to normalization, including the underlying issuer of training instruments.
 The stored real-data check uses one issuer (AAPL), its equity, and synthetic
 option baskets in the existing `contract_check_v2` corpus. It is a pipeline check,
 not a promoted experiment baseline or evidence of predictive performance.
+Its original taxonomy predates mandatory `asset_class` metadata. Before rerunning
+these historical commands, annotate the known equity and synthetic option rows
+explicitly; the trainer now rejects untyped corpora rather than guessing security
+types from their issuer link. The old Pandas corpus builder is not the streaming
+assembly path and still needs replacement.
 
 ```bash
 python scripts/train_multirate_mtl.py \

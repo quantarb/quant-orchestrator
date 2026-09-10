@@ -323,7 +323,7 @@ def main() -> None:
     profiles = warehouse.catalog.query_symbol_profiles(provider="fmp", min_market_cap=0, country="", exchanges=(), exclude_etf=True, exclude_fund=True, limit=100_000)
     profiles_by_symbol = {str(profile.symbol).strip().upper(): profile for profile in profiles}
     taxonomy = pd.DataFrame([
-        {"symbol": symbol, "issuer": _canonical_issuer_key(profiles_by_symbol.get(symbol), symbol),
+        {"symbol": symbol, "asset_class": "equity", "issuer": _canonical_issuer_key(profiles_by_symbol.get(symbol), symbol),
          "sector": (getattr(profiles_by_symbol.get(symbol), "sector", None) or "Unknown"),
          "subsector": subsectors.get(symbol, "Unknown"),
          "industry": (getattr(profiles_by_symbol.get(symbol), "industry", None) or "Unknown")}

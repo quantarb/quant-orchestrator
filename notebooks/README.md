@@ -41,5 +41,7 @@ Current reusable code placement:
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.
 
 The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
-within-step issuer encoding. See the [streaming milestone](../docs/multirate-streaming-milestone.md) for the
+within-step issuer encoding. Corpora now require explicit `asset_class` metadata;
+the historical smoke taxonomy must be annotated before reuse. Instrument-selection
+training is still pending. See the [streaming milestone](../docs/multirate-streaming-milestone.md) for the
 training contract, verification commands, and remaining real-data limits.
