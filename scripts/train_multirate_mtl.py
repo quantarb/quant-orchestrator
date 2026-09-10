@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import subprocess
 import sys
 from collections import OrderedDict
+from datetime import datetime, timezone
 from time import perf_counter
 from pathlib import Path
 
@@ -16,11 +18,8 @@ from pathlib import Path
 # globally installed quant-orchestrator is present.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import numpy as np
-import pandas as pd
 import polars as pl
 import torch
-from sklearn.manifold import TSNE
 from torch import nn
 
 from quant_warehouse import Warehouse
@@ -82,24 +81,43 @@ def matryoshka_alignment_loss(embedding: torch.Tensor, dimensions: tuple[int, ..
         losses.append(1.0 - (prefix * target[:, :dimension]).sum(dim=-1).mean())
     return torch.stack(losses).mean()
 
-def _encode_labels(values: pd.Series) -> tuple[np.ndarray, list[str], dict[str, int]]:
-    labels = sorted(values.astype(str).fillna("Unknown").unique())
+def _as_datetime(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, torch.Tensor):
+        value = value.item()
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value) / 1_000_000_000, tz=timezone.utc).replace(tzinfo=None)
+    text = str(value).replace("Z", "+00:00")
+    return datetime.fromisoformat(text).replace(tzinfo=None)
+
+
+def _epoch_ns(value: object) -> int:
+    parsed = _as_datetime(value).replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1_000_000_000)
+
+
+def _is_missing(value: object) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _encode_labels(values: pl.Series) -> tuple[torch.Tensor, list[str], dict[str, int]]:
+    normalized = values.cast(pl.String).fill_null("Unknown")
+    labels = sorted(normalized.unique().to_list())
     mapping = {value: index for index, value in enumerate(labels)}
-    return values.astype(str).fillna("Unknown").map(mapping).to_numpy("int64"), labels, mapping
+    return torch.tensor([mapping[value] for value in normalized.to_list()], dtype=torch.long), labels, mapping
 
 
-def _symbol_rows(table: pd.DataFrame | dict[str, pd.DataFrame], symbol: str) -> pd.DataFrame:
-    if isinstance(table, dict):
-        return table.get(symbol, table.get("__empty__", pd.DataFrame()))
-    return table.loc[table["symbol"].eq(symbol)]
+def _symbol_rows(table: pl.DataFrame, symbol: str) -> pl.DataFrame:
+    return table.filter(pl.col("symbol").cast(pl.String).str.to_uppercase() == str(symbol).upper())
 
 
-def _read_parquet_polars(path: Path, columns: list[str] | None = None) -> pd.DataFrame:
-    """Read parquet with Polars' streaming engine before the compatibility boundary."""
+def _read_parquet_polars(path: Path, columns: list[str] | None = None) -> pl.DataFrame:
+    """Read parquet with Polars streaming and keep it as a Polars table."""
     scan = pl.scan_parquet(path)
     if columns is not None:
         scan = scan.select(columns)
-    return scan.collect(engine="streaming").to_pandas()
+    return scan.collect(engine="streaming")
 
 
 class _IndexedTable:
@@ -110,14 +128,16 @@ class _IndexedTable:
     O(log n) window lookup without allocating a DataFrame per sample.
     """
 
-    def __init__(self, table: pd.DataFrame, value_columns: list[str], *, target_column: str | None = None):
+    def __init__(self, table: pl.DataFrame, value_columns: list[str], *, target_column: str | None = None):
         self.value_columns = tuple(value_columns)
-        self.rows: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None]] = {}
-        for symbol, group in table.sort_values(["symbol", "date"], kind="stable").groupby("symbol", sort=False):
-            dates = pd.to_datetime(group["date"], errors="coerce").to_numpy(dtype="datetime64[ns]").astype("int64")
-            values = group[list(value_columns)].to_numpy("float32", copy=False)
-            targets = group[target_column].to_numpy("int64", copy=False) if target_column else None
-            self.rows[str(symbol).upper()] = (dates, values, targets)
+        self.rows: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+        ordered = table.sort(["symbol", "date"])
+        for group in ordered.partition_by("symbol", maintain_order=True):
+            symbol = str(group["symbol"][0]).upper()
+            dates = group["date"].cast(pl.Datetime, strict=False).cast(pl.Int64).to_torch().flatten()
+            values = group.select(value_columns).fill_nan(None).fill_null(float("nan")).to_torch().to(torch.float32)
+            targets = group[target_column].to_torch().to(torch.long) if target_column else None
+            self.rows[symbol] = (dates, values, targets)
 
     def save_memmap(self, directory: Path, name: str) -> None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -129,12 +149,12 @@ class _IndexedTable:
             dates, values, targets = self.rows[symbol]
             date_parts.append(dates); value_parts.append(values)
             if has_targets:
-                target_parts.append(targets if targets is not None else np.full(len(dates), -1, dtype="int64"))
+                target_parts.append(targets if targets is not None else torch.full((len(dates),), -1, dtype=torch.long))
             offsets.append(offsets[-1] + len(dates))
-        np.save(directory / f"{name}_dates.npy", np.concatenate(date_parts) if date_parts else np.empty(0, dtype="int64"))
-        np.save(directory / f"{name}_values.npy", np.concatenate(value_parts) if value_parts else np.empty((0, len(self.value_columns)), dtype="float32"))
+        torch.save(torch.cat(date_parts) if date_parts else torch.empty(0, dtype=torch.long), directory / f"{name}_dates.pt")
+        torch.save(torch.cat(value_parts) if value_parts else torch.empty((0, len(self.value_columns)), dtype=torch.float32), directory / f"{name}_values.pt")
         if has_targets:
-            np.save(directory / f"{name}_targets.npy", np.concatenate(target_parts))
+            torch.save(torch.cat(target_parts), directory / f"{name}_targets.pt")
         (directory / f"{name}_index.json").write_text(json.dumps({
             "symbols": symbols, "offsets": offsets, "value_columns": list(self.value_columns), "has_targets": has_targets,
         }))
@@ -144,9 +164,9 @@ class _IndexedTable:
         metadata = json.loads((directory / f"{name}_index.json").read_text())
         instance = cls.__new__(cls)
         instance.value_columns = tuple(metadata["value_columns"])
-        dates = np.load(directory / f"{name}_dates.npy", mmap_mode="r")
-        values = np.load(directory / f"{name}_values.npy", mmap_mode="r")
-        targets = np.load(directory / f"{name}_targets.npy", mmap_mode="r") if metadata["has_targets"] else None
+        dates = torch.load(directory / f"{name}_dates.pt", weights_only=True)
+        values = torch.load(directory / f"{name}_values.pt", weights_only=True)
+        targets = torch.load(directory / f"{name}_targets.pt", weights_only=True) if metadata["has_targets"] else None
         offsets = metadata["offsets"]
         instance.rows = {
             symbol: (dates[offsets[i]:offsets[i + 1]], values[offsets[i]:offsets[i + 1]], targets[offsets[i]:offsets[i + 1]] if targets is not None else None)
@@ -154,21 +174,21 @@ class _IndexedTable:
         }
         return instance
 
-    def window(self, symbol: str, anchor: pd.Timestamp, length: int):
+    def window(self, symbol: str, anchor: datetime, length: int):
         dates, values, targets = self.rows.get(str(symbol).upper(), (
-            np.empty(0, dtype="int64"),
-            np.empty((0, len(self.value_columns)), dtype="float32"),
+            torch.empty(0, dtype=torch.long),
+            torch.empty((0, len(self.value_columns)), dtype=torch.float32),
             None,
         ))
-        stop = int(np.searchsorted(dates, pd.Timestamp(anchor).value, side="right"))
+        stop = int(torch.searchsorted(dates, torch.tensor(_epoch_ns(anchor), dtype=torch.long), right=True))
         start = max(0, stop - length)
         selected = values[start:stop]
-        output = np.full((length, len(self.value_columns)), np.nan, dtype="float32")
-        padding = np.ones(length, dtype=bool)
+        output = torch.full((length, len(self.value_columns)), float("nan"), dtype=torch.float32)
+        padding = torch.ones(length, dtype=torch.bool)
         if len(selected):
             output[-len(selected):] = selected
             padding[-len(selected):] = False
-        selected_dates = dates[start:stop].astype("datetime64[ns]")
+        selected_dates = dates[start:stop]
         return output, padding, selected_dates, (targets[start:stop] if targets is not None else None)
 
 
@@ -207,42 +227,42 @@ def _canonical_issuer_key(profile: object | None, symbol: str) -> str:
     return f"symbol:{str(symbol).strip().upper()}"
 
 
-def _window(table: pd.DataFrame | dict[str, pd.DataFrame], symbol: str, anchor: pd.Timestamp, value_columns: list[str], length: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _window(table: pl.DataFrame, symbol: str, anchor: datetime, value_columns: list[str], length: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if isinstance(table, _IndexedTable):
         values, padding, dates, _ = table.window(symbol, anchor, length)
         return values, padding, dates
-    rows = _symbol_rows(table, symbol).loc[lambda frame: frame["date"].le(anchor)].tail(length)
-    values = rows[value_columns].to_numpy("float32") if len(rows) else np.empty((0, len(value_columns)), dtype="float32")
-    dates = pd.to_datetime(rows["date"], errors="coerce").to_numpy() if len(rows) else np.empty(0, dtype="datetime64[ns]")
-    padding = np.ones(length, dtype=bool)
-    output = np.full((length, len(value_columns)), np.nan, dtype="float32")
+    rows = _symbol_rows(table, symbol).filter(pl.col("date") <= _as_datetime(anchor)).tail(length)
+    values = rows.select(value_columns).fill_nan(None).fill_null(float("nan")).to_torch().to(torch.float32) if len(rows) else torch.empty((0, len(value_columns)), dtype=torch.float32)
+    dates = rows["date"].cast(pl.Datetime, strict=False).cast(pl.Int64).to_torch().flatten() if len(rows) else torch.empty(0, dtype=torch.long)
+    padding = torch.ones(length, dtype=torch.bool)
+    output = torch.full((length, len(value_columns)), float("nan"), dtype=torch.float32)
     if len(rows):
         output[-len(rows):] = values
         padding[-len(rows):] = False
     return output, padding, dates
 
 
-def _sparse_window(table: pd.DataFrame | dict[str, pd.DataFrame], symbol: str, anchor: pd.Timestamp, value_columns: list[str], length: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _sparse_window(table: pl.DataFrame, symbol: str, anchor: datetime, value_columns: list[str], length: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if isinstance(table, _IndexedTable):
         values, padding, dates, targets = table.window(symbol, anchor, length)
-        labels = np.full(length, -1, dtype="int64")
+        labels = torch.full((length,), -1, dtype=torch.long)
         if targets is not None and len(targets):
             labels[-len(targets):] = targets
         return values, padding, labels, dates
-    rows = _symbol_rows(table, symbol).loc[lambda frame: frame["date"].le(anchor)].tail(length)
-    values = np.full((length, len(value_columns)), np.nan, dtype="float32")
-    labels = np.full(length, -1, dtype="int64")
-    padding = np.ones(length, dtype=bool)
-    dates = np.empty(0, dtype="datetime64[ns]")
+    rows = _symbol_rows(table, symbol).filter(pl.col("date") <= _as_datetime(anchor)).tail(length)
+    values = torch.full((length, len(value_columns)), float("nan"), dtype=torch.float32)
+    labels = torch.full((length,), -1, dtype=torch.long)
+    padding = torch.ones(length, dtype=torch.bool)
+    dates = torch.empty(0, dtype=torch.long)
     if len(rows):
-        values[-len(rows):] = rows[value_columns].to_numpy("float32")
-        labels[-len(rows):] = rows["target_id"].to_numpy("int64")
+        values[-len(rows):] = rows.select(value_columns).fill_nan(None).fill_null(float("nan")).to_torch().to(torch.float32)
+        labels[-len(rows):] = rows["target_id"].to_torch().to(torch.long)
         padding[-len(rows):] = False
-        dates = pd.to_datetime(rows["date"], errors="coerce").to_numpy()
+        dates = rows["date"].cast(pl.Datetime, strict=False).cast(pl.Int64).to_torch().flatten()
     return values, padding, labels, dates
 
 
-def _relative_dates(dates: np.ndarray, length: int) -> torch.Tensor:
+def _relative_dates(dates: torch.Tensor, length: int) -> torch.Tensor:
     # Windows are causal and left-padded. Relative ordering is shared across
     # a batch; sparse rows are aggregated to one row per availability date.
     result = torch.arange(length, dtype=torch.long)
@@ -250,11 +270,11 @@ def _relative_dates(dates: np.ndarray, length: int) -> torch.Tensor:
 
 
 def _add_option_state_features(
-    daily: pd.DataFrame,
-    option_panel: pd.DataFrame,
+    daily: pl.DataFrame,
+    option_panel: pl.DataFrame,
     *,
     max_contracts_per_type: int,
-) -> list[str]:
+) -> tuple[pl.DataFrame, list[str]]:
     """Attach leakage-safe, as-of option state features to daily rows.
 
     The option panel contains entry-time chain descriptors and future outcome
@@ -266,7 +286,7 @@ def _add_option_state_features(
     missing = required - set(option_panel.columns)
     if missing:
         raise ValueError(f"option panel missing required columns: {sorted(missing)}")
-    options = pl.from_pandas(option_panel, include_index=False)
+    options = option_panel
     options = options.with_columns(
         pl.col("symbol").cast(pl.String).str.to_uppercase().str.strip_chars(),
         pl.col("entry_date").cast(pl.Datetime, strict=False).dt.truncate("1d"),
@@ -322,28 +342,30 @@ def _add_option_state_features(
         ((weighted_ask - weighted_bid) / weighted_bid.abs()).alias("value__options__mean_spread_pct"),
         weighted_bid.alias("value__options__mean_entry_bid"),
         weighted_ask.alias("value__options__mean_entry_ask"),
-    ).rename({"entry_date": "date"}).to_pandas()
+    ).rename({"entry_date": "date"})
     option_columns = [f"value__options__{name}" for name in OPTION_FEATURES]
-    for column in option_columns:
-        if column not in state:
-            state[column] = np.nan
-    state = state.sort_values(["symbol", "date"])
-    daily["date"] = pd.to_datetime(daily["date"], errors="coerce").dt.normalize()
-    daily.sort_values(["symbol", "date"], inplace=True)
-    daily[option_columns] = np.nan
-    if not state.empty:
-        merged = daily[["symbol", "date"]].merge(state[["symbol", "date", *option_columns]], on=["symbol", "date"], how="left")
-        daily.loc[:, option_columns] = merged[option_columns].to_numpy("float32")
-        daily.loc[:, option_columns] = daily.groupby("symbol", sort=False)[option_columns].ffill()
-    return option_columns
+    state = state.select([
+        "symbol", "date",
+        *[pl.col(column) if column in state.columns else pl.lit(None).alias(column) for column in option_columns],
+    ])
+    daily = daily.with_columns(
+        pl.col("symbol").cast(pl.String).str.to_uppercase().str.strip_chars(),
+        pl.col("date").cast(pl.Datetime, strict=False).dt.truncate("1d"),
+    ).sort(["symbol", "date"])
+    daily = daily.join(state, on=["symbol", "date"], how="left", suffix="_option")
+    daily = daily.with_columns([
+        pl.col(column).forward_fill().over("symbol").cast(pl.Float32).alias(column)
+        for column in option_columns
+    ])
+    return daily, option_columns
 
 
 def _issuer_dte_bin_option_panel(
-    panel: pd.DataFrame,
-    taxonomy: pd.DataFrame,
+    panel: pl.DataFrame,
+    taxonomy: pl.DataFrame,
     *,
     bin_count: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Freeze representative weighted DTE quantiles independently per issuer.
 
     ``bin_count`` representative DTE groups are selected at the interior
@@ -352,44 +374,40 @@ def _issuer_dte_bin_option_panel(
     """
     if bin_count < 1:
         raise ValueError("option issuer DTE bin count must be at least 1")
-    result = panel.copy()
-    result["underlying_symbol"] = result["underlying_symbol"].astype(str).str.upper().str.strip()
-    result["entry_date"] = pd.to_datetime(result["entry_date"], errors="coerce").dt.normalize()
-    result["dte"] = pd.to_numeric(result["dte"], errors="coerce")
-    result["_issuer"] = result["underlying_symbol"].map(taxonomy["issuer"])
-    bid_name = "entry_bid" if "entry_bid" in result else "bid"
-    ask_name = "entry_ask" if "entry_ask" in result else "ask"
-    result["_bid"] = pd.to_numeric(result.get(bid_name), errors="coerce")
-    result["_ask"] = pd.to_numeric(result.get(ask_name), errors="coerce")
-    weight_source = result["dte_contract_count"] if "dte_contract_count" in result else pd.Series(1.0, index=result.index)
-    result["_weight"] = pd.to_numeric(weight_source, errors="coerce").fillna(1.0)
-    result = result.dropna(subset=["_issuer", "entry_date", "dte"])
-    selected: list[pd.DataFrame] = []
-    for issuer, group in result.groupby("_issuer", sort=True):
-        first_date = group.loc[group["_bid"].gt(0) & group["_ask"].gt(0), "entry_date"].min()
-        if pd.isna(first_date):
-            first_date = group["entry_date"].min()
-        first = group.loc[group["entry_date"].eq(first_date)].copy()
-        first = first.loc[first["dte"].ge(0)]
-        if first.empty:
+    issuer_map = dict(zip(taxonomy["symbol"].to_list(), taxonomy["issuer"].to_list()))
+    result = panel.with_columns(
+        pl.col("underlying_symbol").cast(pl.String).str.to_uppercase().str.strip_chars(),
+        pl.col("entry_date").cast(pl.Datetime, strict=False).dt.truncate("1d"),
+        pl.col("dte").cast(pl.Int64, strict=False),
+    ).with_columns(
+        pl.col("underlying_symbol").replace(issuer_map, default=None).alias("_issuer"),
+        (pl.col("entry_bid") if "entry_bid" in panel.columns else pl.col("bid")).cast(pl.Float64, strict=False).alias("_bid"),
+        (pl.col("entry_ask") if "entry_ask" in panel.columns else pl.col("ask")).cast(pl.Float64, strict=False).alias("_ask"),
+        (pl.col("dte_contract_count") if "dte_contract_count" in panel.columns else pl.lit(1.0)).cast(pl.Float64, strict=False).fill_null(1.0).alias("_weight"),
+    ).drop_nulls(["_issuer", "entry_date", "dte"])
+    selected: list[pl.DataFrame] = []
+    for group in result.partition_by("_issuer", maintain_order=True):
+        usable = group.filter((pl.col("_bid") > 0) & (pl.col("_ask") > 0))
+        first_date = (usable["entry_date"].min() if len(usable) else group["entry_date"].min())
+        first = group.filter((pl.col("entry_date") == first_date) & (pl.col("dte") >= 0))
+        if not len(first):
             continue
-        values = first["dte"].astype(int).to_numpy()
-        weights = first["_weight"].clip(lower=1).to_numpy(float)
-        order = np.argsort(values)
-        values, weights = values[order], weights[order]
-        cumulative = np.cumsum(weights) / weights.sum()
-        quantiles = np.linspace(
-            0.5 / bin_count,
-            1.0 - 0.5 / bin_count,
-            bin_count,
-        )
-        targets = [int(values[np.searchsorted(cumulative, q, side="left")]) for q in quantiles]
+        pairs = sorted((int(dte), max(float(weight), 1.0)) for dte, weight in first.select(["dte", "_weight"]).iter_rows())
+        values = [pair[0] for pair in pairs]
+        total_weight = sum(pair[1] for pair in pairs)
+        cumulative = []
+        running = 0.0
+        for _, weight in pairs:
+            running += weight
+            cumulative.append(running / total_weight)
+        quantiles = [(index + 0.5) / bin_count for index in range(bin_count)]
+        targets = [next(values[index] for index, cumulative_value in enumerate(cumulative) if cumulative_value >= quantile) for quantile in quantiles]
         targets = set(targets)
-        selected.append(group.loc[group["dte"].astype(int).isin(targets)])
+        selected.append(group.filter(pl.col("dte").is_in(list(targets))))
     if not selected:
         raise ValueError("issuer-specific DTE bin selection produced no option rows")
 
-    selected_panel = pd.concat(selected, ignore_index=True)
+    selected_panel = pl.concat(selected, how="vertical_relaxed")
     # Collapse the selected strike grid into one synthetic contract per
     # underlying/date/type/DTE. The model therefore sees the mean of the
     # original contract-level features during training, while live inference
@@ -397,23 +415,20 @@ def _issuer_dte_bin_option_panel(
     group_cols = ["underlying_symbol", "entry_date", "option_type", "dte"]
     if "side" in selected_panel.columns:
         group_cols.append("side")
-    selected_panel["dte"] = selected_panel["dte"].round().astype(int)
+    selected_panel = selected_panel.with_columns(pl.col("dte").round().cast(pl.Int64))
     # Preserve the executable economics of the bucket.  A plain arithmetic
     # mean lets illiquid contracts influence the synthetic quote as much as
     # liquid contracts.  Use traded volume when available and open interest
     # as a fallback; if neither exists, every valid contract gets equal
     # weight.  Bid and ask are kept separate so later labels can use the ask
     # for long entries and the bid for short entries.
-    volume = pd.to_numeric(selected_panel.get("volume"), errors="coerce") if "volume" in selected_panel else pd.Series(np.nan, index=selected_panel.index)
-    open_interest = pd.to_numeric(selected_panel.get("open_interest"), errors="coerce") if "open_interest" in selected_panel else pd.Series(np.nan, index=selected_panel.index)
-    selected_panel["_quote_weight"] = volume.clip(lower=0).fillna(0.0)
-    selected_panel.loc[selected_panel["_quote_weight"].le(0), "_quote_weight"] = open_interest.clip(lower=0).fillna(0.0)
-    selected_panel.loc[selected_panel["_quote_weight"].le(0), "_quote_weight"] = 1.0
+    volume = pl.col("volume").cast(pl.Float64, strict=False) if "volume" in selected_panel else pl.lit(None, dtype=pl.Float64)
+    open_interest = pl.col("open_interest").cast(pl.Float64, strict=False) if "open_interest" in selected_panel else pl.lit(None, dtype=pl.Float64)
+    selected_panel = selected_panel.with_columns(
+        pl.when(volume.fill_null(0) > 0).then(volume).otherwise(open_interest).fill_null(0).clip(lower_bound=0).alias("_quote_weight")
+    ).with_columns(pl.when(pl.col("_quote_weight") > 0).then(pl.col("_quote_weight")).otherwise(1.0).alias("_quote_weight"))
 
-    # Keep the heavy tabular aggregation in Polars.  Conversion back to
-    # pandas is deliberately limited to this compatibility boundary because
-    # the downstream sample builder ultimately materializes NumPy tensors.
-    selected_pl = pl.from_pandas(selected_panel, include_index=False)
+    selected_pl = selected_panel
     numeric_cols = [name for name, dtype in zip(selected_pl.columns, selected_pl.dtypes) if dtype.is_numeric() and name != "dte"]
     quote_columns = [name for name in ("entry_bid", "entry_ask", "bid", "ask", "mid") if name in selected_pl.columns]
     aggregations: list[pl.Expr] = [
@@ -436,21 +451,17 @@ def _issuer_dte_bin_option_panel(
         )
     aggregated = selected_pl.group_by(group_cols, maintain_order=True).agg(aggregations)
     counts = selected_pl.group_by(group_cols, maintain_order=True).len(name="synthetic_contract_count")
-    aggregated = aggregated.join(counts, on=group_cols, how="left").to_pandas()
-    option_code = aggregated["option_type"].astype(str).str[:1].str.upper()
-    underlying = aggregated["underlying_symbol"].astype(str).str.upper().str.strip()
-    aggregated["symbol"] = (
-        "OPT_SYNTH_" + underlying + "_" + option_code + "_DTE" + aggregated["dte"].astype(str)
-    )
-    aggregated["contract_symbol"] = aggregated["symbol"]
+    aggregated = aggregated.join(counts, on=group_cols, how="left").with_columns(
+        (pl.lit("OPT_SYNTH_") + pl.col("underlying_symbol") + pl.lit("_") + pl.col("option_type").str.slice(0, 1).str.to_uppercase() + pl.lit("_DTE") + pl.col("dte").cast(pl.String)).alias("symbol")
+    ).with_columns(pl.col("symbol").alias("contract_symbol"))
     if "expiration" in aggregated.columns:
-        aggregated["expiration"] = aggregated["entry_date"] + pd.to_timedelta(aggregated["dte"], unit="D")
-    aggregated["synthetic_option"] = True
+        aggregated = aggregated.with_columns((pl.col("entry_date") + pl.duration(days=pl.col("dte"))).alias("expiration"))
+    aggregated = aggregated.with_columns(pl.lit(True).alias("synthetic_option"))
     return aggregated
 
 
 def _filter_universe(
-    taxonomy: pd.DataFrame,
+    taxonomy: pl.DataFrame,
     *,
     country: str,
     currency: str,
@@ -458,7 +469,7 @@ def _filter_universe(
     allow_unresolved_profiles: bool = False,
 ) -> tuple[set[str], list[str]]:
     """Apply the investable US-equity universe filter using catalog profiles."""
-    wanted = {str(symbol).upper() for symbol in taxonomy.index}
+    wanted = {str(symbol).upper() for symbol in taxonomy["symbol"].to_list()}
     profiles = Warehouse().catalog.query_symbol_profiles(
         provider="fmp", min_market_cap=0, country="", exchanges=(),
         exclude_etf=False, exclude_fund=False, limit=100_000,
@@ -490,20 +501,18 @@ def _filter_universe(
     return keep, unresolved_currency
 
 
-def _add_executable_option_return(options: pd.DataFrame) -> pd.DataFrame:
+def _add_executable_option_return(options: pl.DataFrame) -> pl.DataFrame:
     """Use ask-to-bid execution for option-return supervision."""
-    out = options.copy()
-    def column(name: str, fallback: float = np.nan) -> pd.Series:
-        value = out[name] if name in out else pd.Series(fallback, index=out.index)
-        return pd.to_numeric(value, errors="coerce")
-    entry_mid = column("entry_mid")
-    exit_mid = column("exit_mid")
-    spread = column("spread_pct", 0.0).fillna(0.0).clip(lower=0.0, upper=1.0)
-    entry_ask = pd.to_numeric(out.get("entry_ask"), errors="coerce") if "entry_ask" in out else entry_mid * (1.0 + spread / 2.0)
-    exit_bid = pd.to_numeric(out.get("exit_bid"), errors="coerce") if "exit_bid" in out else exit_mid * (1.0 - spread / 2.0)
-    out["execution_return"] = exit_bid / entry_ask - 1.0
-    out["execution_return"] = out["execution_return"].where(entry_ask.gt(0.0) & exit_bid.notna())
-    return out
+    def number(name: str, fallback: float | None = None) -> pl.Expr:
+        return pl.col(name).cast(pl.Float64, strict=False) if name in options.columns else pl.lit(fallback, dtype=pl.Float64)
+    entry_mid = number("entry_mid")
+    exit_mid = number("exit_mid")
+    spread = number("spread_pct", 0.0).fill_null(0.0).clip(0.0, 1.0)
+    entry_ask = number("entry_ask") if "entry_ask" in options.columns else entry_mid * (1.0 + spread / 2.0)
+    exit_bid = number("exit_bid") if "exit_bid" in options.columns else exit_mid * (1.0 - spread / 2.0)
+    return options.with_columns(
+        pl.when((entry_ask > 0.0) & exit_bid.is_not_null()).then(exit_bid / entry_ask - 1.0).otherwise(None).alias("execution_return")
+    )
 
 
 def main() -> None:
@@ -643,8 +652,9 @@ def main() -> None:
         # The checkpoint defines the sparse target schema used by its task
         # heads. Fresh live data may contain only a subset of those events.
         target_families = list(checkpoint_metrics.get("target_families", target_families))
-    taxonomy = pd.read_csv(root / "taxonomy.csv").set_index("symbol")
-    taxonomy.index = taxonomy.index.astype(str).str.upper()
+    taxonomy = pl.read_csv(root / "taxonomy.csv").with_columns(
+        pl.col("symbol").cast(pl.String).str.to_uppercase().str.strip_chars()
+    )
     # Presence columns are useful for corpus diagnostics but are not model
     # inputs.  Avoid materializing them for the large 10B corpus.
     rate_columns = ["symbol", "date", *[f"value__{family}" for family in feature_families]]
@@ -655,13 +665,13 @@ def main() -> None:
     if sparse_path.exists():
         sparse = _read_parquet_polars(sparse_path)
     else:
-        sparse = pd.DataFrame({
-            "symbol": pd.Series(dtype="string"),
-            "date": pd.Series(dtype="datetime64[ns]"),
-            "event_date": pd.Series(dtype="datetime64[ns]"),
-            "target_family": pd.Series(dtype="string"),
-            "signal_value": pd.Series(dtype="float32"),
-            **{f"text_{i}": pd.Series(dtype="float32") for i in range(7)},
+        sparse = pl.DataFrame({
+            "symbol": pl.Series([], dtype=pl.String),
+            "date": pl.Series([], dtype=pl.Datetime),
+            "event_date": pl.Series([], dtype=pl.Datetime),
+            "target_family": pl.Series([], dtype=pl.String),
+            "signal_value": pl.Series([], dtype=pl.Float32),
+            **{f"text_{i}": pl.Series([], dtype=pl.Float32) for i in range(7)},
         })
     # Apply a frozen DTE selection before normalization/index construction.
     # Otherwise a DTE-105 run needlessly scans every synthetic option symbol
@@ -678,36 +688,36 @@ def main() -> None:
                 bin_count=args.option_issuer_dte_bins,
             )
             selected_panel = issuer_quartile_panel
-            selected_symbols = set(selected_panel["symbol"].astype(str).str.upper())
-            def keep_selected(frame: pd.DataFrame) -> pd.DataFrame:
-                symbols = frame["symbol"].astype(str).str.upper()
-                return frame.loc[~symbols.str.startswith("OPT_") | symbols.isin(selected_symbols)].copy()
+            selected_symbols = set(selected_panel["symbol"].cast(pl.String).str.to_uppercase().to_list())
+            def keep_selected(frame: pl.DataFrame) -> pl.DataFrame:
+                return frame.filter(~pl.col("symbol").cast(pl.String).str.to_uppercase().str.starts_with("OPT_") | pl.col("symbol").cast(pl.String).str.to_uppercase().is_in(list(selected_symbols)))
         else:
-            selected_dte = pd.to_numeric(selected_panel["dte"], errors="coerce").isin(option_dtes)
-            selected_symbols = set(selected_panel.loc[selected_dte, "symbol"].astype(str).str.upper())
-            selected_underlyings = set(selected_panel.loc[selected_dte, "underlying_symbol"].astype(str).str.upper())
-            def keep_selected(frame: pd.DataFrame) -> pd.DataFrame:
-                symbols = frame["symbol"].astype(str).str.upper()
-                return frame.loc[~symbols.str.startswith("OPT_") | symbols.isin(selected_symbols) | symbols.isin(selected_underlyings)].copy()
+            selected_panel = selected_panel.with_columns(pl.col("dte").cast(pl.Int64, strict=False))
+            selected_dte = selected_panel.filter(pl.col("dte").is_in(list(option_dtes)))
+            selected_symbols = set(selected_dte["symbol"].cast(pl.String).str.to_uppercase().to_list())
+            selected_underlyings = set(selected_dte["underlying_symbol"].cast(pl.String).str.to_uppercase().to_list())
+            def keep_selected(frame: pl.DataFrame) -> pl.DataFrame:
+                symbols = pl.col("symbol").cast(pl.String).str.to_uppercase()
+                return frame.filter(~symbols.str.starts_with("OPT_") | symbols.is_in(list(selected_symbols | selected_underlyings)))
         annual = keep_selected(annual)
         quarterly = keep_selected(quarterly)
         daily = keep_selected(daily)
         sparse = keep_selected(sparse)
     if args.option_target_events is not None:
         option_events = _read_parquet_polars(args.option_target_events)
-        if not option_events.empty:
+        if not option_events.is_empty():
             option_symbols = set(option_events["symbol"].astype(str).str.upper())
-            sparse_symbols = sparse["symbol"].astype(str).str.upper()
+            sparse_symbols = pl.col("symbol").cast(pl.String).str.to_uppercase()
             replace_families = {"equity.strategy.hits_graph", "equity.strategy.oracle_trades"}
-            sparse = sparse.loc[~(sparse_symbols.isin(option_symbols) & sparse["target_family"].isin(replace_families))]
-            sparse = pd.concat([sparse, option_events], ignore_index=True, sort=False)
+            sparse = sparse.filter(~(sparse_symbols.is_in(list(option_symbols)) & pl.col("target_family").is_in(list(replace_families))))
+            sparse = pl.concat([sparse, option_events], how="diagonal_relaxed")
     exchanges = {value.strip().upper() for value in args.exchanges.split(",") if value.strip()}
     universe_symbols, unresolved_currency = _filter_universe(
         taxonomy, country=args.country.strip(), currency=args.currency.strip(), exchanges=exchanges,
         allow_unresolved_profiles=args.allow_unresolved_profiles,
-    ) if (args.country.strip() or args.currency.strip() or exchanges) else (set(taxonomy.index), [])
-    taxonomy = taxonomy.loc[taxonomy.index.isin(universe_symbols)].copy()
-    if taxonomy.empty:
+    ) if (args.country.strip() or args.currency.strip() or exchanges) else (set(taxonomy["symbol"].to_list()), [])
+    taxonomy = taxonomy.filter(pl.col("symbol").is_in(list(universe_symbols)))
+    if taxonomy.is_empty():
         raise ValueError("universe filters removed every corpus symbol")
     if "issuer" not in taxonomy.columns:
         profile_rows = Warehouse().catalog.query_symbol_profiles(
@@ -715,92 +725,97 @@ def main() -> None:
             exclude_etf=False, exclude_fund=False, limit=100_000,
         )
         profiles_by_symbol = {str(profile.symbol).strip().upper(): profile for profile in profile_rows}
-        taxonomy["issuer"] = [
+        taxonomy = taxonomy.with_columns(pl.Series("issuer", [
             _canonical_issuer_key(profiles_by_symbol.get(str(symbol).upper()), str(symbol))
-            for symbol in taxonomy.index
-        ]
-    for table in (annual, quarterly, daily, sparse):
-        table["symbol"] = table["symbol"].astype(str).str.upper()
-        table["date"] = pd.to_datetime(table["date"], errors="coerce", utc=True).dt.tz_localize(None)
+            for symbol in taxonomy["symbol"].to_list()
+        ]))
+    def normalize_table(table: pl.DataFrame) -> pl.DataFrame:
+        return table.with_columns(
+            pl.col("symbol").cast(pl.String).str.to_uppercase().str.strip_chars(),
+            pl.col("date").cast(pl.Datetime, strict=False).dt.truncate("1d"),
+        )
+    annual = normalize_table(annual)
+    quarterly = normalize_table(quarterly)
+    daily = normalize_table(daily)
+    sparse = normalize_table(sparse)
     option_columns: list[str] = []
-    option_target_map: dict[tuple[str, pd.Timestamp], np.ndarray] = {}
+    option_target_map: dict[tuple[str, datetime], torch.Tensor] = {}
     option_document_symbols: set[str] = set()
-    option_document_start_dates: dict[str, pd.Timestamp] = {}
+    option_document_start_dates: dict[str, datetime] = {}
     source_symbol_by_symbol: dict[str, str] = {}
-    option_entry_anchors = pd.DataFrame(columns=["symbol", "date"])
+    option_entry_anchors = pl.DataFrame({"symbol": pl.Series([], dtype=pl.String), "date": pl.Series([], dtype=pl.Datetime)})
     if args.option_panel is not None:
         option_panel = issuer_quartile_panel if issuer_quartile_panel is not None else _read_parquet_polars(args.option_panel)
         option_panel = _add_executable_option_return(option_panel)
-        option_panel["entry_date"] = pd.to_datetime(option_panel["entry_date"], errors="coerce").dt.normalize()
-        option_panel = option_panel.loc[option_panel["entry_date"].ge(pd.Timestamp(args.option_start_date))]
+        option_panel = option_panel.with_columns(pl.col("entry_date").cast(pl.Datetime, strict=False).dt.truncate("1d"))
+        option_panel = option_panel.filter(pl.col("entry_date") >= _as_datetime(args.option_start_date))
         if args.option_end_date:
-            option_panel = option_panel.loc[option_panel["entry_date"].le(pd.Timestamp(args.option_end_date))]
+            option_panel = option_panel.filter(pl.col("entry_date") <= _as_datetime(args.option_end_date))
         if option_dtes:
-            option_panel = option_panel.loc[pd.to_numeric(option_panel["dte"], errors="coerce").isin(option_dtes)]
-        option_entry_anchors = option_panel[["symbol", "entry_date"]].rename(columns={"entry_date": "date"}).drop_duplicates()
-        option_state_panel = option_panel.copy()
+            option_panel = option_panel.filter(pl.col("dte").cast(pl.Int64, strict=False).is_in(list(option_dtes)))
+        option_entry_anchors = option_panel.select([pl.col("symbol"), pl.col("entry_date").alias("date")]).unique()
+        option_state_panel = option_panel
         if "underlying_symbol" in option_state_panel:
-            option_state_panel["symbol"] = option_state_panel["underlying_symbol"]
-        option_columns = _add_option_state_features(
+            option_state_panel = option_state_panel.with_columns(pl.col("underlying_symbol").alias("symbol"))
+        daily, option_columns = _add_option_state_features(
             daily,
             option_state_panel,
             max_contracts_per_type=max(0, args.option_max_contracts),
         )
-        for table in (annual, quarterly):
-            for column in option_columns:
-                table[column] = np.nan
-        option_panel["symbol"] = option_panel["symbol"].astype(str).str.upper().str.strip()
+        annual = annual.with_columns([pl.lit(None, dtype=pl.Float32).alias(column) for column in option_columns])
+        quarterly = quarterly.with_columns([pl.lit(None, dtype=pl.Float32).alias(column) for column in option_columns])
+        option_panel = option_panel.with_columns(pl.col("symbol").cast(pl.String).str.to_uppercase().str.strip_chars())
         if "underlying_symbol" in option_panel:
-            source_symbol_by_symbol.update({
-                str(symbol).upper(): str(underlying).upper()
-                for symbol, underlying in option_panel[["symbol", "underlying_symbol"]].dropna().itertuples(index=False, name=None)
-            })
-        option_document_symbols = set(option_panel["symbol"].dropna().astype(str).str.upper())
+            source_symbol_by_symbol.update({str(row[0]).upper(): str(row[1]).upper() for row in option_panel.select(["symbol", "underlying_symbol"]).drop_nulls().iter_rows()})
+        option_document_symbols = set(option_panel["symbol"].drop_nulls().cast(pl.String).str.to_uppercase().to_list())
         if option_dtes and not option_document_symbols:
             raise ValueError(f"no option documents found for DTEs {sorted(option_dtes)}")
         if option_dtes:
-            sparse = sparse.loc[
-                ~sparse["symbol"].astype(str).str.upper().str.startswith("OPT_")
-                | sparse["symbol"].astype(str).str.upper().isin(option_document_symbols)
-            ]
-        option_document_start_dates = (
-            option_panel.dropna(subset=["symbol", "entry_date"])
-            .groupby("symbol")["entry_date"].min().to_dict()
-        )
-        option_panel["entry_date"] = pd.to_datetime(option_panel["entry_date"], errors="coerce").dt.normalize()
-        option_panel["side"] = option_panel["side"].astype(str).str.lower().str.strip()
-        option_panel["execution_return"] = pd.to_numeric(option_panel["execution_return"], errors="coerce")
-        option_panel = option_panel.dropna(subset=["symbol", "entry_date", "execution_return"])
-        for (symbol, date, side), group in option_panel.groupby(["symbol", "entry_date", "side"], sort=False):
+            sparse = sparse.filter(~pl.col("symbol").cast(pl.String).str.to_uppercase().str.starts_with("OPT_") | pl.col("symbol").cast(pl.String).str.to_uppercase().is_in(list(option_document_symbols)))
+        option_document_start_dates = {str(row[0]): row[1] for row in option_panel.drop_nulls(["symbol", "entry_date"]).group_by("symbol").agg(pl.col("entry_date").min()).iter_rows()}
+        option_panel = option_panel.with_columns(
+            pl.col("entry_date").cast(pl.Datetime, strict=False).dt.truncate("1d"),
+            pl.col("side").cast(pl.String).str.to_lowercase().str.strip_chars(),
+            pl.col("execution_return").cast(pl.Float64, strict=False),
+        ).drop_nulls(["symbol", "entry_date", "execution_return"])
+        for (symbol, date, side), group in option_panel.group_by(["symbol", "entry_date", "side"], maintain_order=True):
             if side not in {"long", "short"}:
                 continue
-            transformed = np.sign(group["execution_return"].to_numpy("float64")) * np.log1p(np.minimum(np.abs(group["execution_return"].to_numpy("float64")), 1_000_000.0))
-            values = option_target_map.setdefault((symbol, date), np.full(2, np.nan, dtype="float32"))
-            values[0 if side == "long" else 1] = np.float32(np.nanmean(transformed))
+            transformed = group["execution_return"].to_torch().to(torch.float64)
+            transformed = torch.sign(transformed) * torch.log1p(torch.minimum(transformed.abs(), torch.tensor(1_000_000.0)))
+            values = option_target_map.setdefault((str(symbol), _as_datetime(date)), torch.full((2,), float("nan"), dtype=torch.float32))
+            values[0 if side == "long" else 1] = transformed.nanmean().to(torch.float32)
     if option_document_symbols:
-        allowed_symbols = {symbol for symbol in taxonomy.index if not str(symbol).upper().startswith("OPT_")} | option_document_symbols
-        taxonomy = taxonomy.loc[taxonomy.index.isin(allowed_symbols)].copy()
+        allowed_symbols = {symbol for symbol in taxonomy["symbol"].to_list() if not str(symbol).upper().startswith("OPT_")} | option_document_symbols
+        taxonomy = taxonomy.filter(pl.col("symbol").is_in(list(allowed_symbols)))
+        taxonomy_rows = {str(row["symbol"]): row for row in taxonomy.iter_rows(named=True)}
+        synthetic_taxonomy_rows = []
         for option_symbol, underlying_symbol in source_symbol_by_symbol.items():
-            if option_symbol not in taxonomy.index and underlying_symbol in taxonomy.index:
-                taxonomy.loc[option_symbol] = taxonomy.loc[underlying_symbol]
+            if option_symbol not in taxonomy_rows and underlying_symbol in taxonomy_rows:
+                row = dict(taxonomy_rows[underlying_symbol])
+                row["symbol"] = option_symbol
+                synthetic_taxonomy_rows.append(row)
+        if synthetic_taxonomy_rows:
+            taxonomy = pl.concat([taxonomy, pl.DataFrame(synthetic_taxonomy_rows)], how="vertical_relaxed")
     if "event_date" in sparse:
-        sparse["event_date"] = pd.to_datetime(sparse["event_date"], errors="coerce", utc=True).dt.tz_localize(None)
+        sparse = sparse.with_columns(pl.col("event_date").cast(pl.Datetime, strict=False).dt.truncate("1d"))
 
     # Derived target labels are supervised at their original event date. Their
     # delayed availability remains in ``date`` and therefore keeps them out
     # of the input context at the prediction date.
-    supervised_target_map: dict[tuple[str, pd.Timestamp], dict[str, float]] = {}
+    supervised_target_map: dict[tuple[str, datetime], dict[str, float]] = {}
     if "event_date" in sparse:
         target_channels = ["signal_value", *[f"text_{i}" for i in range(7)]]
-        for row in sparse.loc[sparse["target_family"].isin({
+        supervised_rows = sparse.filter(pl.col("target_family").is_in([
             "equity.strategy.hits_graph", "equity.strategy.oracle_trades",
-        })].itertuples(index=False):
-            event_date = getattr(row, "event_date")
-            if pd.isna(event_date):
+        ])).iter_rows(named=True)
+        for row in supervised_rows:
+            event_date = row.get("event_date")
+            if _is_missing(event_date):
                 continue
-            key = (str(row.symbol).upper(), pd.Timestamp(event_date).normalize())
-            values = {channel: float(getattr(row, channel)) for channel in target_channels if pd.notna(getattr(row, channel))}
-            target_family = str(row.target_family)
+            key = (str(row["symbol"]).upper(), _as_datetime(event_date))
+            values = {channel: float(row[channel]) for channel in target_channels if not _is_missing(row.get(channel))}
+            target_family = str(row["target_family"])
             targets = supervised_target_map.setdefault(key, {})
             if target_family == "equity.strategy.hits_graph":
                 for task_name, channel in zip(HITS_SUPERVISED_TASK_NAMES, target_channels):
@@ -826,51 +841,54 @@ def main() -> None:
         daily_value_columns.extend(option_columns)
     annual_value_columns = daily_value_columns
     quarterly_value_columns = daily_value_columns
-    sparse = sparse.sort_values(["symbol", "date", "event_date"] if "event_date" in sparse else ["symbol", "date"])
+    sparse = sparse.sort(["symbol", "date", "event_date"] if "event_date" in sparse.columns else ["symbol", "date"])
     # Multiple same-day disclosures become one sparse token while retaining
     # the first available family and the mean numeric/text representation.
-    sparse["target_id"] = sparse["target_family"].astype(str).map({name: i for i, name in enumerate(target_families)})
+    sparse = sparse.with_columns(pl.col("target_family").replace({name: i for i, name in enumerate(target_families)}, default=None).cast(pl.Int64).alias("target_id"))
     sparse_value_columns = ["signal_value", *[f"text_{i}" for i in range(7)]]
-    sparse_pl = pl.from_pandas(sparse, include_index=False)
-    sparse = sparse_pl.group_by(["symbol", "date"], maintain_order=True).agg(
+    sparse = sparse.group_by(["symbol", "date"], maintain_order=True).agg(
         pl.col("target_family").first(), pl.col("target_id").first(),
         *[pl.col(column).mean().alias(column) for column in sparse_value_columns],
-    ).to_pandas()
+    )
 
     # Standardize numeric rate values using the available corpus while
     # retaining NaN for coverage-aware missingness handling.
     rate_columns = {"annual": annual_value_columns, "quarterly": quarterly_value_columns, "daily": daily_value_columns}
-    norms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    norms: dict[str, tuple[list[float], list[float]]] = {}
     for name, columns in rate_columns.items():
         values = pl.concat(
-            [pl.from_pandas(table[columns], include_index=False) for table in (annual, quarterly, daily)],
+            [table.select(columns) for table in (annual, quarterly, daily)],
             how="vertical_relaxed",
         )
         stats = values.select(
             *[pl.col(column).fill_nan(None).mean().alias(f"mean_{column}") for column in columns],
             *[pl.col(column).fill_nan(None).std(ddof=0).alias(f"std_{column}") for column in columns],
-        ).to_numpy()[0]
-        mean = np.asarray(stats[:len(columns)], dtype="float64")
-        scale = np.asarray(stats[len(columns):], dtype="float64")
-        mean = np.nan_to_num(mean, nan=0.0); scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0)
-        norms[name] = (mean.astype("float32"), scale.astype("float32"))
+        ).row(0)
+        mean = [0.0 if value is None or not math.isfinite(float(value)) else float(value) for value in stats[:len(columns)]]
+        scale = [float(value) if value is not None and math.isfinite(float(value)) and float(value) > 1e-6 else 1.0 for value in stats[len(columns):]]
+        norms[name] = (mean, scale)
+        # Keep normalization in Polars; the model boundary receives only the
+        # resulting per-window tensors later.
+        normalized = []
         for table in (annual, quarterly, daily):
-            table.loc[:, columns] = ((table[columns].to_numpy("float32") - mean) / scale)
-    sparse_stats = pl.from_pandas(sparse[["signal_value"]], include_index=False).select(
+            normalized.append(table.with_columns([
+                ((pl.col(column).cast(pl.Float32) - float(mean[index])) / float(scale[index])).alias(column)
+                for index, column in enumerate(columns)
+            ]))
+        annual, quarterly, daily = normalized
+    sparse_stats = sparse.select(
         pl.col("signal_value").fill_nan(None).mean().alias("_sparse_mean"),
         pl.col("signal_value").fill_nan(None).std(ddof=0).alias("_sparse_std"),
     ).row(0)
-    sparse_numeric = sparse["signal_value"].to_numpy("float64")
     sparse_mean = float(sparse_stats[0]) if sparse_stats[0] is not None else 0.0
     sparse_scale = float(sparse_stats[1]) if sparse_stats[1] not in (None, 0.0) else 1.0
-    sparse["signal_value"] = ((sparse_numeric - sparse_mean) / sparse_scale).astype("float32")
-    sparse["date"] = pd.to_datetime(sparse["date"], errors="coerce").dt.normalize()
+    sparse = sparse.with_columns(((pl.col("signal_value").cast(pl.Float32) - sparse_mean) / sparse_scale).alias("signal_value"))
     raw_sparse_columns = ["signal_value", *[f"text_{i}" for i in range(7)]]
     sparse_value_columns: list[str] = []
     # Construct the wide family-specific sparse matrix in Polars.  Assigning
-    # hundreds of columns one at a time fragments a large pandas DataFrame and
+    # hundreds of columns one at a time fragments a large tabular frame and
     # caused the 10B/two-year option run to consume tens of GB before training.
-    sparse_wide = pl.from_pandas(sparse[["target_family", *raw_sparse_columns]], include_index=False)
+    sparse_wide = sparse.select(["target_family", *raw_sparse_columns])
     sparse_wide_columns = []
     for family in target_families:
         for column in raw_sparse_columns:
@@ -882,8 +900,7 @@ def main() -> None:
                 .alias(output_column)
             )
             sparse_value_columns.append(output_column)
-    sparse_wide = sparse_wide.select(sparse_wide_columns).to_pandas()
-    sparse = pd.concat([sparse.reset_index(drop=True), sparse_wide], axis=1, copy=False)
+    sparse = sparse.with_columns(sparse_wide.select(sparse_wide_columns))
 
     # Build immutable columnar indexes once. All subsequent sample windows use
     # these arrays instead of repeatedly filtering Pandas frames.
@@ -904,52 +921,44 @@ def main() -> None:
     # A document can be anchored by a regular annual observation or by a
     # sparse event.  Using their union preserves early event history even
     # when annual fundamentals begin later for a symbol.
-    anchor_parts = [annual[["symbol", "date"]], sparse[["symbol", "date"]]]
+    anchor_parts = [annual.select(["symbol", "date"]), sparse.select(["symbol", "date"])]
     if option_document_symbols:
         anchor_parts.append(option_entry_anchors)
     if option_target_map:
-        anchor_parts.append(pd.DataFrame(
-            [{"symbol": symbol, "date": date} for symbol, date in option_target_map]
-        ))
-    anchors = pd.concat(anchor_parts, ignore_index=True).drop_duplicates().sort_values(["symbol", "date"])
+        anchor_parts.append(pl.DataFrame({
+            "symbol": [symbol for symbol, _ in option_target_map],
+            "date": [date for _, date in option_target_map],
+        }))
+    anchors = pl.concat(anchor_parts, how="diagonal_relaxed").unique().sort(["symbol", "date"])
     # Exact-date inference must retain the requested daily anchor. Regular
     # training anchors are intentionally reduced to one date per symbol/year,
     # but that reduction would otherwise discard a current EOD scoring date.
     if args.inference_only and args.prediction_start_date and args.prediction_start_date != "1900-01-01":
-        requested_anchor_date = pd.Timestamp(args.prediction_start_date).normalize()
-        exact_daily_anchors = daily.loc[
-            pd.to_datetime(daily["date"]).dt.normalize().eq(requested_anchor_date),
-            ["symbol", "date"],
-        ]
-        anchors = pd.concat([anchors, exact_daily_anchors], ignore_index=True).drop_duplicates().sort_values(["symbol", "date"])
-    anchors["year"] = pd.to_datetime(anchors["date"]).dt.year
-    target_index = pd.MultiIndex.from_tuples(option_target_map.keys(), names=["symbol", "date"])
-    regular_candidates = anchors.loc[~anchors.set_index(["symbol", "date"]).index.isin(target_index)]
+        requested_anchor_date = _as_datetime(args.prediction_start_date)
+        exact_daily_anchors = daily.filter(pl.col("date") == requested_anchor_date).select(["symbol", "date"])
+        anchors = pl.concat([anchors, exact_daily_anchors], how="diagonal_relaxed").unique().sort(["symbol", "date"])
+    anchors = anchors.with_columns(pl.col("date").dt.year().alias("year"))
+    target_pairs = list(option_target_map)
+    regular_candidates = anchors.filter(~pl.struct(["symbol", "date"]).is_in(target_pairs)) if target_pairs else anchors
     if option_document_symbols:
-        option_daily_anchors = regular_candidates.loc[regular_candidates["symbol"].isin(option_document_symbols)].copy()
-        regular_candidates = regular_candidates.loc[~regular_candidates["symbol"].isin(option_document_symbols)]
+        option_daily_anchors = regular_candidates.filter(pl.col("symbol").is_in(list(option_document_symbols)))
+        regular_candidates = regular_candidates.filter(~pl.col("symbol").is_in(list(option_document_symbols)))
     else:
-        option_daily_anchors = anchors.iloc[0:0].copy()
-    regular_anchors = regular_candidates.groupby(["symbol", "year"], as_index=False)["date"].max()
+        option_daily_anchors = anchors.head(0)
+    regular_anchors = regular_candidates.group_by(["symbol", "year"]).agg(pl.col("date").max())
     if option_target_map:
-        option_anchors = pd.DataFrame(
-            [{"symbol": symbol, "date": date} for symbol, date in option_target_map]
-        )
-        option_anchors["year"] = pd.to_datetime(option_anchors["date"]).dt.year
-        anchors = pd.concat([regular_anchors, option_daily_anchors, option_anchors], ignore_index=True).drop_duplicates(["symbol", "date"])
+        option_anchors = pl.DataFrame({"symbol": [symbol for symbol, _ in option_target_map], "date": [date for _, date in option_target_map]}).with_columns(pl.col("date").dt.year().alias("year"))
+        anchors = pl.concat([regular_anchors, option_daily_anchors, option_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
     else:
-        anchors = pd.concat([regular_anchors, option_daily_anchors], ignore_index=True).drop_duplicates(["symbol", "date"])
+        anchors = pl.concat([regular_anchors, option_daily_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
     if args.inference_only and args.prediction_start_date and args.prediction_start_date != "1900-01-01":
-        requested_anchor_date = pd.Timestamp(args.prediction_start_date).normalize()
-        exact_daily_anchors = daily.loc[
-            pd.to_datetime(daily["date"]).dt.normalize().eq(requested_anchor_date),
-            ["symbol", "date"],
-        ]
-        anchors = pd.concat([anchors, exact_daily_anchors], ignore_index=True).drop_duplicates(["symbol", "date"])
-    empty_annual = annual.iloc[0:0]
-    empty_quarterly = quarterly.iloc[0:0]
-    empty_daily = daily.iloc[0:0]
-    empty_sparse = sparse.iloc[0:0]
+        requested_anchor_date = _as_datetime(args.prediction_start_date)
+        exact_daily_anchors = daily.filter(pl.col("date") == requested_anchor_date).select(["symbol", "date"])
+        anchors = pl.concat([anchors, exact_daily_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
+    empty_annual = annual.head(0)
+    empty_quarterly = quarterly.head(0)
+    empty_daily = daily.head(0)
+    empty_sparse = sparse.head(0)
     context_caches: dict[str, OrderedDict[tuple[str, int], tuple]] = {
         rate: OrderedDict() for rate in ("annual", "quarterly", "daily", "sparse")
     }
@@ -957,7 +966,7 @@ def main() -> None:
     context_cache_misses = {rate: 0 for rate in context_caches}
     context_cache_build_seconds = {rate: 0.0 for rate in context_caches}
 
-    def cached_window(rate: str, table, symbol: str, anchor: pd.Timestamp, columns: list[str], length: int, source_symbol: str | None = None):
+    def cached_window(rate: str, table, symbol: str, anchor: datetime, columns: list[str], length: int, source_symbol: str | None = None):
         source = str(source_symbol or symbol).upper()
         # Annual and quarterly windows only change when their source issuer
         # publishes a new row.  Keying them by the exact document date would
@@ -980,20 +989,20 @@ def main() -> None:
                 cache.popitem(last=False)
         return value
 
-    def rate_version(rate: str, table, source: str, anchor: pd.Timestamp) -> int:
+    def rate_version(rate: str, table, source: str, anchor: datetime) -> int:
         if rate in {"annual", "quarterly"}:
             if isinstance(table, _IndexedTable):
-                dates = table.rows.get(str(source).upper(), (np.empty(0, dtype="int64"), None, None))[0]
-                stop = int(np.searchsorted(dates, pd.Timestamp(anchor).value, side="right"))
+                dates = table.rows.get(str(source).upper(), (torch.empty(0, dtype=torch.long), None, None))[0]
+                stop = int(torch.searchsorted(dates, torch.tensor(_epoch_ns(anchor), dtype=torch.long), right=True))
                 return int(dates[stop - 1]) if stop else -1
             source_rows = _symbol_rows(table, source)
-            available = source_rows.loc[source_rows["date"].le(anchor), "date"]
-            return int(pd.Timestamp(available.iloc[-1]).value) if len(available) else -1
-        return int(pd.Timestamp(anchor).value)
+            available = source_rows.filter(pl.col("date") <= anchor)["date"]
+            return _epoch_ns(available[-1]) if len(available) else -1
+        return _epoch_ns(anchor)
 
-    def cached_sparse_window(symbol: str, anchor: pd.Timestamp):
+    def cached_sparse_window(symbol: str, anchor: datetime):
         rate = "sparse"
-        key = (str(symbol).upper(), int(pd.Timestamp(anchor).value))
+        key = (str(symbol).upper(), _epoch_ns(anchor))
         cache = context_caches[rate]
         if args.context_cache_size and key in cache:
             context_cache_hits[rate] += 1
@@ -1011,9 +1020,11 @@ def main() -> None:
         return value
 
     samples: list[dict[str, object]] = []
-    for row in anchors.itertuples(index=False):
-        symbol = str(row.symbol).upper(); anchor = pd.Timestamp(row.date)
-        if symbol not in taxonomy.index:
+    taxonomy_by_symbol = {str(row["symbol"]): row for row in taxonomy.iter_rows(named=True)}
+    taxonomy_symbols = set(taxonomy_by_symbol)
+    for row in anchors.iter_rows(named=True):
+        symbol = str(row["symbol"]).upper(); anchor = _as_datetime(row["date"])
+        if symbol not in taxonomy_symbols:
             continue
         source_symbol = source_symbol_by_symbol.get(symbol, symbol)
         def materialize(current_symbol=symbol, current_anchor=anchor, current_source=source_symbol):
@@ -1021,12 +1032,12 @@ def main() -> None:
             quarterly_values, quarterly_padding, _ = cached_window("quarterly", quarterly_index, current_symbol, current_anchor, quarterly_value_columns, QUARTERLY_WINDOW, current_source)
             daily_values, daily_padding, daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_source)
             sparse_values, sparse_padding, sparse_labels, sparse_dates = cached_sparse_window(current_symbol, current_anchor)
-            supervised_targets = np.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype="float32")
-            supervised_valid = np.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=bool)
+            supervised_targets = torch.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.float32)
+            supervised_valid = torch.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.bool)
             if len(daily_dates):
                 offset = DAILY_WINDOW - len(daily_dates)
-                for position, date in enumerate(pd.to_datetime(daily_dates).normalize()):
-                    values = supervised_target_map.get((current_symbol, pd.Timestamp(date)), {})
+                for position, date in enumerate(daily_dates):
+                    values = supervised_target_map.get((current_symbol, _as_datetime(date)), {})
                     for task_index, task_name in enumerate(SUPERVISED_TARGET_TASK_NAMES):
                         if task_name in values:
                             supervised_targets[offset + position, task_index] = values[task_name]
@@ -1035,29 +1046,29 @@ def main() -> None:
                 "annual": annual_values, "annual_padding": annual_padding,
                 "quarterly": quarterly_values, "quarterly_padding": quarterly_padding,
                 "daily": daily_values, "daily_padding": daily_padding,
-                "daily_dates": pd.to_datetime(daily_dates).strftime("%Y-%m-%d").tolist(),
+                "daily_dates": [_as_datetime(date).strftime("%Y-%m-%d") for date in daily_dates],
                 "sparse": sparse_values, "sparse_padding": sparse_padding, "sparse_labels": sparse_labels,
                 "supervised_targets": supervised_targets, "supervised_valid": supervised_valid,
             }
         metadata = {
             "symbol": symbol, "date": anchor.strftime("%Y-%m-%d"),
-            "issuer": str(taxonomy.loc[symbol, "issuer"]),
+            "issuer": str(taxonomy_by_symbol[symbol]["issuer"]),
             "annual_context_key": (source_symbol, rate_version("annual", annual_index, source_symbol, anchor)),
             "quarterly_context_key": (source_symbol, rate_version("quarterly", quarterly_index, source_symbol, anchor)),
-            "sector": str(taxonomy.loc[symbol, "sector"]), "subsector": str(taxonomy.loc[symbol, "subsector"]),
-            "industry": str(taxonomy.loc[symbol, "industry"]),
+            "sector": str(taxonomy_by_symbol[symbol]["sector"]), "subsector": str(taxonomy_by_symbol[symbol]["subsector"]),
+            "industry": str(taxonomy_by_symbol[symbol]["industry"]),
         }
         samples.append(_LazySample(metadata, materialize) if args.stream_samples else {**metadata, **materialize()})
     # The indexes own the compact sorted arrays used by lazy samples. Release
-    # the source pandas frames before model construction/training; retaining
+    # the source Polars frames before model construction/training; retaining
     # both representations is the main avoidable memory spike on 100B runs.
     del annual, quarterly, daily, sparse
     if args.max_samples:
         if args.max_samples < 1:
             parser.error("--max-samples must be positive when provided")
-        samples = sorted(samples, key=lambda item: (pd.Timestamp(item["date"]), str(item["symbol"])))[:args.max_samples]
-    frame = pd.DataFrame([{key: value for key, value in sample.items() if isinstance(value, str) or isinstance(value, int)} for sample in samples])
-    label_arrays: dict[str, np.ndarray] = {}
+        samples = sorted(samples, key=lambda item: (_as_datetime(item["date"]), str(item["symbol"])))[:args.max_samples]
+    frame = pl.DataFrame([{key: value for key, value in sample.items() if isinstance(value, (str, int))} for sample in samples])
+    label_arrays: dict[str, torch.Tensor] = {}
     label_names: dict[str, list[str]] = {}
     for task in DOCUMENT_TASK_NAMES[1:]:
         label_arrays[task], label_names[task], _ = _encode_labels(frame[task])
@@ -1085,9 +1096,9 @@ def main() -> None:
     def load_symbol_file(path: Path | None) -> set[str] | None:
         if path is None:
             return None
-        frame = pd.read_csv(path)
+        frame = pl.read_csv(path)
         column = "symbol" if "symbol" in frame.columns else frame.columns[0]
-        return set(frame[column].astype(str).str.upper().str.strip())
+        return set(frame[column].cast(pl.String).str.to_uppercase().str.strip_chars().to_list())
 
     train_symbols = load_symbol_file(args.train_symbols_file)
     test_symbols = load_symbol_file(args.test_symbols_file)
@@ -1100,8 +1111,8 @@ def main() -> None:
             raise ValueError("test symbol file does not match any corpus samples")
     if args.inference_only:
         if args.prediction_start_date and args.prediction_start_date != "1900-01-01":
-            requested_date = pd.Timestamp(args.prediction_start_date).normalize()
-            evaluation_samples = [sample for sample in evaluation_samples if pd.Timestamp(sample["date"]).normalize() == requested_date]
+            requested_date = _as_datetime(args.prediction_start_date)
+            evaluation_samples = [sample for sample in evaluation_samples if _as_datetime(sample["date"]) == requested_date]
             if not evaluation_samples:
                 raise ValueError(f"No feature samples exist for requested inference date {requested_date.date()}")
             symbols_on_date = {str(sample["symbol"]).upper() for sample in evaluation_samples}
@@ -1110,9 +1121,9 @@ def main() -> None:
             latest_by_symbol: dict[str, dict[str, object]] = {}
             for sample in evaluation_samples:
                 symbol = str(sample["symbol"]).upper()
-                if symbol not in latest_by_symbol or pd.Timestamp(sample["date"]) > pd.Timestamp(latest_by_symbol[symbol]["date"]):
+                if symbol not in latest_by_symbol or _as_datetime(sample["date"]) > _as_datetime(latest_by_symbol[symbol]["date"]):
                     latest_by_symbol[symbol] = sample
-            evaluation_samples = sorted(latest_by_symbol.values(), key=lambda item: (pd.Timestamp(item["date"]), str(item["symbol"])))
+            evaluation_samples = sorted(latest_by_symbol.values(), key=lambda item: (_as_datetime(item["date"]), str(item["symbol"])))
             print(f"[multirate-inference] latest-per-symbol evaluation set: {len(evaluation_samples)} symbols", flush=True)
     train_samples = samples if train_symbols is None else [
         sample for sample in samples if str(sample["symbol"]).upper() in train_symbols
@@ -1120,21 +1131,21 @@ def main() -> None:
     if train_symbols is not None and not train_samples:
         raise ValueError("train symbol file does not match any corpus samples")
     if args.train_end_date:
-        train_end = pd.Timestamp(args.train_end_date)
-        train_samples = [sample for sample in samples if pd.Timestamp(sample["date"]) < train_end]
+        train_end = _as_datetime(args.train_end_date)
+        train_samples = [sample for sample in samples if _as_datetime(sample["date"]) < train_end]
         if not train_samples:
             raise ValueError(f"no training samples exist before {args.train_end_date}")
 
     # Keep the latest 20% of training dates as a chronological validation
     # holdout so validation samples never contribute gradients.
-    training_dates = sorted({pd.Timestamp(sample["date"]) for sample in train_samples})
+    training_dates = sorted({_as_datetime(sample["date"]) for sample in train_samples})
     validation_samples: list[dict[str, object]] = []
     if not 0.0 <= args.validation_fraction < 1.0:
         raise ValueError("validation_fraction must be in [0, 1)")
     if args.validation_fraction > 0.0 and len(training_dates) >= 2:
-        validation_start = training_dates[max(1, int(np.ceil(len(training_dates) * (1.0 - args.validation_fraction)))) - 1]
-        validation_samples = [sample for sample in train_samples if pd.Timestamp(sample["date"]) >= validation_start]
-        train_samples = [sample for sample in train_samples if pd.Timestamp(sample["date"]) < validation_start]
+        validation_start = training_dates[max(1, int(math.ceil(len(training_dates) * (1.0 - args.validation_fraction)))) - 1]
+        validation_samples = [sample for sample in train_samples if _as_datetime(sample["date"]) >= validation_start]
+        train_samples = [sample for sample in train_samples if _as_datetime(sample["date"]) < validation_start]
     if not train_samples:
         raise ValueError("chronological validation split removed all training samples")
 
@@ -1248,7 +1259,7 @@ def main() -> None:
         parser.error("--checkpoint-every-batches must be non-negative")
     def training_step(module: torch.nn.Module, batch: list[dict[str, object]], active_tasks):
         def stack(name: str) -> torch.Tensor:
-            return torch.from_numpy(np.stack([item[name] for item in batch])).to(device)
+            return torch.stack([item[name] if isinstance(item[name], torch.Tensor) else torch.as_tensor(item[name]) for item in batch]).to(device)
 
         def context(name: str, padding_name: str) -> tuple[torch.Tensor, torch.Tensor]:
             values = stack(name); padding = stack(padding_name).bool()
@@ -1534,9 +1545,9 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    model.eval(); predictions: dict[str, list[np.ndarray]] = {name: [] for name in enabled_document_tasks[1:]}; states: list[np.ndarray] = []; family_states: list[np.ndarray] = []; family_valid_rows: list[np.ndarray] = []
+    model.eval(); predictions: dict[str, list[torch.Tensor]] = {name: [] for name in enabled_document_tasks[1:]}; states: list[torch.Tensor] = []; family_states: list[torch.Tensor] = []; family_valid_rows: list[torch.Tensor] = []
     prediction_rows: list[dict[str, object]] = []
-    prediction_start = pd.Timestamp(args.prediction_start_date) if args.prediction_start_date else None
+    prediction_start = _as_datetime(args.prediction_start_date) if args.prediction_start_date else None
     family_correct = 0
     family_total = 0
     with torch.inference_mode():
@@ -1553,7 +1564,7 @@ def main() -> None:
                     f"[multirate-inference] scoring symbols {start + 1}-{start + len(batch)}/{len(evaluation_samples)}: {batch_symbols}",
                     flush=True,
                 )
-            def stack(name: str) -> torch.Tensor: return torch.from_numpy(np.stack([item[name] for item in batch])).to(device)
+            def stack(name: str) -> torch.Tensor: return torch.stack([item[name] if isinstance(item[name], torch.Tensor) else torch.as_tensor(item[name]) for item in batch]).to(device)
             def context(name: str, padding_name: str) -> tuple[torch.Tensor, torch.Tensor]:
                 values = stack(name); padding = stack(padding_name).bool()
                 empty = padding.all(dim=1)
@@ -1571,11 +1582,11 @@ def main() -> None:
             if prediction_start is not None:
                 score_names = tuple(SUPERVISED_TARGET_TASK_NAMES)
                 score_arrays = {
-                    name: torch.sigmoid(output["token_outputs"][name].squeeze(-1)).cpu().numpy()
+                    name: torch.sigmoid(output["token_outputs"][name].squeeze(-1)).cpu()
                     for name in score_names
                 }
                 for row_index, item in enumerate(batch):
-                    dates = [pd.Timestamp(value) for value in item["daily_dates"]]
+                    dates = [_as_datetime(value) for value in item["daily_dates"]]
                     offset = DAILY_WINDOW - len(dates)
                     for date_index, date in enumerate(dates):
                         if date < prediction_start:
@@ -1583,7 +1594,7 @@ def main() -> None:
                         score_row = {name: float(values[row_index, offset + date_index]) for name, values in score_arrays.items()}
                         prediction_rows.append({"symbol": item["symbol"], "date": date.strftime("%Y-%m-%d"), **score_row})
             if not args.skip_embeddings:
-                states.append(output["document_prototypes"].cpu().numpy())
+                states.append(output["document_prototypes"].cpu())
             family_labels = torch.arange(len(family_names), device=device).view(1, -1).expand(len(batch), -1)
             family_valid = torch.zeros((len(batch), len(family_names)), dtype=torch.bool, device=device)
             for rate in ("annual", "quarterly", "daily", "sparse"):
@@ -1603,19 +1614,19 @@ def main() -> None:
                     local_count = len(feature_families)
                 family_valid[:, family_offset:family_offset + local_count] |= observed
             if not args.skip_embeddings:
-                family_states.append(output["family_document_prototypes"].cpu().numpy())
-                family_valid_rows.append(family_valid.cpu().numpy())
+                family_states.append(output["family_document_prototypes"].cpu())
+                family_valid_rows.append(family_valid.cpu())
             if "family" in enabled_document_tasks:
                 family_predictions = output["document_outputs"]["family"].argmax(dim=-1)
                 family_correct += int((family_predictions[family_valid] == family_labels[family_valid]).sum())
                 family_total += int(family_valid.sum())
-            for name in predictions: predictions[name].append(output["document_outputs"][name].argmax(dim=-1).cpu().numpy())
+            for name in predictions: predictions[name].append(output["document_outputs"][name].argmax(dim=-1).cpu())
     evaluation_label_arrays = {
-        name: np.asarray([sample[f"{name}_label"] for sample in evaluation_samples], dtype="int64")
+        name: torch.tensor([sample[f"{name}_label"] for sample in evaluation_samples], dtype=torch.long)
         for name in predictions
     }
     task_accuracy = {
-        name: float((np.concatenate(predictions[name]) == evaluation_label_arrays[name]).mean())
+        name: float(torch.cat(predictions[name]).eq(evaluation_label_arrays[name]).float().mean())
         for name in predictions
     }
     if "family" in enabled_document_tasks:
@@ -1664,68 +1675,20 @@ def main() -> None:
     (output_dir / "training_summary.json").write_text(json.dumps(metrics, indent=2))
     torch.save({"state_dict": model.state_dict(), "metrics": metrics, "labels": label_names}, output_dir / "multirate_mtl_model.pt")
     if prediction_rows:
-        pd.DataFrame(prediction_rows).sort_values(["date", "symbol"]).to_csv(output_dir / "supervised_predictions.csv", index=False)
+        pl.DataFrame(prediction_rows).sort(["date", "symbol"]).write_csv(output_dir / "supervised_predictions.csv")
     if args.learned_aggregation_gate:
         gate = model.auto_feature_engineer.aggregation_gate
         if gate.family_logits is not None:
-            weights = torch.softmax(gate.family_logits.detach(), dim=-1).cpu().numpy()
+            weights = torch.softmax(gate.family_logits.detach(), dim=-1).cpu().tolist()
             gate_rows = [
                 {"feature_family": family, "aggregation": aggregation, "weight": float(weights[index, aggregation_index])}
                 for index, family in enumerate(model.family_names)
                 for aggregation_index, aggregation in enumerate(gate.aggregation_functions)
             ]
-            pd.DataFrame(gate_rows).to_csv(output_dir / "aggregation_gate_weights.csv", index=False)
+            pl.DataFrame(gate_rows).write_csv(output_dir / "aggregation_gate_weights.csv")
     if args.skip_embeddings:
         return
-    embeddings = np.nan_to_num(np.concatenate(states), nan=0.0, posinf=0.0, neginf=0.0)
-    family_embeddings = np.nan_to_num(np.concatenate(family_states), nan=0.0, posinf=0.0, neginf=0.0)
-    family_valid_array = np.concatenate(family_valid_rows)
-    rows: list[dict[str, object]] = []
-    for family_index, label in enumerate(family_names):
-        indices = np.where(family_valid_array[:, family_index])[0]
-        if len(indices):
-            for prototype_index, prototype_name in enumerate(DOCUMENT_PROTOTYPE_STATS):
-                start = prototype_index * config.d_model
-                stop = start + config.d_model
-                rows.append({"task": "family", "label": f"{label} [{prototype_name}]", "prototype": prototype_name, "support": int(len(indices)), "embedding": family_embeddings[indices, family_index, start:stop].mean(axis=0)})
-    for name in predictions:
-        # Issuer and symbol are high-cardinality document tasks. They remain
-        # fully trained and evaluated, but are omitted from the global t-SNE
-        # prototype plot so the 10B visualization remains tractable.
-        if name in {"issuer", "symbol"}:
-            continue
-        for label in label_names[name]:
-            indices = np.where(np.asarray(label_names[name])[evaluation_label_arrays[name]] == label)[0]
-            if len(indices):
-                for prototype_index, prototype_name in enumerate(DOCUMENT_PROTOTYPE_STATS):
-                    start = prototype_index * config.d_model
-                    stop = start + config.d_model
-                    rows.append({"task": name, "label": f"{label} [{prototype_name}]", "prototype": prototype_name, "support": int(len(indices)), "embedding": embeddings[indices, start:stop].mean(axis=0)})
-    if args.skip_t_sne:
-        return
-    if len(rows) >= 2:
-        coordinates = TSNE(n_components=3, perplexity=min(30.0, len(rows) - 1), init="pca", learning_rate="auto", max_iter=1500, random_state=42).fit_transform(np.stack([row.pop("embedding") for row in rows]).astype("float32"))
-        coordinates_path = output_dir / "prototype_coordinates_3d.csv"
-        plot = pd.DataFrame(rows); plot[["x", "y", "z"]] = coordinates; plot.to_csv(coordinates_path, index=False)
-
-        # Publish one mean-only visualization per completed model in the
-        # experiment-level folder, shared by all model scales.
-        common_plot_dir = output_dir.parent / "plots"
-        common_plot_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).with_name("generate_mtl_tsne_views.py")),
-                "--coordinates", str(coordinates_path),
-                "--output-dir", str(common_plot_dir),
-                "--title-prefix", f"{output_dir.name} learned family gate",
-                "--prototype", "mean",
-            ],
-            check=True,
-        )
-        (common_plot_dir / "prototype_embeddings_tsne_3d_mean.png").rename(
-            common_plot_dir / f"{output_dir.name}_tsne_3d_mean.png"
-        )
+    raise RuntimeError("embedding/t-SNE export is disabled in the Polars/Torch-only trainer; pass --skip-embeddings")
 
 
 if __name__ == "__main__":
