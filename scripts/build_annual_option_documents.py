@@ -89,7 +89,7 @@ def _expand_documents(base: pl.DataFrame, options: pl.DataFrame, name: str, base
         ).filter(pl.col("_rank") >= pl.col("_count") - 252).drop("_count", "_rank")
     else:
         docs = docs.sort(["symbol", "date"])
-    return pl.concat([base_rows, docs], how="diagonal_relaxed")
+    return pl.concat([base_rows, docs], how="diagonal_relaxed", rechunk=False)
 
 
 def main() -> None:
@@ -139,7 +139,13 @@ def main() -> None:
     ).drop("underlying_symbol").rename({"document_symbol": "symbol"})
     pl.concat([taxonomy.filter(pl.col("symbol").is_in(sorted(base_symbols))), doc_tax], how="diagonal_relaxed").unique("symbol").write_csv(args.output_dir / "taxonomy.csv")
     for name in ("annual", "quarterly", "daily", "sparse_events"):
-        _expand_documents(pl.read_parquet(root / f"{name}.parquet"), options, name, base_symbols).write_parquet(args.output_dir / f"{name}.parquet")
+        # Keep the large 100B daily expansion in Polars. Converting it to
+        # pandas before the option join can exceed memory even though the
+        # resulting parquet is manageable.
+        base_frame = pl.read_parquet(root / f"{name}.parquet")
+        _expand_documents(base_frame, options, name, base_symbols).write_parquet(
+            args.output_dir / f"{name}.parquet", compression="zstd", row_group_size=250_000,
+        )
 
     symbols = sorted(base_symbols)
     train_docs = options.filter(pl.col("underlying_symbol").is_in(sorted(train_symbols))).get_column("document_symbol")

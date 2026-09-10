@@ -709,6 +709,7 @@ def main() -> None:
     option_document_symbols: set[str] = set()
     option_document_start_dates: dict[str, pd.Timestamp] = {}
     source_symbol_by_symbol: dict[str, str] = {}
+    option_entry_anchors = pd.DataFrame(columns=["symbol", "date"])
     if args.option_panel is not None:
         option_panel = issuer_quartile_panel if issuer_quartile_panel is not None else _read_parquet_polars(args.option_panel)
         option_panel = _add_executable_option_return(option_panel)
@@ -718,9 +719,13 @@ def main() -> None:
             option_panel = option_panel.loc[option_panel["entry_date"].le(pd.Timestamp(args.option_end_date))]
         if option_dtes:
             option_panel = option_panel.loc[pd.to_numeric(option_panel["dte"], errors="coerce").isin(option_dtes)]
+        option_entry_anchors = option_panel[["symbol", "entry_date"]].rename(columns={"entry_date": "date"}).drop_duplicates()
+        option_state_panel = option_panel.copy()
+        if "underlying_symbol" in option_state_panel:
+            option_state_panel["symbol"] = option_state_panel["underlying_symbol"]
         option_columns = _add_option_state_features(
             daily,
-            option_panel,
+            option_state_panel,
             max_contracts_per_type=max(0, args.option_max_contracts),
         )
         for table in (annual, quarterly):
@@ -757,6 +762,9 @@ def main() -> None:
     if option_document_symbols:
         allowed_symbols = {symbol for symbol in taxonomy.index if not str(symbol).upper().startswith("OPT_")} | option_document_symbols
         taxonomy = taxonomy.loc[taxonomy.index.isin(allowed_symbols)].copy()
+        for option_symbol, underlying_symbol in source_symbol_by_symbol.items():
+            if option_symbol not in taxonomy.index and underlying_symbol in taxonomy.index:
+                taxonomy.loc[option_symbol] = taxonomy.loc[underlying_symbol]
     if "event_date" in sparse:
         sparse["event_date"] = pd.to_datetime(sparse["event_date"], errors="coerce", utc=True).dt.tz_localize(None)
 
@@ -880,13 +888,7 @@ def main() -> None:
     # when annual fundamentals begin later for a symbol.
     anchor_parts = [annual[["symbol", "date"]], sparse[["symbol", "date"]]]
     if option_document_symbols:
-        option_daily = daily.loc[daily["symbol"].isin(option_document_symbols), ["symbol", "date"]].copy()
-        starts = option_daily["symbol"].map(option_document_start_dates)
-        option_daily = option_daily.loc[
-            option_daily["date"].ge(starts)
-            & option_daily["date"].lt(starts + pd.Timedelta(days=366))
-        ]
-        anchor_parts.append(option_daily)
+        anchor_parts.append(option_entry_anchors)
     if option_target_map:
         anchor_parts.append(pd.DataFrame(
             [{"symbol": symbol, "date": date} for symbol, date in option_target_map]
