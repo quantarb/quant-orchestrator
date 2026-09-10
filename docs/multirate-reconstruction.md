@@ -127,3 +127,20 @@ and nonzero valid targets for HITS, Oracle, and insider families in all four
 reconstruction objectives. Peak process RSS was 3,342 MiB; peak CUDA allocation
 was 8,121 MiB. Counts include overlapping training windows and are not counts of
 unique financial events. These checks establish execution, not generalization.
+
+## EOD information and execution dates
+
+Prediction CSV `date` denotes the EOD information date, also written explicitly
+as `information_date`. It is not the execution date. All rate windows use the
+same as-of anchor, retaining older available observations for slower families.
+The existing replay consumes that score on the following observed trading
+session; it does not trade on the score's information date. For example, a
+Friday EOD score is eligible for Monday execution when Monday is the next
+session. `prediction_timing.json` records this contract beside the scores.
+
+Per the requested training contract, supervised features and event labels stay
+aligned to the same date. NTP retains its next-observation targets and MTP its
+same-observation reconstruction targets. The execution delay belongs in the
+backtest, not in an extra shift of model inputs or supervised labels. Current
+scoring anchors follow instrument price dates, so weekend-only updates are not
+separately scored. Recorded source dates remain unchanged; no publication lags are invented.

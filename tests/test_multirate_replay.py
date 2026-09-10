@@ -35,10 +35,11 @@ def scores(path, symbols, dates, directions):
     pl.DataFrame(rows).write_csv(path)
 
 
-def test_previous_session_execution_and_expiry_intrinsic(tmp_path, monkeypatch):
+@pytest.mark.parametrize("session_days", [(2, 3, 4), (5, 8, 9)])
+def test_previous_session_execution_and_expiry_intrinsic(tmp_path, monkeypatch, session_days):
     root = tmp_path / "corpus"
     root.mkdir()
-    dates = [datetime(2024, 1, d) for d in [2, 3, 4]]
+    dates = [datetime(2024, 1, d) for d in session_days]
     pl.DataFrame(
         [
             dict(symbol="A", issuer="A", underlying_symbol="A", asset_class="equity"),
@@ -47,7 +48,7 @@ def test_previous_session_execution_and_expiry_intrinsic(tmp_path, monkeypatch):
                 issuer="A",
                 underlying_symbol="A",
                 asset_class="option",
-                expiration="2024-01-04",
+                expiration=dates[-1].strftime("%Y-%m-%d"),
                 strike=100.0,
                 option_type="call",
             ),
@@ -75,8 +76,8 @@ def test_previous_session_execution_and_expiry_intrinsic(tmp_path, monkeypatch):
         root,
         score_path,
         tmp_path / "replay",
-        start="2024-01-02",
-        end="2024-01-04",
+        start=dates[0].strftime("%Y-%m-%d"),
+        end=dates[-1].strftime("%Y-%m-%d"),
         initial_cash=1000,
         fee_bps=0,
         slippage_bps=0,
@@ -85,7 +86,7 @@ def test_previous_session_execution_and_expiry_intrinsic(tmp_path, monkeypatch):
     assert result["final_equity"] == pytest.approx(6100.0)
     trades = pl.read_parquet(tmp_path / "replay/trade_list.parquet")
     assert trades.height == 1
-    assert trades["entry_date"][0] == datetime(2024, 1, 3)
+    assert trades["entry_date"][0] == dates[1]
     assert trades["exit_price"][0] == 20.0
 
 

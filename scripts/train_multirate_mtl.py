@@ -1819,7 +1819,7 @@ def main() -> None:
                         if date < prediction_start or date != _as_datetime(item["date"]):
                             continue
                         score_row = {name: float(values[row_index, offset + date_index]) for name, values in score_arrays.items()}
-                        prediction_rows.append({"symbol": item["symbol"], "date": date.strftime("%Y-%m-%d"), **score_row})
+                        prediction_rows.append({"symbol": item["symbol"], "date": date.strftime("%Y-%m-%d"), "information_date": item["date"], **score_row})
             if prediction_rows:
                 with prediction_temporary.open("a", newline="") as handle:
                     writer = csv.DictWriter(handle, fieldnames=list(prediction_rows[0]))
@@ -1924,6 +1924,14 @@ def main() -> None:
                 "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}}, output_dir / "multirate_mtl_model.pt")
     if prediction_count:
         os.replace(prediction_temporary, output_dir / "supervised_predictions.csv")
+        (output_dir / "prediction_timing.json").write_text(json.dumps({
+            "date_semantics": "EOD information date, not execution date",
+            "information_date_column": "information_date",
+            "context_rule": "Use observations with recorded corpus dates at or before the information date",
+            "execution_rule": "Existing replay uses each score on the following observed trading session",
+            "supervision_rule": "Train on same-date features and event labels; apply the EOD score on the following trading session",
+            "calendar_rule": "Existing scoring anchors follow instrument price dates; weekend-only updates are not separately scored",
+        }, indent=2))
     else:
         prediction_temporary.unlink(missing_ok=True)
     if args.learned_aggregation_gate:
