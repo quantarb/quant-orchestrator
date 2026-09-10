@@ -76,3 +76,38 @@ def test_epoch_backtest_freezes_prices_and_reports_return_changes(tmp_path, monk
     assert len(calls)==1 and calls[0]['adjustment']=='splits_and_dividends'
     assert reports[0]['capital_return']>0 and reports[1]['capital_return']==0
     assert 'backtest[2]' in format_backtest_report(reports)
+
+
+def test_yearly_backtests_isolate_dates_capital_and_price_snapshots(tmp_path, monkeypatch):
+    from datetime import date
+    import polars as pl
+    from quant_orchestrator.research_tools.epoch_evaluation import yearly_epoch_backtests, format_backtest_report
+    corpus=tmp_path/'corpus';corpus.mkdir()
+    pl.DataFrame({'symbol':['A'],'asset_class':['equity']}).write_csv(corpus/'taxonomy.csv')
+    calls=[]
+    class Warehouse:
+        def read_prices(self, symbol, **kwargs):
+            calls.append(kwargs)
+            year=int(kwargs['start'][:4])
+            return pl.DataFrame({'date':[date(year,1,5),date(year,1,6)],
+                'close':[100.,200. if year==2024 else 50.]})
+    monkeypatch.setattr('quant_warehouse.Warehouse',Warehouse)
+    previous=None
+    for epoch in (1,2):
+        directory=tmp_path/f'epoch_{epoch}';directory.mkdir()
+        dates=[date(y,1,d) for y in (2024,2025,2026) for d in (5,6)]
+        pl.DataFrame({'date':dates,'symbol':['A']*6,
+            **{f'hits_{side}_return_{role}':[.1]*6 for side in ('long','short') for role in ('hub','authority')}}).write_csv(directory/'supervised_predictions.csv')
+        reports=yearly_epoch_backtests(['python','train','--corpus',str(corpus)],directory,'2024-01-01','2026-09-09',previous)
+        assert len(reports)==6
+        longs=[r for r in reports if r['side']=='long']
+        assert [r['period'] for r in longs]==['2024','2025','2026']
+        assert longs[0]['capital_return']>0
+        assert longs[1]['capital_return']<0 and longs[2]['capital_return']<0
+        assert all(r['initial_cash']==100000 for r in reports)
+        if previous:
+            assert all(r['return_change_vs_previous_epoch']==0 for r in reports)
+        previous=reports
+    assert len(calls)==3
+    assert calls[-1]['end']=='2026-09-09'
+    assert 'period,start,end' in format_backtest_report(reports)

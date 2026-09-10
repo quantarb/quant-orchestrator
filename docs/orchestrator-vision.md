@@ -230,3 +230,10 @@ For the user-selected original transformer strategy, epoch evaluation now uses
 and shared-book functions. Data preparation stays in Polars; only one bounded
 annual panel crosses the original engine's pandas interface. The replacement
 0.80 authority-threshold replay is not the reference strategy.
+
+The multi-rate epoch monitor also supports a separate frozen inference corpus
+and independent calendar-year backtests (`--inference-corpus`,
+`--backtest-by-year`). `research_tools.epoch_evaluation.yearly_epoch_backtests`
+filters each year's full score calendar, resets capital, and keeps annual
+price snapshots and epoch comparisons separate while reusing the original
+transformer trading policy and shared-book engine.

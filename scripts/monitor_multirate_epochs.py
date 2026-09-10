@@ -12,7 +12,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from quant_orchestrator.research_tools.epoch_evaluation import (
     option, evaluation_command, last_epoch_batches, trend_report, format_epoch_report,
-    anchored_epoch_backtest, format_backtest_report,
+    anchored_epoch_backtest, yearly_epoch_backtests, format_backtest_report,
 )
 
 
@@ -30,6 +30,8 @@ def main():
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--validation-start', required=True)
     parser.add_argument('--validation-end', required=True)
+    parser.add_argument('--inference-corpus', type=Path, help='Separate frozen corpus for evaluation; training corpus is unchanged')
+    parser.add_argument('--backtest-by-year', action='store_true', help='Report independent calendar-year books, including a partial final year')
     parser.add_argument('--max-samples', type=int, default=256)
     parser.add_argument('--poll-seconds', type=float, default=10)
     parser.add_argument('--training-pid', type=int, help='Detect training exit without stopping or modifying it')
@@ -45,11 +47,16 @@ def main():
     if args.training_pid is not None and args.training_pid <= 0:
         parser.error('training-pid must be positive')
     training = Path(option(command, '--output-dir'))
+    if args.inference_corpus:
+        command[command.index('--corpus') + 1] = str(args.inference_corpus.resolve())
+    if args.backtest_by_year and not args.backtest_anchored_hits:
+        parser.error('--backtest-by-year requires --backtest-anchored-hits')
     latest = training / 'multirate_mtl_checkpoint_latest.pt'
     args.output_dir.mkdir(parents=True, exist_ok=True)
     configuration = dict(command=command, validation_start=args.validation_start,
                          validation_end=args.validation_end, max_samples=0 if args.backtest_anchored_hits else args.max_samples,
-                         backtest_anchored_hits=args.backtest_anchored_hits)
+                         backtest_anchored_hits=args.backtest_anchored_hits,
+                         backtest_by_year=args.backtest_by_year)
     config_path = args.output_dir / 'configuration.json'
     if config_path.exists() and json.loads(config_path.read_text()) != configuration:
         raise ValueError('Existing monitor output has a different validation configuration; select a new output directory')
@@ -97,7 +104,8 @@ def main():
                     report = trend_report(epoch+1, json.loads((directory/'ntp_evaluation.json').read_text()), previous)
                     if args.backtest_anchored_hits:
                         status('backtesting', epoch=epoch+1)
-                        previous_backtest = anchored_epoch_backtest(command, directory, args.validation_start, args.validation_end, previous_backtest)
+                        backtest = yearly_epoch_backtests if args.backtest_by_year else anchored_epoch_backtest
+                        previous_backtest = backtest(command, directory, args.validation_start, args.validation_end, previous_backtest)
                         print(f"backtest_epoch: {epoch+1}\n" + format_backtest_report(previous_backtest), flush=True)
                     (directory/'epoch_metrics.json').write_text(json.dumps(report, indent=2))
                     print(format_epoch_report(report), flush=True)

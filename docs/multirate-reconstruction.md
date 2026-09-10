@@ -296,3 +296,31 @@ The latest section of `multirate-v6-backtest.md` records the exact call chain,
 original timing/accounting, and the distinction between original total_return
 and return from actual initial capital. This is the policy used for the 100B
 per-epoch backtests; no model training objectives were changed.
+
+### $100B epoch reporting: 2024, 2025, and 2026 YTD
+
+The active run now monitors the full 2024-01-02 through 2026-09-09 scoring
+calendar. `monitor_multirate_epochs.py --inference-corpus ...
+--backtest-anchored-hits --backtest-by-year` uses a separate frozen inference
+corpus and invokes the same original transformer policy/shared-book engine for
+independent annual long and short books. Each year starts with $100,000 and uses
+`1 / min(20, symbol_count)` allocation. Return, Sharpe, drawdown, entries,
+exposure, and return change versus the previous epoch are printed with period
+labels. Price snapshots are cached separately by date range, and scores are
+filtered to each period before simulation.
+
+Training PID 396801 continues on the original pre-2024 data. The inference
+extension preserves every original corpus row, column, and taxonomy entry and
+appends only stored 2026 observed price, statement, and insider data in Polars.
+It generates no 2026 Oracle/HITS targets. Saved checkpoint normalization and
+label mappings are used for inference. There are 115 equities with 2026 prices:
+113 through September 9 and BRK-A/BRK-B through September 8; historical-only ANTM
+has no 2026 scores. No synthetic last-day prices are added by the extension;
+the unchanged backtest engine retains its existing price forward-fill behavior.
+
+Run artifacts, launch script, extension script, and coverage manifest are under
+`artifacts/multirate_recovery/100B/`. Epoch output is under
+`train_long_v6/epoch_validation_2024_2026/epoch_NNNN/{2024,2025,2026}/`.
+All three years are now repeatedly inspected evaluation periods, not untouched
+holdouts. A six-anchor 2026 inference smoke check used the existing $1T model
+only to check dataset/checkpoint compatibility; its output is not a $100B result.
