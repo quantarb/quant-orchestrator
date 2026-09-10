@@ -629,6 +629,12 @@ def main() -> None:
     manifest = json.loads((root / "manifest.json").read_text())
     feature_families = list(manifest["feature_families"])
     target_families = list(manifest["target_families"])
+    # The four-rate architecture keeps a sparse stream even for a fresh
+    # feature-only build with no target-event parquet yet.  A neutral family
+    # preserves the tensor contract without creating a supervised task or
+    # contributing any labels.
+    if not target_families:
+        target_families = ["__empty_sparse_family__"]
     checkpoint_payload = None
     if args.inference_only and args.checkpoint is not None:
         checkpoint_payload = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
