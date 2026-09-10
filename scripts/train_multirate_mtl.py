@@ -524,8 +524,8 @@ def main() -> None:
     )
     parser.add_argument("--grad-accumulation-steps", type=int, default=1)
     parser.add_argument(
-        "--context-cache-size", type=int, default=4096,
-        help="Maximum issuer/date windows cached per rate while building samples; 0 disables the training-data LRU.",
+        "--context-cache-size", type=int, default=256,
+        help="Maximum issuer/date windows cached per rate; 0 disables the training-data LRU.",
     )
     parser.add_argument("--context-memmap-dir", type=Path, help="Optional prepared normalized context-array cache directory.")
     parser.add_argument(
@@ -954,10 +954,6 @@ def main() -> None:
     empty_quarterly = quarterly.iloc[0:0]
     empty_daily = daily.iloc[0:0]
     empty_sparse = sparse.iloc[0:0]
-    annual_by_symbol = {symbol: group for symbol, group in annual.groupby("symbol", sort=False)}; annual_by_symbol["__empty__"] = empty_annual
-    quarterly_by_symbol = {symbol: group for symbol, group in quarterly.groupby("symbol", sort=False)}; quarterly_by_symbol["__empty__"] = empty_quarterly
-    daily_by_symbol = {symbol: group for symbol, group in daily.groupby("symbol", sort=False)}; daily_by_symbol["__empty__"] = empty_daily
-    sparse_by_symbol = {symbol: group for symbol, group in sparse.groupby("symbol", sort=False)}; sparse_by_symbol["__empty__"] = empty_sparse
     context_caches: dict[str, OrderedDict[tuple[str, int], tuple]] = {
         rate: OrderedDict() for rate in ("annual", "quarterly", "daily", "sparse")
     }
@@ -1056,6 +1052,10 @@ def main() -> None:
             "industry": str(taxonomy.loc[symbol, "industry"]),
         }
         samples.append(_LazySample(metadata, materialize) if args.stream_samples else {**metadata, **materialize()})
+    # The indexes own the compact sorted arrays used by lazy samples. Release
+    # the source pandas frames before model construction/training; retaining
+    # both representations is the main avoidable memory spike on 100B runs.
+    del annual, quarterly, daily, sparse
     if args.max_samples:
         if args.max_samples < 1:
             parser.error("--max-samples must be positive when provided")
