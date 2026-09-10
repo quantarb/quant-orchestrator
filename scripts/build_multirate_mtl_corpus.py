@@ -191,8 +191,8 @@ def _build_sparse_events(events: pd.DataFrame, output: Path, device: str) -> lis
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", type=Path, required=True)
-    parser.add_argument("--target-events", type=Path, required=True)
+    parser.add_argument("--symbols", type=Path, help="Optional symbol file; omitted by default so the universe is discovered from FMP profiles.")
+    parser.add_argument("--target-events", type=Path, help="Optional raw target-event parquet; omitted by default.")
     parser.add_argument(
         "--fund-activity-events",
         type=Path,
@@ -203,15 +203,30 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=100)
     parser.add_argument("--text-device", default="cuda")
     parser.add_argument("--start-date", default="1900-01-01")
+    parser.add_argument("--market-cap-min", type=float, default=10_000_000_000)
+    parser.add_argument("--country", default="US")
+    parser.add_argument("--exchanges", default="NYSE,NASDAQ,AMEX")
     args = parser.parse_args()
-    symbols = tuple(sorted(pd.read_csv(args.symbols)["symbol"].astype(str).str.upper().unique()))
+    warehouse = Warehouse()
+    if args.symbols is not None:
+        symbols = tuple(sorted(pd.read_csv(args.symbols)["symbol"].astype(str).str.upper().unique()))
+    else:
+        exchanges = tuple(value.strip().upper() for value in args.exchanges.split(",") if value.strip())
+        profiles = warehouse.catalog.query_symbol_profiles(
+            provider="fmp", min_market_cap=args.market_cap_min, country=args.country,
+            exchanges=exchanges, exclude_etf=True, exclude_fund=True, limit=100_000,
+        )
+        symbols = tuple(sorted({str(profile.symbol).strip().upper() for profile in profiles if str(profile.symbol).strip()}))
+        print(f"discovered FMP universe: {len(symbols)} symbols", flush=True)
+    if not symbols:
+        raise RuntimeError("No symbols available from the requested FMP universe")
     subsectors = _subsector_map(symbols)
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
-    warehouse = Warehouse()
     profiles = warehouse.catalog.query_symbol_profiles(
-        provider="fmp", min_market_cap=10_000_000_000, country="US",
-        exchanges=("NYSE", "NASDAQ", "AMEX"), exclude_etf=True, exclude_fund=True,
+        provider="fmp", min_market_cap=args.market_cap_min, country=args.country,
+        exchanges=tuple(value.strip().upper() for value in args.exchanges.split(",") if value.strip()),
+        exclude_etf=True, exclude_fund=True,
         limit=100_000,
     )
     valid_symbols = {str(profile.symbol).strip().upper() for profile in profiles}
@@ -291,7 +306,7 @@ def main() -> None:
     families = sorted(set(families))
     for rate in ("daily", "quarterly", "annual"):
         _rate_table(daily, families, rate).to_parquet(output / f"{rate}.parquet", index=False)
-    target_events = pd.read_parquet(args.target_events)
+    target_events = pd.read_parquet(args.target_events) if args.target_events is not None else pd.DataFrame()
     if args.fund_activity_events is not None:
         fund_activity_events = pd.read_parquet(args.fund_activity_events)
         target_events = pd.concat([target_events, fund_activity_events], ignore_index=True, sort=False)
