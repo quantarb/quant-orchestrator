@@ -423,6 +423,7 @@ simulation = simulate_return_paths(returns, iterations=1000, horizon=252, block_
 The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
 within-step issuer encoding. Oracle/HITS supervise instrument-specific decisions.
 Masked and next-observation objectives reconstruct individual values at token
-and subtoken levels, using both whole-observation and individual-value masking.
+and subtoken levels. Subtoken MTP masks features within each family; token MTP
+masks whole families. NTP predicts coherent next family and combined-token observations.
 See the [reconstruction contract](docs/multirate-reconstruction.md) for the objective details, checkpoint
 requirements, executed diagnostic scope, and longer-history 1T experiment.

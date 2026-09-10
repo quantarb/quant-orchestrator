@@ -86,7 +86,10 @@ def audit_corpus(root: Path, cutoff: str) -> dict:
     return result
 
 
-def evaluate_predictions(root: Path, predictions: Path, *, start: str, end: str) -> dict:
+def evaluate_predictions(root: Path, predictions: Path, *, start: str, end: str, training_cutoff: str | None = None) -> dict:
+    training_cutoff = training_cutoff or start
+    if datetime.fromisoformat(training_cutoff) > datetime.fromisoformat(start):
+        raise ValueError("Training cutoff must not follow evaluation start")
     taxonomy = pl.read_csv(root / "taxonomy.csv").select("symbol", "issuer", "asset_class")
     scores = pl.scan_csv(predictions, try_parse_dates=True).with_columns(
         pl.col("date").cast(pl.Datetime("ns"))
@@ -134,7 +137,7 @@ def evaluate_predictions(root: Path, predictions: Path, *, start: str, end: str)
     store = StreamingSupervision(pl.scan_parquet(root / "sparse_events.parquet"))
     # Availability, not just the event date, determines baseline fitting.
     train = StreamingSupervision(
-        pl.scan_parquet(root / "sparse_events.parquet"), cutoff=datetime.fromisoformat(start)
+        pl.scan_parquet(root / "sparse_events.parquet"), cutoff=datetime.fromisoformat(training_cutoff)
     ).scan
     joined = scores.join(store.scan, on=["symbol", "date"], how="inner", suffix="_target").join(
         taxonomy.lazy(), on="symbol"
@@ -179,6 +182,7 @@ def evaluate_predictions(root: Path, predictions: Path, *, start: str, end: str)
     return dict(
         start=start,
         end=end,
+        training_cutoff=training_cutoff,
         scored_rows=scores.select(pl.len()).collect(engine="streaming").item(),
         missing_rows=missing,
         event_metrics=metrics,

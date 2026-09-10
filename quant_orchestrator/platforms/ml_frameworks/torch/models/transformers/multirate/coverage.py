@@ -53,6 +53,7 @@ class CoverageAwareInput(nn.Module):
             for name, dim in self.family_dims.items()
         })
         self.missingness_embeddings = nn.Parameter(torch.randn(len(self.family_names), d_model) * 0.02)
+        self.feature_missingness_embeddings = nn.Parameter(torch.randn(self.feature_dim, d_model) * 0.02)
         self.coverage_gate_bias = nn.Parameter(torch.full((len(self.family_names),), -2.0))
         self.modality_names = tuple(modalities)
         if not self.modality_names:
@@ -90,6 +91,7 @@ class CoverageAwareInput(nn.Module):
             state = self.family_adapters[self.family_keys[name]](family)
             missing = (~observed_features[..., self.slices[name]]).to(values.dtype).mean(dim=-1, keepdim=True)
             state = state + missing * self.missingness_embeddings[index]
+            state = state + (~observed_features[..., self.slices[name]]).to(values.dtype) @ self.feature_missingness_embeddings[self.slices[name]]
             gate = torch.sigmoid(self.coverage_gate_bias[index]) * presence[..., index:index + 1]
             states.append(state * gate)
         combined = torch.stack(states, dim=0).sum(dim=0)

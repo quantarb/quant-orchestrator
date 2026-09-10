@@ -648,10 +648,6 @@ class MultiRateTransformer(nn.Module):
         outputs: dict[str, torch.Tensor] = {}
         for task in self.prediction_task_specs:
             source = subtoken_states[task.source] if task.level == "subtoken" else token_states[task.source]
-            if task.level == "subtoken" and task.objective == "masked_token":
-                # Temporal next-family prediction stays within its own family.
-                # Hidden-family reconstruction additionally uses other features.
-                source = source + token_states[task.source].unsqueeze(-2)
             source = torch.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
             outputs[task.task_name] = self.prediction_heads[task.task_name](source)
         return outputs

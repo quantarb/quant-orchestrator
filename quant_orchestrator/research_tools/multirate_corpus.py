@@ -15,12 +15,16 @@ import polars as pl
 from quant_orchestrator.research_tools.multirate_supervision import instrument_asset_groups
 from quant_orchestrator.research_tools.multirate_targets import materialize_instrument_targets
 
-STATEMENTS = {
-    "income": ("revenue", "net_income", "operating_income"),
-    "balance": ("total_assets", "total_liabilities", "total_equity"),
-    "cash": ("operating_cash_flow", "capital_expenditure", "free_cash_flow"),
-}
+STATEMENTS = ("income", "balance", "cash")
 CHANNELS = ["signal_value", *[f"text_{i}" for i in range(7)]]
+
+
+def statement_fields(frame):
+    """Retain raw numeric statement fields, excluding temporal metadata."""
+    metadata = {"date", "period_ending", "filing_date", "accepted_date", "fiscal_year", "fiscal_period"}
+    return [name for name, dtype in frame.schema.items()
+            if name not in metadata and dtype.is_numeric()
+            and frame[name].cast(pl.Float64).is_finite().any()]
 
 
 def bounded_dates(frame, start, end, *, column="date"):
@@ -242,7 +246,7 @@ def build_fresh_corpus(
         add_instrument(tax, frame)
     for issuer in sorted(set(roster["underlying_symbol"])):
         for period, rate in [("annual", "annual"), ("quarter", "quarterly")]:
-            for section, fields in STATEMENTS.items():
+            for section in STATEMENTS:
                 frame = warehouse.read_fundamentals(
                     issuer, section=section, period=period, provider="fmp", start=start, end=end
                 )
@@ -262,12 +266,7 @@ def build_fresh_corpus(
                     raise ValueError(
                         f"Statement coverage differs from audit for {gap_key}: observed gaps {missing_years}, audited gaps {audited_years}"
                     )
-                numeric = [
-                    c
-                    for c in fields
-                    if c in frame.columns
-                    and frame[c].cast(pl.Float64, strict=False).is_finite().any()
-                ]
+                numeric = statement_fields(frame)
                 if not numeric:
                     raise ValueError(f"No usable fields for {issuer}/{period}/{section}")
                 names = {c: f"fmp.{section}.{c}" for c in numeric}
@@ -289,6 +288,7 @@ def build_fresh_corpus(
                         rate=rate,
                         section=section,
                         rows=frame.height,
+                        fields=numeric,
                         first=str(frame[date_column].min()),
                         last=str(frame[date_column].max()),
                     )
