@@ -10,11 +10,15 @@ class Warehouse:
     def __init__(self, prices, distributions):
         self.prices = prices
         self.distributions = distributions
+        self.price_adjustments = []
 
     def read_prices(self, symbol, **kwargs):
+        self.price_adjustments.append(kwargs["adjustment"])
         return self.prices
 
     def read_fundamentals(self, symbol, **kwargs):
+        if kwargs.get("section") == "historical_splits":
+            return pl.DataFrame()
         return self.distributions
 
 
@@ -84,13 +88,14 @@ def test_previous_session_execution_and_expiry_intrinsic(tmp_path, monkeypatch, 
         warehouse=warehouse,
     )
     assert result["final_equity"] == pytest.approx(6100.0)
+    assert warehouse.price_adjustments == ["splits_and_dividends", "unadjusted"]
     trades = pl.read_parquet(tmp_path / "replay/trade_list.parquet")
     assert trades.height == 1
     assert trades["entry_date"][0] == dates[1]
     assert trades["exit_price"][0] == 20.0
 
 
-def test_distribution_entitlement_survives_sale_before_payment(tmp_path):
+def test_adjusted_prices_do_not_double_count_cash_distributions(tmp_path):
     root = tmp_path / "corpus"
     root.mkdir()
     dates = [datetime(2024, 1, d) for d in [2, 3, 4, 5]]
@@ -114,6 +119,7 @@ def test_distribution_entitlement_survives_sale_before_payment(tmp_path):
         slippage_bps=0,
         warehouse=warehouse,
     )
-    assert result["final_equity"] == pytest.approx(1010.0)
+    assert result["final_equity"] == pytest.approx(1000.0)
     curve = pl.read_parquet(tmp_path / "replay/equity_curve.parquet")
-    assert curve["receivables"].to_list() == [0.0, 0.0, 10.0, 0.0]
+    assert curve["receivables"].to_list() == [0.0, 0.0, 0.0, 0.0]
+    assert warehouse.price_adjustments == ["splits_and_dividends"]

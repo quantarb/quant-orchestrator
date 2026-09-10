@@ -251,3 +251,7 @@ The completed v6 run has a [measured failure diagnosis and training profile](mul
 It identifies pooled price scaling, unseen constant option attributes, and
 CPU sample preparation as repair priorities; it does not claim those repairs
 or a full-run speedup have been completed.
+
+The unchanged v6 checkpoint also has a [completed adjusted-price backtest](multirate-v6-backtest.md)
+for separate 2024 and 2025 folds, including the fixed policy, costs, exposure,
+and issuer-equity buy-and-hold comparison.

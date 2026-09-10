@@ -41,16 +41,16 @@ def replay_multirate(
     metadata = {r["symbol"]: r for r in taxonomy.iter_rows(named=True)}
     issuers = sorted(taxonomy["issuer"].unique())
     first, last = datetime.fromisoformat(start), datetime.fromisoformat(end)
-    quote_paths, distribution_paths = [], []
-    # Read one non-option instrument at a time, preserving raw execution prices
-    # and cash distributions separately from adjusted model-input histories.
+    quote_paths, distribution_paths, underlying_paths = [], [], []
+    # Adjusted equity units are synthetic total-return units; do not add
+    # dividends or split adjustments a second time.
     for row in taxonomy.filter(pl.col("asset_class") != "option").iter_rows(named=True):
         symbol = row["symbol"]
         frame = warehouse.read_prices(
-            symbol, provider="fmp", start=start, end=end, adjustment="unadjusted"
+            symbol, provider="fmp", start=start, end=end, adjustment="splits_and_dividends"
         )
         if frame.is_empty():
-            raise ValueError(f"Missing unadjusted execution prices for {symbol}")
+            raise ValueError(f"Missing adjusted execution prices for {symbol}")
         frame = frame.select(
             pl.col("date").cast(pl.Datetime("ns")),
             pl.lit(symbol).alias("symbol"),
@@ -60,28 +60,13 @@ def replay_multirate(
         path = inputs / f"prices_{symbol}.parquet"
         frame.write_parquet(path)
         quote_paths.append(path)
-        dist = warehouse.read_fundamentals(
-            symbol, section="dividends", provider="fmp", start=start, end=end
-        )
-        if not dist.is_empty():
-            if not dist.schema["payment_date"].is_temporal():
-                raise ValueError(
-                    f"Invalid payment dates for {symbol}; restore source cashflow history"
-                )
-            dist = dist.select(
-                pl.lit(symbol).alias("symbol"),
-                pl.col("ex_dividend_date").cast(pl.Datetime("ns")).alias("date"),
-                pl.col("payment_date").cast(pl.Datetime("ns")),
-                pl.col("amount").cast(pl.Float64),
-            )
-            if dist.null_count().select(pl.sum_horizontal(pl.all())).item():
-                raise ValueError(f"Incomplete cashflow records for {symbol}")
-            path = inputs / f"distributions_{symbol}.parquet"
-            dist.write_parquet(path)
-            distribution_paths.append(path)
     for issuer in sorted(
         taxonomy.filter(pl.col("asset_class") == "option")["underlying_symbol"].unique()
     ):
+        raw = warehouse.read_prices(issuer, provider="fmp", start=start, end=end, adjustment="unadjusted")
+        path = inputs / f"underlying_raw_{issuer}.parquet"
+        raw.select(pl.col("date").cast(pl.Datetime("ns")), pl.lit(issuer).alias("symbol"), "close").write_parquet(path)
+        underlying_paths.append(path)
         selected = taxonomy.filter(
             (pl.col("asset_class") == "option") & (pl.col("underlying_symbol") == issuer)
         )["symbol"].to_list()
@@ -114,6 +99,7 @@ def replay_multirate(
                 quote_paths.append(path)
             day = stop + timedelta(days=1)
     quotes = pl.scan_parquet(quote_paths)
+    underlying_quotes = pl.scan_parquet(underlying_paths) if underlying_paths else None
     distributions = (
         pl.scan_parquet(distribution_paths)
         if distribution_paths
@@ -210,11 +196,11 @@ def replay_multirate(
                 stale += 1
             expiry = datetime.fromisoformat(tax["expiration"]) if tax.get("expiration") else None
             if expiry and date >= expiry:
-                underlying = day.get(tax["underlying_symbol"])
-                if underlying is None:
+                underlying = underlying_quotes.filter((pl.col("symbol") == tax["underlying_symbol"]) & (pl.col("date") == date)).collect(engine="streaming")
+                if underlying.is_empty():
                     raise ValueError(f"Missing expiry underlying valuation for {symbol}")
                 sign = 1 if str(tax["option_type"]).lower().startswith("c") else -1
-                intrinsic = max(0.0, sign * (underlying["bid"] - tax["strike"]))
+                intrinsic = max(0.0, sign * (underlying["close"][0] - tax["strike"]))
                 sell(symbol, date, intrinsic, "expiration_intrinsic")
             elif (
                 not baseline
@@ -328,9 +314,11 @@ def replay_multirate(
             if baseline
             else "funded long-only, one instrument per issuer, previous-session Oracle direction, HITS entry ordering"
         ),
-        cashflows="raw prices plus ex-date entitlements paid on source payment dates",
+        cashflows="split-and-dividend-adjusted equity prices; no separate corporate-action cashflows",
+        equity_price_adjustment="splits_and_dividends",
         options="100-share lots, bid/ask execution, expiry intrinsic cash-equivalent valuation, no rolls",
         limitations=[
+            "Equity quantities are synthetic adjusted-price units, not historical share counts",
             "No short borrowing or naked-option margin simulation",
             "Early exercise, assignment and taxes are not modeled",
             "HITS scores are per-instrument graph scores, not calibrated cross-asset returns",
@@ -368,7 +356,7 @@ def replay_multirate(
     )
     scored.sink_parquet(output / "scored_panel.parquet")
     summary["input_sha256"] = {}
-    for path in [*quote_paths, *distribution_paths, predictions, root / "taxonomy.csv"]:
+    for path in [*quote_paths, *distribution_paths, *underlying_paths, predictions, root / "taxonomy.csv"]:
         with path.open("rb") as handle:
             summary["input_sha256"][str(path.resolve())] = hashlib.file_digest(
                 handle, "sha256"
