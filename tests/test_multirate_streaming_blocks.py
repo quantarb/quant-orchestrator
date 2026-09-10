@@ -64,3 +64,23 @@ def test_sparse_families_keep_history_despite_frequent_other_events():
     earlier, early_padding, _, _ = context.window('X', datetime(2020, 1, 20), 4)
     assert earlier[~early_padding, 0].nan_to_num().max() == 15
     assert earlier[~early_padding, 1].nan_to_num().max() == 20
+
+
+def test_anchor_ordering_preserves_rows_and_reuses_bounded_issuer_metadata():
+    from collections import OrderedDict
+    from quant_orchestrator.research_tools.streaming_context import context_ordered_anchors
+    # Interleaving >32 issuers previously evicted every cached version on each pass.
+    rows=[{'symbol':f'S{i:03d}', 'date':datetime(2020,1,day)}
+          for day in (1,2,3) for i in range(114)]
+    rows += [{'symbol':'OTHER_SHARE','date':datetime(2020,1,2)}]
+    original=pl.DataFrame(rows)
+    ordered=context_ordered_anchors(original,{'OTHER_SHARE':'S000'})
+    assert ordered.sort('symbol','date').equals(original.sort('symbol','date'))
+    cache=OrderedDict();misses=0
+    for symbol in ordered['symbol']:
+        issuer='S000' if symbol=='OTHER_SHARE' else symbol
+        if issuer not in cache:misses+=1
+        cache[issuer]=True;cache.move_to_end(issuer)
+        if len(cache)>32:cache.popitem(last=False)
+    assert misses==114
+    assert len(cache)==32

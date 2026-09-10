@@ -237,3 +237,8 @@ and independent calendar-year backtests (`--inference-corpus`,
 filters each year's full score calendar, resets capital, and keeps annual
 price snapshots and epoch comparisons separate while reusing the original
 transformer trading policy and shared-book engine.
+
+Multi-rate sample metadata preparation groups anchors by issuer/instrument/date
+before visiting the bounded streaming caches. Feature histories remain lazy;
+the current trainer still builds its sample metadata list before fitting and
+prints preparation progress every 25,000 anchors.

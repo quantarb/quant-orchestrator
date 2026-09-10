@@ -25,7 +25,7 @@ import torch
 from torch import nn
 
 from quant_warehouse import Warehouse
-from quant_orchestrator.research_tools.streaming_context import StreamingContext, StreamingFamilyContext
+from quant_orchestrator.research_tools.streaming_context import StreamingContext, StreamingFamilyContext, context_ordered_anchors
 from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups, input_event_families
 from quant_orchestrator.research_tools.multirate_objectives import (
     RECONSTRUCTION_CONTRACT, reconstruction_mask, reconstruction_targets, family_channels, feature_family_layout,
@@ -1125,7 +1125,13 @@ def main() -> None:
     samples: list[dict[str, object]] = []
     taxonomy_by_symbol = {str(row["symbol"]): row for row in taxonomy.iter_rows(named=True)}
     taxonomy_symbols = set(taxonomy_by_symbol)
-    for row in anchors.iter_rows(named=True):
+    anchors = context_ordered_anchors(anchors, source_symbol_by_symbol)
+    preparation_started = perf_counter()
+    print(f"[multirate-prepare] anchors={anchors.height} stage=sample_metadata", flush=True)
+    for anchor_index, row in enumerate(anchors.iter_rows(named=True)):
+        if anchor_index and anchor_index % 25000 == 0:
+            print(f"[multirate-prepare] anchors={anchor_index}/{anchors.height} "
+                  f"seconds={perf_counter()-preparation_started:.1f}", flush=True)
         symbol = str(row["symbol"]).upper(); anchor = _as_datetime(row["date"])
         if symbol not in taxonomy_symbols:
             continue
@@ -1185,6 +1191,8 @@ def main() -> None:
             "industry": str(taxonomy_by_symbol[symbol]["industry"]),
         }
         samples.append(_LazySample(metadata, materialize) if args.stream_samples else {**metadata, **materialize()})
+    print(f"[multirate-prepare] samples={len(samples)} stage=metadata_complete "
+          f"seconds={perf_counter()-preparation_started:.1f}", flush=True)
     # The indexes own the compact sorted arrays used by lazy samples. Release
     # the source Polars frames before model construction/training; retaining
     # both representations is the main avoidable memory spike on 100B runs.

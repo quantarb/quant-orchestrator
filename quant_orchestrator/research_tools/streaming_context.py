@@ -7,6 +7,13 @@ import polars as pl
 import torch
 
 
+def context_ordered_anchors(anchors: pl.DataFrame, source_symbols: dict[str, str]) -> pl.DataFrame:
+    """Group the small symbol/date index so bounded issuer caches can be reused."""
+    return anchors.with_columns(
+        pl.col('symbol').replace_strict(source_symbols, default=pl.col('symbol')).alias('_context_source')
+    ).sort('_context_source', 'symbol', 'date').drop('_context_source')
+
+
 class StreamingContext:
     def __init__(self, scan: pl.LazyFrame, columns: list[str], *, target_column=None):
         # Independent endpoint rows on one date must form one union row.

@@ -324,3 +324,24 @@ Run artifacts, launch script, extension script, and coverage manifest are under
 All three years are now repeatedly inspected evaluation periods, not untouched
 holdouts. A six-anchor 2026 inference smoke check used the existing $1T model
 only to check dataset/checkpoint compatibility; its output is not a $100B result.
+
+### $100B preparation cache locality repair
+
+The first $100B launch was active on CPU but had not reached a training batch.
+Training uses bounded streamed feature windows, but prepares all sample metadata
+before fitting. Unordered Polars event anchors exceeded the 32-issuer metadata
+cache: a reproduction on the pre-2024 supervised anchor index counted 13,380
+cache misses in the first 20,000 records. There are 1,071,066 unique supervised
+anchors before the remaining sample/taxonomy filters; this is not a completed
+training sample count.
+
+`context_ordered_anchors` now groups preparation by source issuer, instrument,
+and date. This retains every anchor and the bounded cache while avoiding
+repeated issuer metadata scans during preparation. The trainer reports progress
+every 25,000 anchors. Feature windows still load lazily in Polars; the full
+sample metadata list remains an upfront cost and is not yet an iterable dataset.
+Twenty-five streaming/context contract checks pass, including a 114-issuer
+cache-eviction regression. The preparation process was restarted before any
+batch checkpoint existed; current PIDs and the restart record live in
+`100B/run_status.json` and `100B/cache_locality_restart.json`. The corpus and all
+three yearly epoch backtests remain in place.
