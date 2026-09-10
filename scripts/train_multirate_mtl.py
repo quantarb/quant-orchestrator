@@ -528,10 +528,6 @@ def main() -> None:
         help="Maximum issuer/date windows cached per rate; 0 disables the training-data LRU.",
     )
     parser.add_argument("--context-memmap-dir", type=Path, help="Optional prepared normalized context-array cache directory.")
-    parser.add_argument(
-        "--group-context-batches", action="store_true",
-        help="Keep documents with the same issuer/date context together for token reuse.",
-    )
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--layers", type=int, default=2)
@@ -1194,7 +1190,10 @@ def main() -> None:
         family_names,
         label_names,
         batch_size=args.batch_size,
-        batch_key=(lambda item: item["annual_context_key"]) if args.group_context_batches else None,
+        # This is part of the Multi-Rate training contract.  Issuer/date
+        # contexts must remain together so annual and quarterly encoder states
+        # can be reused inside every training batch.
+        batch_key=lambda item: item["annual_context_key"],
     )
     model_tasks = tuple(
         task for task in task_bundle.document_tasks + task_bundle.supervised_tasks
@@ -1441,7 +1440,7 @@ def main() -> None:
         validation_samples,
         name="validation",
         batch_size=args.batch_size,
-        batch_key=(lambda item: item["annual_context_key"]) if args.group_context_batches else None,
+        batch_key=lambda item: item["annual_context_key"],
     )
 
     def validation_loss(epoch: int) -> float:
@@ -1634,7 +1633,7 @@ def main() -> None:
         "train_symbols": sorted(train_symbols) if train_symbols is not None else None,
         "test_symbols": sorted(test_symbols) if test_symbols is not None else None,
         "cacheable_rate_states": config.cacheable_rate_states,
-        "group_context_batches": args.group_context_batches,
+        "group_context_batches": True,
         "mixed_precision": args.mixed_precision,
         "fp8": args.fp8,
         "compile_model": args.compile_model,
