@@ -32,6 +32,7 @@ from quant_orchestrator.research_tools.multirate_objectives import (
 )
 from quant_orchestrator.research_tools.multirate_audit import verify_corpus_files
 from quant_orchestrator.research_tools.ntp_evaluation import NTPPersistenceAudit
+from quant_orchestrator.research_tools.multirate_batch import BatchTensors, supervision_counts
 
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import (
     DOCUMENT_PROTOTYPE_STATS,
@@ -1464,11 +1465,10 @@ def main() -> None:
             parameter.register_hook(record_gradient(name.split(".layers")[0] if ".layers" in name else name.split(".")[0]))
 
     def training_step(module: torch.nn.Module, batch: list[dict[str, object]], active_tasks):
-        def stack(name: str) -> torch.Tensor:
-            return torch.stack([item[name] if isinstance(item[name], torch.Tensor) else torch.as_tensor(item[name]) for item in batch]).to(device)
+        stack = BatchTensors(batch, device)
 
         def context(name: str, padding_name: str) -> tuple[torch.Tensor, torch.Tensor]:
-            values = stack(name); padding = stack(padding_name).bool()
+            values = stack(name).clone(); padding = stack(padding_name).bool().clone()
             empty = padding.all(dim=1)
             if empty.any():
                 values[empty, -1] = 0.0; padding[empty, -1] = False
@@ -1595,9 +1595,10 @@ def main() -> None:
             if not valid.any():
                 continue
             if module.training:
-                task_observations[name] += int(valid.sum())
-                for row_index, item in enumerate(batch):
-                    task_observations[f"{item['asset_class']}:{name}"] += int(valid[row_index].sum())
+                total, by_asset = supervision_counts(valid, batch)
+                task_observations[name] += total
+                for asset, count in by_asset.items():
+                    task_observations[f"{asset}:{name}"] += count
             target = supervised_targets[:, :, task_index]
             prediction = output["token_outputs"][name].squeeze(-1)
             if name in ORACLE_SUPERVISED_TASK_NAMES or name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES or name in HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES:
@@ -1799,9 +1800,9 @@ def main() -> None:
                     f"[multirate-inference] scoring symbols {start + 1}-{start + len(batch)}/{len(evaluation_samples)}: {batch_symbols}",
                     flush=True,
                 )
-            def stack(name: str) -> torch.Tensor: return torch.stack([item[name] if isinstance(item[name], torch.Tensor) else torch.as_tensor(item[name]) for item in batch]).to(device)
+            stack = BatchTensors(batch, device)
             def context(name: str, padding_name: str) -> tuple[torch.Tensor, torch.Tensor]:
-                values = stack(name); padding = stack(padding_name).bool()
+                values = stack(name).clone(); padding = stack(padding_name).bool().clone()
                 empty = padding.all(dim=1)
                 if empty.any():
                     values[empty, -1] = 0.0; padding[empty, -1] = False

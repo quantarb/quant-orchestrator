@@ -206,3 +206,18 @@ Calendar coverage and a rolling model window are distinct: the training spans
 all available pre-2024 history, while each sample uses bounded windows of 252
 daily, 40 quarterly, 16 annual and 16 observations per sparse feature family.
 This preserves Polars streaming and bounded memory.
+
+## Batch staging overhead
+
+`multirate_batch.py` stages each raw field once per step. Corruption and padding
+repairs use clones so raw reconstruction targets remain unchanged. Diagnostic
+counts transfer once per supervised task rather than once per instrument and
+task. These changes preserve model architecture, objectives, dates and coverage.
+A running Python trainer retains its loaded implementation; new training or
+inference processes pick up the optimization.
+
+Component benchmarks on the GB10, while the full run was active, measured
+23.2 ms versus 0.36 ms for twelve task counters at batch 128, and 1.16 s versus
+0.060 s for twenty reads of a 128×252×132 tensor. These measure the individual
+operations, not an end-to-end training speedup. Concurrent GPU work prevents
+interpreting the diagnostic run's wall time as an isolated throughput comparison.
