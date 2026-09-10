@@ -221,3 +221,28 @@ Component benchmarks on the GB10, while the full run was active, measured
 0.060 s for twenty reads of a 128×252×132 tensor. These measure the individual
 operations, not an end-to-end training speedup. Concurrent GPU work prevents
 interpreting the diagnostic run's wall time as an isolated throughput comparison.
+
+## Precision and batch-size benchmarks
+
+The trainer supports `--mixed-precision --autocast-dtype bfloat16` on supported
+CUDA hardware. Float16 remains available through `--mixed-precision` (its
+default format) with gradient scaling. BF16 uses autocast without a loss scaler;
+model parameters and saved weights remain FP32. Inference currently runs FP32.
+Precision selection is recorded in the command, checkpoint configuration and
+training summary.
+
+Compare precision and batch size on the same corpus, dates, sample selection,
+model dimensions, objectives and optimizer settings. A larger batch performs
+fewer optimizer updates per epoch, so its loss is not an equal-update comparison.
+GPU sharing and data preparation affect measured wall time; use repeated baselines
+and report throughput and peak allocation alongside loss and finite-gradient
+checks. Existing training processes retain their original precision and batch size.
+
+The 2,048-sample benchmark measured FP32/batch-128 at 90.9 and 91.4 seconds,
+BF16/batch-128 at 89.9 seconds, and BF16/batch-256 at 88.4 seconds. Peak CUDA
+allocations were 7.9, 5.6 and 11.1 GiB respectively. All runs completed with
+finite losses; both BF16 checkpoints reloaded and produced finite post-cutoff
+predictions. Throughput gains were modest (about 1.4% and 3.1% relative to the
+repeated FP32 baseline), so the full run retained its existing configuration.
+The batch-256 check performed half as many optimizer updates; its epoch loss
+is not directly comparable as a quality result.

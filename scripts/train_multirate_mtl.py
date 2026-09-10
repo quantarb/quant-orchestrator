@@ -637,7 +637,8 @@ def main() -> None:
         help="Comma-separated nested embedding dimensions for MRL; empty disables MRL.",
     )
     parser.add_argument("--mrl-weight", type=float, default=0.25)
-    parser.add_argument("--mixed-precision", action="store_true", help="Use CUDA autocast (float16 with GradScaler).")
+    parser.add_argument("--mixed-precision", action="store_true", help="Use CUDA autocast with --autocast-dtype.")
+    parser.add_argument("--autocast-dtype", choices=("float16", "bfloat16"), default="float16", help="Autocast format; bfloat16 requires --mixed-precision and supported CUDA hardware.")
     parser.add_argument(
         "--attention-backend", choices=("pytorch", "transformer_engine"), default="pytorch",
         help="Transformer attention implementation; transformer_engine requires quant-orchestrator[cuda-te].",
@@ -717,6 +718,10 @@ def main() -> None:
         parser.error("--grad-accumulation-steps must be at least 1")
     if args.context_cache_size < 0:
         parser.error("--context-cache-size must be non-negative")
+    if args.autocast_dtype != "float16" and not args.mixed_precision:
+        parser.error("--autocast-dtype requires --mixed-precision")
+    if args.mixed_precision and args.autocast_dtype == "bfloat16" and not torch.cuda.is_bf16_supported():
+        parser.error("bfloat16 autocast requires supported CUDA hardware")
     if args.mixed_precision and args.device == "cpu":
         parser.error("--mixed-precision requires a CUDA device")
     if args.attention_backend == "transformer_engine" and not args.device.startswith("cuda"):
@@ -1416,7 +1421,7 @@ def main() -> None:
         optimizer,
         seed=args.seed,
         grad_accumulation_steps=args.grad_accumulation_steps,
-        autocast_dtype=torch.float16 if args.mixed_precision else None,
+        autocast_dtype=getattr(torch, args.autocast_dtype) if args.mixed_precision else None,
         transformer_engine_fp8=args.fp8,
     )
     best_loss = float("inf")
@@ -1907,6 +1912,7 @@ def main() -> None:
         "cacheable_rate_states": config.cacheable_rate_states,
         "group_context_batches": True,
         "mixed_precision": args.mixed_precision,
+        "autocast_dtype": args.autocast_dtype if args.mixed_precision else None,
         "fp8": args.fp8,
         "compile_model": args.compile_model,
         "optimizer": args.optimizer,
