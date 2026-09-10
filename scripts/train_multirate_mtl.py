@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import subprocess
 import sys
 from collections import OrderedDict
@@ -516,6 +517,10 @@ def main() -> None:
     parser.add_argument(
         "--progress-every-batches", type=int, default=100,
         help="Print training progress every N batches; 0 disables batch progress logging.",
+    )
+    parser.add_argument(
+        "--checkpoint-every-batches", type=int, default=100,
+        help="Save a resumable checkpoint every N batches; 0 disables batch checkpoints.",
     )
     parser.add_argument("--grad-accumulation-steps", type=int, default=1)
     parser.add_argument(
@@ -1240,6 +1245,8 @@ def main() -> None:
     validation_losses: list[float] = []
     if args.progress_every_batches < 0:
         parser.error("--progress-every-batches must be non-negative")
+    if args.checkpoint_every_batches < 0:
+        parser.error("--checkpoint-every-batches must be non-negative")
     def training_step(module: torch.nn.Module, batch: list[dict[str, object]], active_tasks):
         def stack(name: str) -> torch.Tensor:
             return torch.from_numpy(np.stack([item[name] for item in batch])).to(device)
@@ -1469,10 +1476,35 @@ def main() -> None:
 
     training_started = perf_counter()
 
+    def save_batch_checkpoint(epoch: int, batch_index: int, batch_loss: float) -> None:
+        checkpoint_path = output_dir / "multirate_mtl_checkpoint_latest.pt"
+        temporary_path = output_dir / "multirate_mtl_checkpoint_latest.pt.tmp"
+        payload = {
+            "state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "metrics": {
+                "epoch": epoch,
+                "batch": batch_index,
+                "batch_loss": batch_loss,
+                "feature_families": feature_families,
+                "target_families": target_families,
+                "tasks": list(expected_task_names),
+                "train_samples": len(train_samples),
+            },
+        }
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, checkpoint_path)
+        print(
+            f"[multirate-checkpoint] epoch={epoch + 1} batch={batch_index} "
+            f"path={checkpoint_path}",
+            flush=True,
+        )
+
     def training_progress(epoch: int, batch_index: int, total_batches: int, batch_loss: float) -> None:
         interval = args.progress_every_batches
         if interval <= 0 or (batch_index % interval and batch_index != total_batches):
-            return
+            if args.checkpoint_every_batches <= 0 or (batch_index % args.checkpoint_every_batches and batch_index != total_batches):
+                return
         elapsed = perf_counter() - training_started
         rate = batch_index / max(elapsed, 1e-6)
         remaining = (total_batches - batch_index) / max(rate, 1e-6)
@@ -1480,13 +1512,18 @@ def main() -> None:
         memory = ""
         if device.type == "cuda":
             memory = f" cuda_gb={torch.cuda.memory_allocated(device) / 1024**3:.2f}"
-        print(
-            f"[multirate-train] epoch={epoch + 1}/{args.epochs} "
-            f"batch={batch_index}/{total_batches} samples={samples_done}/{len(train_samples)} "
-            f"loss={batch_loss:.6f} elapsed_s={elapsed:.1f} "
-            f"batches_per_s={rate:.2f} eta_s={remaining:.1f}{memory}",
-            flush=True,
-        )
+        if interval > 0 and (batch_index % interval == 0 or batch_index == total_batches):
+            print(
+                f"[multirate-train] epoch={epoch + 1}/{args.epochs} "
+                f"batch={batch_index}/{total_batches} samples={samples_done}/{len(train_samples)} "
+                f"loss={batch_loss:.6f} elapsed_s={elapsed:.1f} "
+                f"batches_per_s={rate:.2f} eta_s={remaining:.1f}{memory}",
+                flush=True,
+            )
+        if args.checkpoint_every_batches > 0 and (
+            batch_index % args.checkpoint_every_batches == 0 or batch_index == total_batches
+        ):
+            save_batch_checkpoint(epoch, batch_index, batch_loss)
 
     losses = [] if args.inference_only else trainer.fit(
         args.epochs,
