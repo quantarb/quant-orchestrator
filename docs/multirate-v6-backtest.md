@@ -45,3 +45,34 @@ curves, action tapes, trade lists, scored panels, and strategy manifests.
 The three replay regression tests passed, including next-session/weekend
 execution, raw-price option expiration valuation, and no duplicate dividend
 credit when using adjusted equity prices.
+
+## Previous HITS entry/exit policy replay
+
+The unchanged checkpoint was also replayed with the prior HITS policy:
+hub >= 0.50 to enter, authority >= 0.50 to exit, and a shared top-5 book without
+an issuer cap or Oracle gating. Existing positions remain until authority exit,
+expiration, or fold-end. Entry allocation is up to one fifth of NAV, cash-limited.
+As in the prior DTE policy, calls and equities use long-return HITS channels;
+puts use short-return HITS channels. The present training targets describe each
+contract's own price path, so this inherited put-channel convention should not
+be assumed equivalent to the underlying's bearish direction.
+
+The Polars replay uses the same adjusted-price, next-session-close, fee and
+slippage conventions as the Oracle comparison above. It adapts the former DTE
+basket policy to individual instruments; it does not rebuild the old baskets.
+
+| Year | Return | Maximum drawdown | Trades | Maximum entry hub score |
+|---|---:|---:|---:|---:|
+| 2024 | 0.00% | 0.00% | 0 | 0.225259 |
+| 2025 | 0.00% | 0.00% | 0 | 0.215246 |
+
+All 3,762 scored rows in 2024 and 3,735 in 2025 fail the 0.50 entry threshold.
+Both $100,000 portfolios remain entirely in non-interest-bearing cash. This
+result reflects the threshold and score scale, not a demonstrated profitable
+HITS trading strategy. HITS predictions are regression outputs, not calibrated
+probabilities. Thresholds were not reduced after inspecting these test periods.
+
+Artifacts are under `artifacts/multirate_recovery/1T/backtest_v6_hits/`, including
+`results.json`, `entry_audit.json`, and each year's complete replay bundle.
+Four replay tests pass, including a nonzero-trade HITS scenario verifying shared
+slots, ranking, prior-session authority exits, and independence from Oracle.

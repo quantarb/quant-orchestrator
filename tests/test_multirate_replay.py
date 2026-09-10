@@ -123,3 +123,30 @@ def test_adjusted_prices_do_not_double_count_cash_distributions(tmp_path):
     curve = pl.read_parquet(tmp_path / "replay/equity_curve.parquet")
     assert curve["receivables"].to_list() == [0.0, 0.0, 0.0, 0.0]
     assert warehouse.price_adjustments == ["splits_and_dividends"]
+
+
+def test_hits_shared_slots_ignore_oracle_and_exit_on_authority(tmp_path):
+    dates = [datetime(2024, 1, d) for d in (2, 3, 4, 5)]
+    root = tmp_path / 'corpus'
+    root.mkdir()
+    pl.DataFrame({'symbol': ['A', 'B', 'C'], 'issuer': ['same'] * 3,
+                  'underlying_symbol': ['A', 'B', 'C'], 'asset_class': ['equity'] * 3}).write_csv(root / 'taxonomy.csv')
+    rows = []
+    for i, date in enumerate(dates):
+        for symbol, hub in [('A', .8), ('B', .9), ('C', .7)]:
+            rows.append(dict(symbol=symbol, date=date, oracle_is_buy=0., oracle_is_short=1.,
+                oracle_is_sell=1., hits_long_return_hub=0. if symbol == 'B' and i > 0 else hub,
+                hits_long_return_authority=.6 if symbol == 'B' and i > 0 else 0.))
+    predictions = tmp_path / 'predictions.csv'
+    pl.DataFrame(rows).write_csv(predictions)
+    warehouse = Warehouse(pl.DataFrame({'date': dates, 'close': [100.] * 4}), pl.DataFrame())
+    output = tmp_path / 'replay'
+    result = replay_multirate(root, predictions, output, start='2024-01-02', end='2024-01-05',
+        policy='hits', top_k=2, initial_cash=1000, fee_bps=0, slippage_bps=0, warehouse=warehouse)
+    trades = pl.read_parquet(output / 'trade_list.parquet')
+    b = trades.filter(pl.col('symbol') == 'B').row(0, named=True)
+    assert b['entry_date'] == dates[1] and b['exit_date'] == dates[2]
+    assert b['reason'] == 'hits_authority_exit'
+    assert trades.filter(pl.col('symbol') == 'C')['entry_date'][0] == dates[2]
+    assert pl.read_parquet(output / 'equity_curve.parquet')['positions'].to_list() == [0, 2, 2, 0]
+    assert result['final_equity'] == pytest.approx(1000)
