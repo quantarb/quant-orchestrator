@@ -644,7 +644,10 @@ def main() -> None:
     annual = _read_parquet_polars(root / "annual.parquet", rate_columns)
     quarterly = _read_parquet_polars(root / "quarterly.parquet", rate_columns)
     daily = _read_parquet_polars(root / "daily.parquet", rate_columns)
-    sparse = _read_parquet_polars(root / "sparse_events.parquet")
+    sparse_path = root / "sparse_events.parquet"
+    sparse = _read_parquet_polars(sparse_path) if sparse_path.exists() else pd.DataFrame(
+        columns=["symbol", "date", "event_date", "target_family", "signal_value", *[f"text_{i}" for i in range(7)]]
+    )
     # Apply a frozen DTE selection before normalization/index construction.
     # Otherwise a DTE-105 run needlessly scans every synthetic option symbol
     # in the full daily table.

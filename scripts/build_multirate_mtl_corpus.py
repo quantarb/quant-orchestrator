@@ -140,6 +140,10 @@ def _rate_table(daily: pd.DataFrame, families: list[str], rate: str) -> pd.DataF
 
 def _build_sparse_events(events: pd.DataFrame, output: Path, device: str) -> list[str]:
     if events.empty:
+        pd.DataFrame(columns=[
+            "symbol", "date", "event_date", "target_family", "signal_value",
+            *[f"text_{index}" for index in range(7)],
+        ]).to_parquet(output / "sparse_events.parquet", index=False)
         return []
     events = events.copy()
     # Rebuilding a corpus from an already encoded sparse-event table should
