@@ -217,3 +217,9 @@ and subtoken levels. Subtoken MTP masks features within each family; token MTP
 masks whole families. NTP predicts coherent next family and combined-token observations.
 See the [reconstruction contract](multirate-reconstruction.md) for the objective details, checkpoint
 requirements, executed diagnostic scope, and longer-history 1T experiment.
+
+`platforms/backtesting_frameworks/anchored_hits_replay.py` provides bounded
+Polars replay of the older HITS daily-percentile equity policy, with separate
+long/short books and explicit next-session-close execution. The executed v6
+comparison and its fixed-weight accounting limits are documented in
+[multirate-v6-backtest.md](multirate-v6-backtest.md).

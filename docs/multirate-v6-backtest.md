@@ -76,3 +76,53 @@ Artifacts are under `artifacts/multirate_recovery/1T/backtest_v6_hits/`, includi
 `results.json`, `entry_audit.json`, and each year's complete replay bundle.
 Four replay tests pass, including a nonzero-trade HITS scenario verifying shared
 slots, ranking, prior-session authority exits, and independence from Oracle.
+
+## Anchored HITS percentile policy
+
+The user selected the older anchored strategy in
+`optimal_trader/scripts/run_oracle_hits_anchored_wfo.py`. Its `hits_score`
+function converts each day's predictions to average-tie percentile ranks,
+separately for each side's hub and authority. Defaults are strict percentile
+`> 0.80` for entry and exit, capacity 20, separate long-only and short-only
+books, and 5.5 bps per change in portfolio weight. No Oracle gate or issuer cap
+is applied. Each held symbol has signed weight 1/20; vacant capacity stays cash.
+Exits are processed before entries, including same-session re-entry if both
+signals qualify. Existing positions are not rotated because their hub rank falls.
+
+`anchored_hits_replay.py` reproduces that ranking, threshold, and fixed-weight
+accounting in bounded Polars day slices. It uses the unchanged pre-2024 v6
+scores for 13 equities, rather than retraining the older feature-family random
+forests every year. Options are excluded because the anchored strategy was an
+equity strategy. Per the user's EOD requirement, signal-date ranks execute at
+the following session's close, and held positions then earn subsequent returns.
+The old script used signal-date weights against next returns, so this execution
+delay is an intentional difference. Adjusted equity prices are reused from the
+hashed inputs of the completed v6 replay.
+
+| Year | Book | Return | Max drawdown | Entry events | Exit events | Open at year-end | Mean gross exposure |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 2024 | Long | 16.55% | -7.97% | 328 | 319 | 9 | 40.63% |
+| 2024 | Short | -15.14% | -16.64% | 374 | 367 | 7 | 29.98% |
+| 2025 | Long | 14.97% | -11.16% | 238 | 230 | 8 | 37.12% |
+| 2025 | Short | -9.17% | -13.81% | 367 | 361 | 6 | 24.84% |
+
+Each book/year starts independently at $100,000. Entries are action events,
+not distinct round trips: authority exits may immediately re-enter if the hub
+also qualifies. The older fixed-weight cost convention charges net target-weight
+changes; it does not charge an exit/re-entry with unchanged net weight or drift
+rebalancing. Open positions are marked at the final close without forced terminal
+liquidation, matching the older accounting. Short results exclude borrow fees
+and locate constraints. These are model-policy experiments, not broker execution
+simulations. With 13 equities and 20 slots, gross exposure cannot exceed 65%.
+
+This is not an identical-cost comparison with the earlier Oracle and raw-HITS
+replays: those used 10 bps per side, while this uses the anchored default of
+5.5 bps on target-weight changes. It also uses constant portfolio weights rather
+than fixed quantities. No rank thresholds or capacities were tuned on 2024/2025.
+The positive long returns alone do not establish predictive alpha.
+
+Artifacts: `artifacts/multirate_recovery/1T/backtest_v6_anchored_hits/` contains
+four annual book folders with equity curves, target weights, action tapes and
+summaries, plus `results.json`, `input_sha256.json`, and the reproduction script.
+Seven tests pass across both replay modules, including ties, strict percentile
+thresholds, and a Friday-to-Monday next-close execution check for long and short.
