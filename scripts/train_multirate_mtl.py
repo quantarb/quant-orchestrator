@@ -95,11 +95,11 @@ def _symbol_rows(table: pd.DataFrame | dict[str, pd.DataFrame], symbol: str) -> 
 
 
 def _read_parquet_polars(path: Path, columns: list[str] | None = None) -> pd.DataFrame:
-    """Read parquet through Polars' lazy scanner, then cross the pandas boundary once."""
+    """Read parquet with Polars' streaming engine before the compatibility boundary."""
     scan = pl.scan_parquet(path)
     if columns is not None:
         scan = scan.select(columns)
-    return scan.collect().to_pandas()
+    return scan.collect(engine="streaming").to_pandas()
 
 
 class _IndexedTable:
