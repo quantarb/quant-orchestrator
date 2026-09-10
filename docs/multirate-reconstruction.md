@@ -171,3 +171,38 @@ supervision remained active. The small diagnostic model did not beat persistence
 in any measured family/level group. This short check is not a completed training
 experiment. Annual groups had no eligible successor in that evaluation interval;
 reports now explicitly include zero-coverage groups with null error/skill.
+
+## Epoch-by-epoch monitoring
+
+`monitor_multirate_epochs.py` attaches to a running training command without
+restarting it or changing optimizer state. It copies a completed-epoch
+checkpoint, evaluates a fixed bounded post-cutoff sample using the inference
+path, and prints per-family/per-level model MSE, persistence MSE, skill and
+change in skill from the preceding epoch. It rejects changed target counts or
+baseline errors between epochs. Positive skill beats persistence; increasing
+skill means improvement. Zero-error baselines and absent coverage retain null
+skill instead of a misleading percentage.
+
+The current full run trains all eligible samples before 2024, with no training
+sample cap and no pre-2024 validation holdout. Its epoch monitor uses a fixed
+256-anchor sample from 2024; 2025 is reserved for the final test. Monitoring does
+not update gradients or select checkpoints. Each run has an `epoch_metrics.json`
+and an immutable checkpoint under its epoch directory. The companion process
+prints to `train_long_v6/epoch_validation.log`; it does not rewrite the active
+trainer's log. The status file distinguishes waiting, evaluation and completion.
+
+Example:
+
+```bash
+python scripts/monitor_multirate_epochs.py \
+  --command-file artifacts/multirate_recovery/1T/training_command_v6.json \
+  --training-log artifacts/multirate_recovery/1T/training_v6.log \
+  --output-dir artifacts/multirate_recovery/1T/train_long_v6/epoch_validation \
+  --validation-start 2024-01-02 --validation-end 2024-12-31 \
+  --training-pid TRAINING_PID
+```
+
+Calendar coverage and a rolling model window are distinct: the training spans
+all available pre-2024 history, while each sample uses bounded windows of 252
+daily, 40 quarterly, 16 annual and 16 observations per sparse feature family.
+This preserves Polars streaming and bounded memory.

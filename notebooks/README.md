@@ -44,6 +44,7 @@ The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
 within-step issuer encoding. Oracle/HITS are supervised labels only and never
 historical model inputs. Causal elapsed-time and information-age embeddings
 represent irregular gaps; NTP evaluation compares each family with persistence.
+The epoch monitor prints fixed post-cutoff evaluation trends without restarting training.
 Masked and next-observation objectives reconstruct individual values at token
 and subtoken levels. Subtoken MTP masks features within each family; token MTP
 masks whole families. NTP predicts coherent next family and combined-token observations.
