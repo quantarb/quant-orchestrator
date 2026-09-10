@@ -26,6 +26,7 @@ from torch import nn
 
 from quant_warehouse import Warehouse
 from quant_orchestrator.research_tools.streaming_context import StreamingContext, StreamingFamilyContext, context_ordered_anchors
+from quant_orchestrator.research_tools.sequence_training import sequence_anchors, window_supervision
 from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups, input_event_families
 from quant_orchestrator.research_tools.multirate_objectives import (
     RECONSTRUCTION_CONTRACT, reconstruction_mask, reconstruction_targets, family_channels, feature_family_layout,
@@ -688,6 +689,8 @@ def main() -> None:
         "--stream-samples", action="store_true", default=True,
         help="Keep sample metadata in memory and materialize rate arrays only per batch.",
     )
+    parser.add_argument('--training-sequence-stride', type=int, default=0,
+                        help='Supervise all event dates in overlapping chunks; 0 keeps one anchor per event. Must be smaller than daily-window.')
     parser.add_argument(
         "--max-samples", type=int, default=0,
         help="Optional deterministic cap on samples for a fast end-to-end smoke run.",
@@ -761,6 +764,8 @@ def main() -> None:
     if min(args.annual_window, args.quarterly_window, args.daily_window) < 2:
         parser.error('Rate windows must contain at least two observations')
     ANNUAL_WINDOW, QUARTERLY_WINDOW, DAILY_WINDOW = args.annual_window, args.quarterly_window, args.daily_window
+    if args.training_sequence_stride and (not args.train_end_date or not 0 < args.training_sequence_stride < DAILY_WINDOW):
+        parser.error('Sequence training requires train-end-date and 0 < training-sequence-stride < daily-window')
     taxonomy = pl.read_csv(root / "taxonomy.csv").with_columns(
         pl.col("symbol").cast(pl.String).str.to_uppercase().str.strip_chars()
     )
@@ -1046,7 +1051,18 @@ def main() -> None:
     # tokens in an annual document can see issuer memory from the anchor.
     if supervised_target_map:
         event_anchors = supervised_target_map.anchors()
-        anchors = pl.concat([anchors, event_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
+        if args.training_sequence_stride and not args.inference_only:
+            sequence_rows, sequence_report = sequence_anchors(daily, event_anchors,
+                cutoff=args.train_end_date, stride=args.training_sequence_stride, window=DAILY_WINDOW)
+            (output_dir/'sequence_coverage.json').write_text(json.dumps(sequence_report,indent=2))
+            print(f"[multirate-sequences] {sequence_report}", flush=True)
+            # Keep pre-existing regular documents for SSL, but give supervised
+            # events exclusively to the sequence documents that own their dates.
+            anchors = anchors.with_columns(pl.col('date').cast(pl.Datetime('ns'))).join(
+                sequence_rows.select('symbol','date'),on=['symbol','date'],how='anti')
+            anchors = pl.concat([anchors, sequence_rows],how='diagonal_relaxed')
+        else:
+            anchors = pl.concat([anchors, event_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
     if args.inference_only and args.prediction_start_date and args.prediction_start_date != "1900-01-01":
         requested_anchor_date = _as_datetime(args.prediction_start_date)
         exact_daily_anchors = daily.filter(pl.col("date") >= requested_anchor_date).select(["symbol", "date"]).collect(engine="streaming")
@@ -1136,16 +1152,33 @@ def main() -> None:
         if symbol not in taxonomy_symbols:
             continue
         source_symbol = source_symbol_by_symbol.get(symbol, symbol)
-        def materialize(current_symbol=symbol, current_anchor=anchor, current_source=source_symbol):
-            annual_values, annual_padding, annual_dates = cached_window("annual", annual_index, current_symbol, current_anchor, annual_value_columns, ANNUAL_WINDOW, current_source)
-            quarterly_values, quarterly_padding, quarterly_dates = cached_window("quarterly", quarterly_index, current_symbol, current_anchor, quarterly_value_columns, QUARTERLY_WINDOW, current_source)
+        supervision_start = row.get('supervision_start')
+        def materialize(current_symbol=symbol, current_anchor=anchor, current_source=source_symbol,
+                        current_supervision_start=supervision_start):
             daily_values, daily_padding, daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_symbol)
-            sparse_values, sparse_padding, sparse_labels, sparse_dates = cached_sparse_window(current_symbol, current_anchor)
-            issuer_daily, issuer_daily_padding, issuer_daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_source)
-            issuer_sparse, issuer_sparse_padding, _, issuer_sparse_dates = cached_sparse_window(current_source, current_anchor)
+            if current_supervision_start is not None:
+                annual_values, annual_padding, annual_dates, _ = annual_index.sequence_window(current_source,current_supervision_start,current_anchor,ANNUAL_WINDOW)
+                quarterly_values, quarterly_padding, quarterly_dates, _ = quarterly_index.sequence_window(current_source,current_supervision_start,current_anchor,QUARTERLY_WINDOW)
+                sparse_values, sparse_padding, sparse_dates, sparse_labels = sparse_index.sequence_window(current_symbol,current_supervision_start,current_anchor,sparse_window_length)
+                issuer_daily, issuer_daily_padding, issuer_daily_dates, _ = daily_index.sequence_window(current_source,current_supervision_start,current_anchor,DAILY_WINDOW)
+                if current_source == current_symbol:
+                    issuer_sparse, issuer_sparse_padding, issuer_sparse_dates = sparse_values,sparse_padding,sparse_dates
+                else:
+                    issuer_sparse, issuer_sparse_padding, issuer_sparse_dates, _ = sparse_index.sequence_window(current_source,current_supervision_start,current_anchor,sparse_window_length)
+            else:
+                annual_values, annual_padding, annual_dates = cached_window("annual", annual_index, current_symbol, current_anchor, annual_value_columns, ANNUAL_WINDOW, current_source)
+                quarterly_values, quarterly_padding, quarterly_dates = cached_window("quarterly", quarterly_index, current_symbol, current_anchor, quarterly_value_columns, QUARTERLY_WINDOW, current_source)
+                sparse_values, sparse_padding, sparse_labels, sparse_dates = cached_sparse_window(current_symbol, current_anchor)
+                issuer_daily, issuer_daily_padding, issuer_daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_source)
+                issuer_sparse, issuer_sparse_padding, _, issuer_sparse_dates = cached_sparse_window(current_source, current_anchor)
             supervised_targets = torch.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.float32)
             supervised_valid = torch.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.bool)
-            if len(daily_dates):
+            if args.training_sequence_stride and not args.inference_only:
+                if current_supervision_start is not None:
+                    supervised_targets, supervised_valid = window_supervision(
+                        supervised_target_map, current_symbol, daily_dates, length=DAILY_WINDOW,
+                        tasks=SUPERVISED_TARGET_TASK_NAMES, start=current_supervision_start, end=current_anchor)
+            elif len(daily_dates):
                 offset = DAILY_WINDOW - len(daily_dates)
                 for position, date in enumerate(daily_dates):
                     values = supervised_target_map.get((current_symbol, _as_datetime(date)), {}) if _as_datetime(date) == current_anchor else {}
@@ -1161,18 +1194,18 @@ def main() -> None:
             if args.issuer_context == 'none':
                 annual_values = torch.full_like(torch.as_tensor(annual_values), float('nan'))
                 quarterly_values = torch.full_like(torch.as_tensor(quarterly_values), float('nan'))
-                annual_padding = torch.ones(ANNUAL_WINDOW, dtype=torch.bool)
-                quarterly_padding = torch.ones(QUARTERLY_WINDOW, dtype=torch.bool)
+                annual_padding = torch.ones(len(annual_values), dtype=torch.bool)
+                quarterly_padding = torch.ones(len(quarterly_values), dtype=torch.bool)
                 annual_dates = quarterly_dates = []
             return {
                 "issuer_daily": issuer_daily, "issuer_daily_padding": issuer_daily_padding,
-                "issuer_daily_timestamps": timestamps(issuer_daily_dates, DAILY_WINDOW),
+                "issuer_daily_timestamps": timestamps(issuer_daily_dates, len(issuer_daily)),
                 "issuer_sparse": issuer_sparse, "issuer_sparse_padding": issuer_sparse_padding,
-                "issuer_sparse_timestamps": timestamps(issuer_sparse_dates, sparse_window_length),
-                "annual_timestamps": timestamps(annual_dates, ANNUAL_WINDOW),
-                "quarterly_timestamps": timestamps(quarterly_dates, QUARTERLY_WINDOW),
+                "issuer_sparse_timestamps": timestamps(issuer_sparse_dates, len(issuer_sparse)),
+                "annual_timestamps": timestamps(annual_dates, len(annual_values)),
+                "quarterly_timestamps": timestamps(quarterly_dates, len(quarterly_values)),
                 "daily_timestamps": timestamps(daily_dates, DAILY_WINDOW),
-                "sparse_timestamps": timestamps(sparse_dates, sparse_window_length),
+                "sparse_timestamps": timestamps(sparse_dates, len(sparse_values)),
                 "annual": annual_values, "annual_padding": annual_padding,
                 "quarterly": quarterly_values, "quarterly_padding": quarterly_padding,
                 "daily": daily_values, "daily_padding": daily_padding,
@@ -1184,9 +1217,9 @@ def main() -> None:
             "symbol": symbol, "date": anchor.strftime("%Y-%m-%d"),
             "issuer": str(taxonomy_by_symbol[symbol]["issuer"]),
             "asset_class": str(taxonomy_by_symbol[symbol]["asset_class"]),
-            "issuer_context_key": (source_symbol, _epoch_ns(anchor)),
-            "annual_context_key": (source_symbol, rate_version("annual", annual_index, source_symbol, anchor)),
-            "quarterly_context_key": (source_symbol, rate_version("quarterly", quarterly_index, source_symbol, anchor)),
+            "issuer_context_key": (source_symbol, _epoch_ns(anchor), str(supervision_start)),
+            "annual_context_key": (source_symbol, rate_version("annual", annual_index, source_symbol, anchor), str(supervision_start)),
+            "quarterly_context_key": (source_symbol, rate_version("quarterly", quarterly_index, source_symbol, anchor), str(supervision_start)),
             "sector": str(taxonomy_by_symbol[symbol]["sector"]), "subsector": str(taxonomy_by_symbol[symbol]["subsector"]),
             "industry": str(taxonomy_by_symbol[symbol]["industry"]),
         }
@@ -1604,7 +1637,8 @@ def main() -> None:
             if name not in active_names:
                 continue
             valid = supervised_valid[:, :, task_index] & ~daily_mask
-            valid[:, :-1] = False
+            if not args.training_sequence_stride:
+                valid[:, :-1] = False
             if not valid.any():
                 continue
             if module.training:
@@ -1707,7 +1741,7 @@ def main() -> None:
 
     training_started = perf_counter()
 
-    def save_batch_checkpoint(epoch: int, batch_index: int, batch_loss: float) -> None:
+    def save_batch_checkpoint(epoch: int, batch_index: int, batch_loss: float, *, epoch_complete: bool = False) -> None:
         checkpoint_path = output_dir / "multirate_mtl_checkpoint_latest.pt"
         temporary_path = output_dir / "multirate_mtl_checkpoint_latest.pt.tmp"
         payload = {
@@ -1721,6 +1755,7 @@ def main() -> None:
             "metrics": {
                 "epoch": epoch,
                 "batch": batch_index,
+                "epoch_complete": epoch_complete,
                 "batch_loss": batch_loss,
                 "feature_families": feature_families,
                 "sparse_input_families": sparse_input_families,
@@ -1730,6 +1765,11 @@ def main() -> None:
         }
         torch.save(payload, temporary_path)
         os.replace(temporary_path, checkpoint_path)
+        if epoch_complete:
+            snapshots = output_dir / 'epoch_checkpoints'
+            snapshots.mkdir(exist_ok=True)
+            # Atomic replacement of latest leaves this immutable inode intact.
+            os.link(checkpoint_path, snapshots / f'epoch_{epoch+1:04d}.pt')
         print(
             f"[multirate-checkpoint] epoch={epoch + 1} batch={batch_index} "
             f"path={checkpoint_path}",
@@ -1759,7 +1799,7 @@ def main() -> None:
         if args.checkpoint_every_batches > 0 and (
             batch_index % args.checkpoint_every_batches == 0 or batch_index == total_batches
         ):
-            save_batch_checkpoint(epoch, batch_index, batch_loss)
+            save_batch_checkpoint(epoch, batch_index, batch_loss, epoch_complete=batch_index == total_batches)
 
     losses = [] if args.inference_only else trainer.fit(
         args.epochs,

@@ -345,3 +345,40 @@ cache-eviction regression. The preparation process was restarted before any
 batch checkpoint existed; current PIDs and the restart record live in
 `100B/run_status.json` and `100B/cache_locality_restart.json`. The corpus and all
 three yearly epoch backtests remain in place.
+
+### Sequence training with Polars (v7)
+
+`--training-sequence-stride 128` replaces event-by-event supervised anchors with
+bounded overlapping daily sequences. The daily window remains 252 observations:
+128 new positions plus at least 124 context positions when history is available.
+The Polars date-index audit matches all 1,071,066 supervised symbol/date pairs to
+9,085 sequence documents, with no unmatched dates. Existing annual/irregular
+regular documents remain for self-supervision, giving 12,744 pre-2024 training
+documents and 100 packed batches at batch size 128 in the $100B benchmark.
+Each supervised event belongs to exactly one sequence; context-only positions
+remain unlabeled. A single bounded exact-date join supplies each sequence's
+labels. No synthetic daily labels or pandas training dataframes are introduced.
+
+Slow-rate and issuer contexts retain the configured historical observations at
+the first supervised date plus every source update through the sequence end.
+Variable context lengths are left-padded at the batch boundary. Timestamp masks
+prevent later observations from reaching earlier predictions. Daily instrument
+history uses overlapping 252-observation windows; the first supervised positions
+have a shorter instrument-local prefix than a separately anchored 252-day window.
+This is a sequence-training change, not numerically equivalent optimizer steps or
+identical loss weighting to v6. All previous history remains eligible across the
+corpus, and all supervised dates remain covered. Hierarchical NTP/MTP objectives
+and Oracle/HITS input exclusions remain intact. As-of inference and the original
+trading engine are unchanged.
+
+Every completed epoch writes an immutable hard-linked checkpoint under
+`epoch_checkpoints/`. The monitor consumes these in order, including after the
+trainer exits, so slower evaluation cannot overwrite an unevaluated epoch.
+The $100B sequence run uses `training_command_v7.json`, `training_v7.log`,
+`train_sequence_v7/`, and the existing frozen 2024–2026 inference corpus.
+
+The history-preserving benchmark completed its first two batches in 55.3 seconds,
+projecting roughly 46 minutes per training epoch versus six hours for v6. This
+is an early throughput estimate, not a completed-epoch measurement; per-epoch
+2024–2026 inference/backtesting adds time. The 57 sequence, context, masking,
+causality, and epoch-monitor checks passed.

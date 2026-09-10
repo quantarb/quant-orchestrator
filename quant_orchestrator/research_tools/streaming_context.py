@@ -91,6 +91,24 @@ class StreamingContext:
             padding[-len(selected_dates):] = False
         return values, padding, selected_dates, selected_targets
 
+    def sequence_window(self, symbol: str, start: datetime, end: datetime, history: int):
+        """Retain history at the first supervised date plus all subsequent updates."""
+        ordering = ['date', *([self.target_column] if self.target_column else [])]
+        selected = self.scan.filter(pl.col('symbol') == symbol).select(
+            'date', *self.columns, *([self.target_column] if self.target_column else []))
+        before = selected.filter(pl.col('date') <= start).top_k(history, by=ordering)
+        updates = selected.filter((pl.col('date') > start) & (pl.col('date') <= end))
+        frame = pl.concat([before, updates]).sort(ordering).collect(engine='streaming')
+        length = max(history, frame.height)
+        values = torch.full((length,len(self.columns)),float('nan'))
+        padding = torch.ones(length,dtype=torch.bool)
+        dates = frame['date'].dt.epoch('ns').to_torch()
+        targets = frame[self.target_column].to_torch().long() if self.target_column else None
+        if frame.height:
+            values[-frame.height:] = frame.select(pl.col(c).cast(pl.Float32).fill_nan(None).fill_null(float('nan')) for c in self.columns).to_torch()
+            padding[-frame.height:] = False
+        return values,padding,dates,targets
+
 
 class StreamingFamilyContext(StreamingContext):
     """Reserve history for each sparse family, then union equal-date observations."""
@@ -124,3 +142,19 @@ class StreamingFamilyContext(StreamingContext):
             values[inverse[rows] + length - len(dates), columns] = joined[rows, columns]
             padding[-len(dates):] = False
         return values, padding, dates, None
+
+    def sequence_window(self, symbol, start, end, history):
+        parts,date_parts=[],[]
+        for context in self.family_contexts:
+            values,padding,dates,_=context.sequence_window(symbol,start,end,self.history_per_family)
+            parts.append(values[~padding]);date_parts.append(dates)
+        dates,inverse=torch.cat(date_parts).unique(sorted=True,return_inverse=True)
+        length=max(self.window_length,len(dates))
+        values=torch.full((length,len(self.columns)),float('nan'))
+        padding=torch.ones(length,dtype=torch.bool)
+        if len(dates):
+            joined=torch.cat(parts)
+            rows,columns=torch.isfinite(joined).nonzero(as_tuple=True)
+            values[inverse[rows]+length-len(dates),columns]=joined[rows,columns]
+            padding[-len(dates):]=False
+        return values,padding,dates,None

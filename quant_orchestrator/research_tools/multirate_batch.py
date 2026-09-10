@@ -12,7 +12,16 @@ class BatchTensors:
 
     def __call__(self, name):
         if name not in self.tensors:
-            self.tensors[name] = torch.stack([torch.as_tensor(item[name]) for item in self.batch]).to(self.device)
+            rows = [torch.as_tensor(item[name]) for item in self.batch]
+            if len({row.shape for row in rows}) > 1:
+                length=max(row.shape[0] for row in rows)
+                fill = True if name.endswith('_padding') else torch.iinfo(torch.long).min if name.endswith('_timestamps') else float('nan')
+                padded=[]
+                for row in rows:
+                    prefix=torch.full((length-row.shape[0],*row.shape[1:]),fill,dtype=row.dtype)
+                    padded.append(torch.cat([prefix,row]))
+                rows=padded
+            self.tensors[name] = torch.stack(rows).to(self.device)
         return self.tensors[name]
 
 

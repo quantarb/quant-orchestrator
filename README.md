@@ -424,7 +424,10 @@ The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
 within-step issuer encoding. Oracle/HITS are supervised labels only and never
 historical model inputs. Causal elapsed-time and information-age embeddings
 represent irregular gaps; NTP evaluation compares each family with persistence.
-The epoch monitor prints fixed post-cutoff evaluation trends without restarting training.
+Sequence training (`--training-sequence-stride 128`) packs event dates into overlapping
+Polars windows and supervises each event once. Issuer streams retain history at
+the sequence start plus dated updates. The epoch monitor drains immutable epoch
+checkpoints and prints separate annual backtests without restarting training.
 Optional BF16 autocast is available for measured precision/batch-size comparisons.
 Masked and next-observation objectives reconstruct individual values at token
 and subtoken levels. Subtoken MTP masks features within each family; token MTP

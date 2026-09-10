@@ -242,3 +242,11 @@ Multi-rate sample metadata preparation groups anchors by issuer/instrument/date
 before visiting the bounded streaming caches. Feature histories remain lazy;
 the current trainer still builds its sample metadata list before fitting and
 prints preparation progress every 25,000 anchors.
+
+`research_tools.sequence_training` builds overlapping training sequences from a
+Polars symbol/date index and joins bounded event labels once per window. Each
+supervised date is owned once. Streaming contexts retain history at the first
+supervised date and subsequent updates; variable lengths are padded per batch.
+This reuses the older sequence-level training approach without restoring pandas
+or full-corpus feature tensors. The epoch monitor queues immutable checkpoints
+so training and annual backtest reporting can progress at different speeds.

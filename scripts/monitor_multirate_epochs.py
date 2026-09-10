@@ -75,18 +75,20 @@ def main():
     status('waiting_for_epoch')
     import torch
     while True:
-        if latest.exists():
-            current_signature = latest.stat().st_mtime_ns
+        queued = training / 'epoch_checkpoints' / f'epoch_{completed+1:04d}.pt'
+        source = queued if queued.exists() else latest
+        if source.exists():
+            current_signature = (str(source), source.stat().st_mtime_ns)
             if current_signature != signature:
                 # Preserve the inode contents even if training atomically replaces latest.
                 snapshot = args.output_dir / 'candidate.pt'
-                shutil.copyfile(latest, snapshot)
+                shutil.copyfile(source, snapshot)
                 payload = torch.load(snapshot, map_location='cpu', weights_only=True)
                 metrics = payload['metrics']
                 epoch, batch = int(metrics['epoch']), int(metrics['batch'])
                 del payload
                 totals = last_epoch_batches(args.training_log)
-                if epoch + 1 > completed and batch == totals.get(epoch):
+                if epoch + 1 > completed and (metrics.get('epoch_complete') or batch == totals.get(epoch)):
                     if epoch != completed:
                         raise ValueError(f'Missed an epoch checkpoint: expected {completed+1}, found {epoch+1}')
                     directory = args.output_dir / f'epoch_{epoch+1:04d}'
@@ -131,6 +133,8 @@ def main():
             except ProcessLookupError:
                 alive = False
         if not alive:
+            if (training / 'epoch_checkpoints' / f'epoch_{completed+1:04d}.pt').exists():
+                continue
             if not (training / 'multirate_mtl_model.pt').exists():
                 raise RuntimeError('Training exited before writing its final model')
             status('complete')

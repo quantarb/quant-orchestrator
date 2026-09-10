@@ -111,3 +111,28 @@ def test_yearly_backtests_isolate_dates_capital_and_price_snapshots(tmp_path, mo
     assert len(calls)==3
     assert calls[-1]['end']=='2026-09-09'
     assert 'period,start,end' in format_backtest_report(reports)
+
+
+def test_monitor_drains_immutable_epochs_after_trainer_exits(tmp_path,monkeypatch):
+    import json,sys,torch
+    from scripts import monitor_multirate_epochs as monitor
+    training=tmp_path/'training';snapshots=training/'epoch_checkpoints';snapshots.mkdir(parents=True)
+    (training/'multirate_mtl_model.pt').touch()
+    for epoch in (0,1):
+        torch.save({'metrics':{'epoch':epoch,'batch':3,'epoch_complete':True}},snapshots/f'epoch_{epoch+1:04d}.pt')
+    command=tmp_path/'command.json';command.write_text(json.dumps(['python','train','--output-dir',str(training),'--train-end-date','2024-01-01']))
+    log=tmp_path/'train.log';log.write_text('')
+    out=tmp_path/'evaluation';calls=[]
+    def inference(invocation,**kwargs):
+        directory=__import__('pathlib').Path(invocation[invocation.index('--output-dir')+1])
+        (directory/'ntp_evaluation.json').write_text(json.dumps({'metrics':[]}))
+        calls.append(directory.name)
+        return __import__('types').SimpleNamespace(returncode=0)
+    monkeypatch.setattr(monitor.subprocess,'run',inference)
+    def exited(*args):raise ProcessLookupError
+    monkeypatch.setattr(monitor.os,'kill',exited)
+    monkeypatch.setattr(sys,'argv',['monitor','--command-file',str(command),'--training-log',str(log),
+        '--output-dir',str(out),'--validation-start','2024-01-01','--validation-end','2024-12-31','--training-pid','123'])
+    monitor.main()
+    assert calls==['epoch_0001','epoch_0002']
+    assert json.loads((out/'status.json').read_text())['completed_epoch']==2
