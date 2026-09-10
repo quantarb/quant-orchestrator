@@ -307,6 +307,11 @@ class MultiRateTransformer(nn.Module):
             num_heads=self.config.num_heads,
             max_position=self.config.max_position,
         )
+        self.information_age = nn.ModuleDict({
+            rate: nn.Sequential(nn.Linear(len(family_config[rate]) * 2, self.config.d_model), nn.GELU(),
+                                nn.Linear(self.config.d_model, self.config.d_model))
+            for rate in self.config.rates
+        })
         self.rate_embeddings = nn.ParameterDict({
             rate: nn.Parameter(torch.randn(self.config.d_model) * 0.02)
             for rate in self.config.rates
@@ -1006,6 +1011,15 @@ class MultiRateTransformer(nn.Module):
         encoded_rates = {"annual": annual_states, "quarterly": quarterly_states,
                          "daily": instrument_states, "sparse": sparse_states}
         query_dates = daily_dates.expand(daily_values.shape[0], -1) if daily_dates.ndim == 1 else daily_dates
+        from .time_features import family_clock
+        def age_state(rate, values, dates, padding, presence=None):
+            if presence is None:
+                presence = torch.stack([torch.isfinite(values[..., sl]).any(-1)
+                    for sl in self.coverage_inputs[rate].slices.values()], -1)
+            if padding is not None:
+                presence = presence & ~padding.unsqueeze(-1)
+            clock = family_clock(dates, presence.bool(), query_dates).to(values.dtype)
+            return self.information_age[rate](clock.flatten(-2)) * clock[..., 1].any(-1, keepdim=True)
         context_parts = []
         for rate in self.config.rates:
             if rate == "daily":
@@ -1017,7 +1031,8 @@ class MultiRateTransformer(nn.Module):
             if rate_padding[rate] is not None:
                 visible = visible & ~rate_padding[rate][:, None, :]
             weights = visible.to(encoded_rates[rate].dtype)
-            context_parts.append(torch.bmm(weights, encoded_rates[rate]) / weights.sum(-1, keepdim=True).clamp_min(1))
+            context_parts.append(torch.bmm(weights, encoded_rates[rate]) / weights.sum(-1, keepdim=True).clamp_min(1)
+                + age_state(rate, input_contracts[rate][0], dates, rate_padding[rate], input_contracts[rate][1]))
         instrument_fused = self.instrument_fusion(torch.cat(context_parts, dim=-1))
         # Issuer daily/irregular observations are distinct from the instrument's
         # own daily/irregular observations; both use the native rate encoder.
@@ -1042,7 +1057,7 @@ class MultiRateTransformer(nn.Module):
             visible = (dates[:, None, :] <= query_dates[:, :, None]) & ~padding[:, None, :]
             weights = visible.to(states.dtype)
             context = torch.bmm(weights, states) / weights.sum(-1, keepdim=True).clamp_min(1)
-            instrument_fused = instrument_fused + self.issuer_context_fusion(context)
+            instrument_fused = instrument_fused + self.issuer_context_fusion(context + age_state(rate, values, dates, padding))
             issuer_reuse[rate] = {"requested": values.shape[0], "encoded": len(first)}
         supervised_states = {**token_states, "daily": instrument_fused}
         (

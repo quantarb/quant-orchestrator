@@ -1,0 +1,72 @@
+"""Disk-deduplicated, per-family NTP comparison with last-known-value persistence."""
+import sqlite3
+import torch
+from .multirate_objectives import family_channels, reconstruction_targets, next_observation_targets
+
+
+class NTPPersistenceAudit:
+    def __init__(self, path, *, start_ns=None, end_ns=None):
+        self.connection = sqlite3.connect(path)
+        self.connection.execute('PRAGMA cache_size=-8192')
+        self.connection.execute('CREATE TABLE IF NOT EXISTS pairs (symbol TEXT, rate TEXT, level TEXT, family TEXT, source INTEGER, target INTEGER, n INTEGER, model_error REAL, baseline_error REAL, PRIMARY KEY(symbol,rate,level,family,source,target))')
+        self.start_ns, self.end_ns = start_ns, end_ns
+        self.groups = set()
+
+    @torch.no_grad()
+    def update(self, symbols, rate, names, widths, values, padding, dates, predictions):
+        self.groups.update((rate, level, name) for level in ("subtoken", "token") for name in names)
+        valid = torch.isfinite(values) & ~padding.unsqueeze(-1)
+        rows = torch.arange(values.shape[1], device=values.device).view(1, -1, 1)
+        last = torch.where(valid, rows, -1).cummax(1).values
+        baseline = values.gather(1, last.clamp_min(0))
+        baseline_valid = last >= 0
+        targets = reconstruction_targets(values, padding, dates, torch.zeros_like(valid), widths)
+        presence = family_channels(valid, widths).any(-1)
+        future_family, _ = next_observation_targets(dates.unsqueeze(-1).expand_as(presence), presence, dates)
+        future_token, _ = next_observation_targets(dates.unsqueeze(-1), valid.any(-1, keepdim=True), dates)
+        inserts = []
+        for level in ('subtoken', 'token'):
+            target, target_valid = targets['next_' + level]
+            prediction = predictions[f'next_{rate}_{level}']
+            if level == 'token':
+                target, target_valid, prediction = [family_channels(t, widths) for t in (target, target_valid, prediction)]
+            keep = target_valid & family_channels(baseline_valid, widths)
+            future = future_family if level == 'subtoken' else future_token.expand_as(future_family)
+            if self.start_ns is not None:
+                keep &= (future >= self.start_ns).unsqueeze(-1)
+            if self.end_ns is not None:
+                keep &= (future <= self.end_ns).unsqueeze(-1)
+            counts = keep.sum(-1)
+            model_error = torch.where(keep, (prediction.double() - target.double()).square(), 0).sum(-1)
+            baseline_error = torch.where(keep, (family_channels(baseline, widths).double() - target.double()).square(), 0).sum(-1)
+            if not torch.isfinite(model_error).all() or not torch.isfinite(baseline_error).all():
+                raise ValueError('Nonfinite NTP evaluation errors')
+            indices = (counts > 0).nonzero().cpu().tolist()
+            counts, model_error, baseline_error, future, source = [t.cpu() for t in (counts, model_error, baseline_error, future, dates)]
+            for b, t, f in indices:
+                inserts.append((symbols[b], rate, level, names[f], int(source[b,t]), int(future[b,t,f]),
+                    int(counts[b,t,f]), float(model_error[b,t,f]), float(baseline_error[b,t,f])))
+        self.connection.executemany('INSERT OR IGNORE INTO pairs VALUES (?,?,?,?,?,?,?,?,?)', inserts)
+        self.connection.commit()
+
+    def report(self):
+        result = []
+        for rate, level, family, pairs, count, model, baseline, minimum_days, maximum_days in self.connection.execute(
+            'SELECT rate,level,family,COUNT(*),SUM(n),SUM(model_error),SUM(baseline_error),MIN((target-source)/86400000000000.0),MAX((target-source)/86400000000000.0) FROM pairs GROUP BY rate,level,family'):
+            result.append(dict(rate=rate, level=level, family=family, unique_pairs=pairs, values=count, minimum_horizon_days=minimum_days, maximum_horizon_days=maximum_days,
+                model_mse=model/count, persistence_mse=baseline/count,
+                skill=1-model/baseline if baseline > 0 else None,
+                beats_persistence=model < baseline))
+        measured = {(row['rate'], row['level'], row['family']) for row in result}
+        for rate, level, family in sorted(self.groups - measured):
+            result.append(dict(rate=rate, level=level, family=family, unique_pairs=0, values=0,
+                minimum_horizon_days=None, maximum_horizon_days=None, model_mse=None,
+                persistence_mse=None, skill=None, beats_persistence=None))
+        result.sort(key=lambda row: (row['rate'], row['level'], row['family']))
+        return dict(units='training-normalized values', weighting='individual observed values; identical model/baseline targets',
+            deduplication='instrument/rate/level/family/source date/target date',
+            missing_policy='exclude targets with no previously observed value for persistence',
+            start_ns=self.start_ns, end_ns=self.end_ns, metrics=result)
+
+    def close(self):
+        self.connection.close()

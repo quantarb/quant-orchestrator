@@ -41,7 +41,9 @@ Current reusable code placement:
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.
 
 The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
-within-step issuer encoding. Oracle/HITS supervise instrument-specific decisions.
+within-step issuer encoding. Oracle/HITS are supervised labels only and never
+historical model inputs. Causal elapsed-time and information-age embeddings
+represent irregular gaps; NTP evaluation compares each family with persistence.
 Masked and next-observation objectives reconstruct individual values at token
 and subtoken levels. Subtoken MTP masks features within each family; token MTP
 masks whole families. NTP predicts coherent next family and combined-token observations.

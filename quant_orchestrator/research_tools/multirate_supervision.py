@@ -67,3 +67,14 @@ class StreamingSupervision:
                 raise ValueError(f'Missing supervised training labels for {asset}: {", ".join(missing)}')
             counts[asset] = row
         return counts
+
+
+SUPERVISED_ONLY_FAMILIES = frozenset({
+    "equity.strategy.hits_graph", "equity.strategy.oracle_trades",
+})
+
+
+def input_event_families(events, families):
+    """Keep outcome labels out of every historical input and reconstruction path."""
+    names = [name for name in families if name not in SUPERVISED_ONLY_FAMILIES]
+    return events.filter(~pl.col("target_family").is_in(list(SUPERVISED_ONLY_FAMILIES))), names or ["__empty_sparse_family__"]

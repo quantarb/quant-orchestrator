@@ -2,7 +2,7 @@
 import torch
 
 
-RECONSTRUCTION_CONTRACT = "hierarchical_masks_v5"
+RECONSTRUCTION_CONTRACT = "features_only_time_v6"
 
 
 def feature_family_layout(columns):

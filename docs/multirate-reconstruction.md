@@ -1,6 +1,6 @@
 # Individual-value reconstruction
 
-The multi-rate trainer uses the `hierarchical_masks_v5` objective
+The multi-rate trainer uses the `features_only_time_v6` objective
 contract. Oracle/HITS remain the instrument-specific supervised tasks.
 
 Each token head predicts the complete ordered numeric feature vector for its
@@ -39,12 +39,33 @@ weight 0.1 relative to weight 1 for each supervised task.
 `--self-supervision both|next|masked|none` enables controlled comparisons.
 The `next` and `none` settings do not corrupt inputs.
 
-Sparse windows reserve 16 observations per family, then union observations with
-the same availability date. Frequent insider events cannot crowd out all older
-HITS/Oracle observations. Target-derived context remains availability-gated;
-HITS/Oracle context currently summarizes each year's events. Families or
-instruments with fewer than two available observations cannot contribute NTP
-pairs. Counts describe actual eligible targets, not guaranteed coverage.
+Oracle and HITS are supervised targets only. Their rows are retained in the
+separate supervised scan, then removed before sparse input normalization,
+window selection, family adapters, NTP/MTP targets, and issuer context. Their
+values are never fed back into the model, even after the outcome is known.
+Other sparse feature families retain 16 observations each, merged on equal
+dates. Families with fewer than two observations cannot contribute NTP pairs.
+An empty sparse feature stream uses a fully missing placeholder, not outcomes.
+
+The family encoder embeds log elapsed days since its previous observation,
+log age of its latest observed value, and flags distinguishing known history
+from no history. Explicit dates use Unix nanoseconds. Slow-family information
+age is also computed at each daily query before instrument fusion; this allows
+cached slow representations to remain reusable while their age changes.
+Padding and future observations cannot define a clock input. No next-event
+interval is provided to the model, and no training dates or labels are shifted.
+
+`ntp_evaluation.py` evaluates clean-input NTP against the last known value of
+each individual channel on identical target masks, grouped by rate, family,
+and subtoken/token level. A bounded SQLite cache deduplicates overlapping
+windows by instrument, family, source date, and target date; the first window
+in chronological evaluation order is retained. Values without a historical
+persistence estimate are excluded from both compared errors. The report includes
+counts, forecast-horizon range, model MSE, persistence MSE and skill
+`1 - model_error / persistence_error`. Skill is null when persistence error is
+zero. Errors use training-normalized units and value weighting. Evaluation
+intervals filter target dates. Reports assess available pairs within model
+windows, not observations absent from the corpus or outside those windows.
 
 The checkpoint records the objective contract. Checkpoints trained with the
 previous scalar-average objectives must be retrained; the trainer rejects them
@@ -106,20 +127,15 @@ separately from implementation and training status.
 
 ## Assessment and next experiments
 
-The hierarchy is implemented, but held-out trading utility is unproven. The
-highest-priority experiments are elapsed-time and forecast-horizon conditioning,
-next-step persistence baselines per family, event-level HITS/Oracle context with
-availability preserved, and supervised-only/NTP/MTP/combined ablations under the
-same trading rules. The current family temporal encoder uses learned sequence
-positions; timestamps impose causal visibility without encoding elapsed gaps.
-
-Eleven issuers provide a useful pipeline trial, not evidence of broad issuer or
-asset-class generalization. Extend both universe and held-out issuer coverage
-before making that claim. Balance losses using measured per-family coverage and
-validation results rather than assuming more reconstruction heads improve trading.
-For a model frozen at the start of 2024, both 2024 and 2025 evaluations must fit
-baseline statistics before 2024; `evaluate_predictions(training_cutoff=...)`
-records and enforces that boundary separately from the evaluation interval.
+Held-out trading utility remains unproven. Use the NTP report to establish
+whether temporal reconstruction beats persistence, then compare supervised-only,
+NTP, MTP and combined runs under identical trading rules. Eleven issuers are
+an execution trial, not broad generalization evidence. Event-level Oracle/HITS
+input experiments are excluded: the user requires these to remain supervised
+labels only. The older v5 diagnostics below describe an archived model that
+included target-derived context; its long run was stopped after that correction.
+For a model trained before 2024, both 2024 and 2025 baseline statistics must use
+that same training cutoff, separately from the evaluation interval.
 
 The v5 hierarchy CUDA check completed 2,048 samples in one epoch with finite
 loss (4.207217), nonzero gradients for every rate encoder and instrument fusion,
@@ -144,3 +160,14 @@ same-observation reconstruction targets. The execution delay belongs in the
 backtest, not in an extra shift of model inputs or supervised labels. Current
 scoring anchors follow instrument price dates, so weekend-only updates are not
 separately scored. Recorded source dates remain unchanged; no publication lags are invented.
+
+## v6 execution check
+
+The corrected model completed a 2,048-sample CUDA epoch with finite loss
+(5.279881), peak process RSS 3,374 MiB and peak CUDA allocation 8,059 MiB.
+Checkpoint reload scored 135 instrument/date rows for 2024-03-25 through
+2024-04-05. The only sparse input family was insider trading; HITS/Oracle
+supervision remained active. The small diagnostic model did not beat persistence
+in any measured family/level group. This short check is not a completed training
+experiment. Annual groups had no eligible successor in that evaluation interval;
+reports now explicitly include zero-coverage groups with null error/skill.

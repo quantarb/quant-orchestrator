@@ -26,11 +26,12 @@ from torch import nn
 
 from quant_warehouse import Warehouse
 from quant_orchestrator.research_tools.streaming_context import StreamingContext, StreamingFamilyContext
-from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups
+from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups, input_event_families
 from quant_orchestrator.research_tools.multirate_objectives import (
     RECONSTRUCTION_CONTRACT, reconstruction_mask, reconstruction_targets, family_channels, feature_family_layout,
 )
 from quant_orchestrator.research_tools.multirate_audit import verify_corpus_files
+from quant_orchestrator.research_tools.ntp_evaluation import NTPPersistenceAudit
 
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import (
     DOCUMENT_PROTOTYPE_STATS,
@@ -728,13 +729,13 @@ def main() -> None:
     manifest = json.loads((root / "manifest.json").read_text())
     input_fingerprint = verify_corpus_files(root, manifest)
     feature_families = list(manifest["feature_families"])
-    target_families = list(manifest["target_families"])
+    sparse_input_families = list(manifest["target_families"])
     # The four-rate architecture keeps a sparse stream even for a fresh
     # feature-only build with no target-event parquet yet.  A neutral family
     # preserves the tensor contract without creating a supervised task or
     # contributing any labels.
-    if not target_families:
-        target_families = ["__empty_sparse_family__"]
+    if not sparse_input_families:
+        sparse_input_families = ["__empty_sparse_family__"]
     checkpoint_payload = None
     if args.inference_only and args.checkpoint is not None:
         checkpoint_payload = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
@@ -744,7 +745,7 @@ def main() -> None:
             raise ValueError("Corpus feature-family order does not match the checkpoint")
         # The checkpoint defines the sparse target schema used by its task
         # heads. Fresh live data may contain only a subset of those events.
-        target_families = list(checkpoint_metrics.get("target_families", target_families))
+        sparse_input_families = list(checkpoint_metrics.get("sparse_input_families", sparse_input_families))
     if checkpoint_payload:
         if checkpoint_payload.get("configuration", {}).get("reconstruction_contract") != RECONSTRUCTION_CONTRACT:
             raise ValueError("Checkpoint objective/family layout differs; retrain using the current grouped reconstruction contract")
@@ -907,9 +908,8 @@ def main() -> None:
     if "event_date" in sparse.collect_schema().names():
         sparse = sparse.with_columns(pl.col("event_date").cast(pl.Datetime, strict=False).dt.truncate("1d"))
 
-    # Derived target labels are supervised at their original event date. Their
-    # delayed availability remains in ``date`` and therefore keeps them out
-    # of the input context at the prediction date.
+    # Outcome-derived labels remain on their original event dates. Retain the
+    # supervised scan before excluding these families entirely from inputs.
     supervised_target_map = StreamingSupervision(
         sparse, cutoff=_as_datetime(args.train_end_date) if args.train_end_date else None,
     )
@@ -921,6 +921,8 @@ def main() -> None:
         (output_dir / "supervision_coverage.json").write_text(json.dumps(coverage, indent=2))
         print(f"[supervision] {coverage}", flush=True)
 
+    sparse, sparse_input_families = input_event_families(sparse, sparse_input_families)
+
     daily_value_columns = [f"value__{family}" for family in feature_families]
     if option_columns:
         daily_value_columns.extend(option_columns)
@@ -928,7 +930,7 @@ def main() -> None:
     quarterly_value_columns = daily_value_columns
     # Preserve endpoint identity when multiple families occur on one date.
     sparse = sparse.with_columns(pl.col("target_family").replace_strict(
-        {name: i for i, name in enumerate(target_families)}, default=None,
+        {name: i for i, name in enumerate(sparse_input_families)}, default=None,
     ).cast(pl.Int64).alias("target_id"))
     sparse_value_columns = ["signal_value", *[f"text_{i}" for i in range(7)]]
     sparse = sparse.group_by(["symbol", "date", "target_family", "target_id"]).agg(
@@ -936,9 +938,8 @@ def main() -> None:
     )
 
     if args.issuer_context == 'none':
-        # Preserve supervised outcomes; remove issuer feature events only.
-        sparse = sparse.filter(pl.col('target_family').is_in([
-            'equity.strategy.hits_graph', 'equity.strategy.oracle_trades']))
+        # Supervision was retained separately; this view contains inputs only.
+        sparse = sparse.filter(pl.lit(False))
     # Standardize numeric rate values using the available corpus while
     # retaining NaN for coverage-aware missingness handling.
     rate_columns = {"annual": annual_value_columns, "quarterly": quarterly_value_columns, "daily": daily_value_columns}
@@ -971,7 +972,7 @@ def main() -> None:
     # caused the 10B/two-year option run to consume tens of GB before training.
     sparse_wide = sparse.select(["target_family", *raw_sparse_columns])
     sparse_wide_columns = []
-    for family in target_families:
+    for family in sparse_input_families:
         for column in raw_sparse_columns:
             output_column = f"{family}__{column}"
             sparse_wide_columns.append(
@@ -999,7 +1000,7 @@ def main() -> None:
     annual_index = StreamingContext(annual, annual_value_columns)
     quarterly_index = StreamingContext(quarterly, quarterly_value_columns)
     daily_index = StreamingContext(daily, daily_value_columns)
-    sparse_index = StreamingFamilyContext(sparse, sparse_value_columns, families=target_families)
+    sparse_index = StreamingFamilyContext(sparse, sparse_value_columns, families=sparse_input_families)
     sparse_window_length = sparse_index.window_length
 
     # A document can be anchored by a regular annual observation or by a
@@ -1226,7 +1227,7 @@ def main() -> None:
     feature_family_dimensions = feature_family_layout([family for family in feature_families if family != "options"])
     if option_columns:
         feature_family_dimensions["options"] = len(option_columns)
-    family_names = [*feature_family_dimensions, *target_families]
+    family_names = [*feature_family_dimensions, *sparse_input_families]
     label_names["family"] = (
         list(checkpoint_payload["labels"]["family"])
         if checkpoint_payload is not None and isinstance(checkpoint_payload.get("labels"), dict)
@@ -1351,7 +1352,7 @@ def main() -> None:
     )
     reconstruction_widths = {
         **{rate: tuple(feature_family_dimensions.values()) for rate in ("annual", "quarterly", "daily")},
-        "sparse": (len(raw_sparse_columns),) * len(target_families),
+        "sparse": (len(raw_sparse_columns),) * len(sparse_input_families),
     }
     task_bundle = add_subtoken_temporal_tasks(
         train_samples,
@@ -1387,7 +1388,7 @@ def main() -> None:
             "annual": feature_family_dimensions,
             "quarterly": feature_family_dimensions,
             "daily": feature_family_dimensions,
-            "sparse": {family: len(raw_sparse_columns) for family in target_families},
+            "sparse": {family: len(raw_sparse_columns) for family in sparse_input_families},
         },
         modalities=asset_classes,
         tasks=model_tasks,
@@ -1459,7 +1460,7 @@ def main() -> None:
             encoder_gradient_sums[name] += float(gradient.detach().abs().sum())
         return record
     for name, parameter in model.named_parameters():
-        if parameter.requires_grad and name.startswith(("annual_encoder.", "quarterly_encoder.", "encoders.daily.", "encoders.sparse.", "instrument_fusion.")):
+        if parameter.requires_grad and name.startswith(("annual_encoder.", "quarterly_encoder.", "encoders.daily.", "encoders.sparse.", "instrument_fusion.", "information_age.", "auto_feature_engineer.elapsed_time.")):
             parameter.register_hook(record_gradient(name.split(".layers")[0] if ".layers" in name else name.split(".")[0]))
 
     def training_step(module: torch.nn.Module, batch: list[dict[str, object]], active_tasks):
@@ -1608,7 +1609,7 @@ def main() -> None:
         for rate in ("annual", "quarterly", "daily", "sparse"):
             raw = stack(rate)
             if rate == "sparse":
-                local_count, width, family_offset = len(target_families), len(raw_sparse_columns), len(feature_family_dimensions)
+                local_count, width, family_offset = len(sparse_input_families), len(raw_sparse_columns), len(feature_family_dimensions)
                 observed = torch.isfinite(raw).reshape(raw.shape[0], raw.shape[1], local_count, width).any(dim=-1).any(dim=1)
             else:
                 family_offset = 0
@@ -1640,7 +1641,7 @@ def main() -> None:
                     task_observations[name] += int(valid.sum())
                     per_family = valid if level == "subtoken" else family_channels(valid, reconstruction_widths[rate])
                     counts = per_family.sum(dim=(0, 1, 3)).detach().cpu().tolist()
-                    names = target_families if rate == "sparse" else list(feature_family_dimensions)
+                    names = sparse_input_families if rate == "sparse" else list(feature_family_dimensions)
                     for family, count in zip(names, counts):
                         task_family_observations[f"{name}:{family}"] += count
         if module.training:
@@ -1708,7 +1709,7 @@ def main() -> None:
                 "batch": batch_index,
                 "batch_loss": batch_loss,
                 "feature_families": feature_families,
-                "target_families": target_families,
+                "sparse_input_families": sparse_input_families,
                 "tasks": list(expected_task_names),
                 "train_samples": len(train_samples),
             },
@@ -1769,12 +1770,19 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    evaluation_samples = sorted(evaluation_samples, key=lambda item: (item["date"], item["symbol"]))
     model.eval(); predictions: dict[str, list[torch.Tensor]] = {name: [] for name in enabled_document_tasks[1:]}; states: list[torch.Tensor] = []; family_states: list[torch.Tensor] = []; family_valid_rows: list[torch.Tensor] = []
     prediction_rows: list[dict[str, object]] = []
     prediction_count = 0
     prediction_temporary = output_dir / "supervised_predictions.csv.tmp"
     prediction_temporary.write_text("")
     prediction_start = _as_datetime(args.prediction_start_date) if args.prediction_start_date else None
+    ntp_path = output_dir / "ntp_evaluation.sqlite"
+    if ntp_path.exists():
+        ntp_path.unlink()
+    ntp_audit = NTPPersistenceAudit(ntp_path,
+        start_ns=_epoch_ns(prediction_start) if prediction_start else None,
+        end_ns=_epoch_ns(_as_datetime(args.prediction_end_date)) if args.prediction_end_date else None)
     family_correct = 0
     family_total = 0
     with torch.inference_mode():
@@ -1806,6 +1814,10 @@ def main() -> None:
             quarterly_batch, quarterly_mask = context("quarterly", "quarterly_padding")
             sparse_batch, sparse_padding_mask = context("sparse", "sparse_padding")
             output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, issuer_streams=issuer_inputs(batch, stack), daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"), quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"), daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, DAILY_WINDOW))
+            for rate, widths in reconstruction_widths.items():
+                ntp_audit.update([str(item["symbol"]) for item in batch], rate,
+                    sparse_input_families if rate == "sparse" else list(feature_family_dimensions), widths,
+                    stack(rate), stack(f"{rate}_padding").bool(), stack(f"{rate}_timestamps"), output["prediction_outputs"])
             if prediction_start is not None:
                 score_names = tuple(SUPERVISED_TARGET_TASK_NAMES)
                 score_arrays = {
@@ -1835,7 +1847,7 @@ def main() -> None:
             for rate in ("annual", "quarterly", "daily", "sparse"):
                 raw = stack(rate)
                 if rate == "sparse":
-                    local_count, width, family_offset = len(target_families), len(raw_sparse_columns), len(feature_family_dimensions)
+                    local_count, width, family_offset = len(sparse_input_families), len(raw_sparse_columns), len(feature_family_dimensions)
                     observed = torch.isfinite(raw).reshape(raw.shape[0], raw.shape[1], local_count, width).any(dim=-1).any(dim=1)
                 else:
                     family_offset = 0
@@ -1873,7 +1885,13 @@ def main() -> None:
         )
     if "family" in enabled_document_tasks:
         task_accuracy["family"] = family_correct / max(1, family_total)
-    metrics = {"device": str(device), "samples": len(samples), "training_samples": len(train_samples), "feature_families": feature_families, "target_families": target_families, "family_labels": family_names, "tasks": [*expected_task_names, *(["mrl"] if mrl_dimensions else [])], "losses": losses, "best_loss": best_loss, "epochs_completed": len(losses), "patience": args.patience, "min_delta": args.min_delta, "task_accuracy": task_accuracy, "rates": ["annual", "quarterly", "daily", "sparse"], "backbone": config.backbone, "document_tasks_disabled": args.disable_document_tasks, "learned_aggregation_gate": args.learned_aggregation_gate, "mrl": bool(mrl_dimensions), "mrl_dimensions": list(mrl_dimensions), "mrl_weight": args.mrl_weight, "train_end_date": args.train_end_date, "prediction_start_date": args.prediction_start_date}
+    ntp_report = ntp_audit.report()
+    ntp_report.update(training_cutoff=args.train_end_date, evaluation_samples=len(evaluation_samples),
+        trained_self_supervision=(checkpoint_payload or {}).get("configuration", {}).get("self_supervision", args.self_supervision),
+        sparse_input_families=sparse_input_families)
+    (output_dir / "ntp_evaluation.json").write_text(json.dumps(ntp_report, indent=2))
+    ntp_audit.close()
+    metrics = {"device": str(device), "samples": len(samples), "training_samples": len(train_samples), "feature_families": feature_families, "sparse_input_families": sparse_input_families, "family_labels": family_names, "tasks": [*expected_task_names, *(["mrl"] if mrl_dimensions else [])], "losses": losses, "best_loss": best_loss, "epochs_completed": len(losses), "patience": args.patience, "min_delta": args.min_delta, "task_accuracy": task_accuracy, "rates": ["annual", "quarterly", "daily", "sparse"], "backbone": config.backbone, "document_tasks_disabled": args.disable_document_tasks, "learned_aggregation_gate": args.learned_aggregation_gate, "mrl": bool(mrl_dimensions), "mrl_dimensions": list(mrl_dimensions), "mrl_weight": args.mrl_weight, "train_end_date": args.train_end_date, "prediction_start_date": args.prediction_start_date}
     metrics.update({
         "validation_samples": len(validation_samples),
         "validation_losses": validation_losses,
@@ -1906,7 +1924,7 @@ def main() -> None:
     })
     metrics["input_fingerprint"] = input_fingerprint
     metrics["feature_family_dimensions"] = feature_family_dimensions
-    metrics["streaming_blocks"] = {rate: {"hits": index.cache_hits, "misses": index.cache_misses, "max_blocks": 32 * (len(target_families) if rate == "sparse" else 1), "extra_rows_per_block": 1024}
+    metrics["streaming_blocks"] = {rate: {"hits": index.cache_hits, "misses": index.cache_misses, "max_blocks": 32 * (len(sparse_input_families) if rate == "sparse" else 1), "extra_rows_per_block": 1024}
         for rate, index in {"annual": annual_index, "quarterly": quarterly_index, "daily": daily_index, "sparse": sparse_index}.items()}
     metrics["context_cache"] = {
         "size_per_rate": args.context_cache_size,

@@ -58,6 +58,9 @@ class LearnedAggregationGate(nn.Module):
         return gated, weights
 
 
+from .time_features import family_clock
+
+
 class AutoFeatureEngineer(nn.Module):
     """Learn feature relationships with one date-aware attention policy.
 
@@ -85,6 +88,7 @@ class AutoFeatureEngineer(nn.Module):
         super().__init__()
         if d_model % num_heads:
             raise ValueError("d_model must be divisible by num_heads")
+        self.elapsed_time = nn.Sequential(nn.Linear(4, d_model), nn.GELU(), nn.Linear(d_model, d_model))
         self.position = nn.Parameter(torch.randn(max_position, d_model) * 0.02)
         # Each family is an independent temporal document. Reshaping to
         # [batch * family, date, d_model] gives every (symbol, family)
@@ -172,7 +176,9 @@ class AutoFeatureEngineer(nn.Module):
         if dates.shape not in ((length,), (batch, length)):
             raise ValueError("dates must have shape [sequence] or [batch, sequence]")
 
-        tokens = family_states + self.position[:length].view(1, length, 1, -1)
+        observed = family_presence if padding_mask is None else family_presence & ~padding_mask.unsqueeze(-1)
+        timing = family_clock(dates, observed).to(family_states.dtype)
+        tokens = family_states + self.position[:length].view(1, length, 1, -1) + self.elapsed_time(timing)
         token_padding = family_presence.eq(0)
         if padding_mask is not None:
             token_padding = token_padding | padding_mask.unsqueeze(-1)
