@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
+
+# Make direct script execution use this checkout's canonical package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import polars as pl
 
