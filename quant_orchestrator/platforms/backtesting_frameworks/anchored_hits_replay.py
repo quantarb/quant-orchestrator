@@ -36,7 +36,7 @@ def replay_anchored_hits(predictions, prices, output, *, start, end, side,
                          threshold=.8, top_k=20, cost_bps=5.5, initial_cash=100000.):
     """EOD decisions execute the following close; held weights earn subsequent returns.
 
-    Preserve the former shared-book fixed signed 1/top_k weights and its cost
+    Preserve the former shared-book fixed signed 1/min(top_k, universe size) weights and its cost
     convention (cost on changes in target weights). No forced terminal exit.
     Inputs are lazy frames of equity scores and split/dividend-adjusted closes.
     """
@@ -47,6 +47,10 @@ def replay_anchored_hits(predictions, prices, output, *, start, end, side,
     prices = prices.filter(date_filter).with_columns(pl.col('date').cast(pl.Date))
     scores = predictions.filter(date_filter).with_columns(pl.col('date').cast(pl.Date))
     dates = prices.select('date').unique().sort('date').collect(engine='streaming')['date'].to_list()
+    symbols = scores.select('symbol').unique().collect(engine='streaming')['symbol'].to_list()
+    if not symbols:
+        raise ValueError('Empty scoring universe')
+    allocation_slots = min(top_k, len(symbols))
     held, previous_ranks, last_quotes = set(), {}, {}
     nav = initial_cash; peak = initial_cash; curve = []; actions = []; weights = []
     sign = 1 if side == 'long' else -1
@@ -56,20 +60,20 @@ def replay_anchored_hits(predictions, prices, output, *, start, end, side,
         for symbol in held:
             if symbol not in quotes or symbol not in last_quotes or not math.isfinite(quotes[symbol]) or quotes[symbol] <= 0:
                 raise ValueError(f'Missing/invalid held equity quote: {symbol} {date}')
-            gross += sign / top_k * (quotes[symbol] / last_quotes[symbol] - 1)
+            gross += sign / allocation_slots * (quotes[symbol] / last_quotes[symbol] - 1)
         updated, events = update_book(held, previous_ranks, threshold=threshold, top_k=top_k)
         if not updated.issubset(quotes):
             raise ValueError(f'Missing entry quote on {date}')
-        turnover = len(held.symmetric_difference(updated)) / top_k
+        turnover = len(held.symmetric_difference(updated)) / allocation_slots
         net = gross - turnover * cost_bps / 10000
         nav *= 1 + net; peak = max(peak, nav)
         for symbol, action, rank in events:
             actions.append(dict(date=date, symbol=symbol, action=f'{action}_{side}', rank=rank))
         held = updated
         for symbol in sorted(held):
-            weights.append(dict(date=date, symbol=symbol, weight=sign/top_k))
+            weights.append(dict(date=date, symbol=symbol, weight=sign/allocation_slots))
         curve.append(dict(date=date, equity=nav, return_=net, drawdown=nav/peak-1,
-                          positions=len(held), gross_exposure=len(held)/top_k, turnover=turnover))
+                          positions=len(held), gross_exposure=len(held)/allocation_slots, turnover=turnover))
         day = scores.filter(pl.col('date') == date).collect(engine='streaming')
         if day['symbol'].n_unique() != day.height:
             raise ValueError('Duplicate symbol/date predictions')
@@ -85,7 +89,7 @@ def replay_anchored_hits(predictions, prices, output, *, start, end, side,
         entries=sum(a['action'].startswith('enter') for a in actions),
         exits=sum(a['action'].startswith('exit') for a in actions),
         open_positions=len(held), mean_gross_exposure=equity['gross_exposure'].mean(),
-        threshold=threshold,top_k=top_k,cost_bps=cost_bps,
+        threshold=threshold,top_k=top_k,allocation_slots=allocation_slots,universe_symbols=len(symbols),cost_bps=cost_bps,
         timing='EOD ranks execute next session close; subsequent close-to-close returns',
         prices='splits_and_dividends', model='fixed pre-2024 v6 checkpoint',
         limitations=['Equity-only; no option baskets', 'No borrow fees or locate constraints for shorts',

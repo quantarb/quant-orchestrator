@@ -126,3 +126,23 @@ four annual book folders with equity curves, target weights, action tapes and
 summaries, plus `results.json`, `input_sha256.json`, and the reproduction script.
 Seven tests pass across both replay modules, including ties, strict percentile
 thresholds, and a Friday-to-Monday next-close execution check for long and short.
+
+## Corrected universe-capped allocation
+
+Per the user's sizing correction, the current anchored replay allocates
+`1 / min(top_k, scoring-universe symbol count)` per held symbol. For 13 equities
+and top_k=20 this is 1/13 (7.6923%), initially $7,692.31 per symbol. The denominator
+is the fold's declared scoring universe, not the number of currently open
+positions. Vacant positions therefore still leave cash. The prior 1/20 results
+above remain historical experiment results, not the current sizing rule.
+
+With all other settings and entry/exit events unchanged:
+
+| Year | Long return | Long max drawdown | Short return | Short max drawdown |
+|---|---:|---:|---:|---:|
+| 2024 | 26.04% | -12.09% | -22.51% | -24.60% |
+| 2025 | 23.28% | -16.77% | -13.92% | -20.55% |
+
+Artifacts: `artifacts/multirate_recovery/1T/backtest_v6_anchored_hits_sized/`.
+Five anchored replay tests pass, including allocation for a universe smaller
+than the configured capacity. Both books remain independent annual experiments.
