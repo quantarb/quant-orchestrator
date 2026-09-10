@@ -62,9 +62,16 @@ def anchored_epoch_backtest(command, directory, start, end, previous=None):
     """Use full-calendar epoch scores and a frozen adjusted-price snapshot."""
     import polars as pl
     from quant_warehouse import Warehouse
-    from quant_orchestrator.platforms.backtesting_frameworks.anchored_hits_replay import replay_anchored_hits
+    from quant_orchestrator.platforms.backtesting_frameworks.existing_multirate_backtest import run_existing_multirate_backtest
     corpus = Path(option(command, '--corpus'))
-    symbols = pl.read_csv(corpus/'taxonomy.csv').filter(pl.col('asset_class') == 'equity')['symbol'].to_list()
+    equity_symbols = pl.read_csv(corpus/'taxonomy.csv').filter(pl.col('asset_class') == 'equity')['symbol'].to_list()
+    score_scan = pl.scan_csv(directory/'supervised_predictions.csv',try_parse_dates=True)
+    scored_symbols = score_scan.select('symbol').unique().collect(engine='streaming')['symbol'].to_list()
+    symbols = sorted(set(equity_symbols) & set(scored_symbols))
+    if not symbols:
+        raise ValueError('No scored equities in the validation calendar')
+    (directory/'backtest_universe.json').write_text(json.dumps(dict(included=symbols,
+        excluded_no_calendar_scores=sorted(set(equity_symbols)-set(symbols))),indent=2))
     cache = directory.parent/'backtest_prices'
     cache.mkdir(exist_ok=True)
     warehouse = Warehouse()
@@ -79,19 +86,17 @@ def anchored_epoch_backtest(command, directory, start, end, previous=None):
             frame.select(pl.lit(symbol).alias('symbol'),'date','close').write_parquet(temporary)
             temporary.replace(path)
         paths.append(path)
-    scores = pl.scan_csv(directory/'supervised_predictions.csv',try_parse_dates=True).filter(pl.col('symbol').is_in(symbols))
-    reports = []
-    for side in ('long','short'):
-        report = replay_anchored_hits(scores,pl.scan_parquet(paths),directory/f'backtest_{side}',start=start,end=end,side=side)
-        before = next((r for r in (previous or []) if r['side'] == side),None)
-        report['return_change_vs_previous_epoch'] = report['total_return']-before['total_return'] if before else None
-        reports.append(report)
+    scores = score_scan.filter(pl.col('symbol').is_in(symbols))
+    reports = run_existing_multirate_backtest(scores,pl.scan_parquet(paths),directory/'backtest_existing_strategy')
+    for report in reports:
+        before = next((r for r in (previous or []) if r['side'] == report['side']),None)
+        report['return_change_vs_previous_epoch'] = report['capital_return']-before['capital_return'] if before else None
     (directory/'backtest_metrics.json').write_text(json.dumps(reports,indent=2))
     return reports
 
 
 def format_backtest_report(reports):
-    fields = ('side','total_return','max_drawdown','entries','mean_gross_exposure','return_change_vs_previous_epoch')
+    fields = ('side','capital_return','sharpe','max_drawdown','entries','mean_gross_exposure','return_change_vs_previous_epoch')
     lines = [f"backtest[{len(reports)}]{{{','.join(fields)}}}:"]
     for row in reports:
         lines.append('  '+','.join(json.dumps(round(row[f],6) if isinstance(row[f],float) else row[f]) for f in fields))

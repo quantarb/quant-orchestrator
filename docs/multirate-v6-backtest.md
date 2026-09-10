@@ -146,3 +146,61 @@ With all other settings and entry/exit events unchanged:
 Artifacts: `artifacts/multirate_recovery/1T/backtest_v6_anchored_hits_sized/`.
 Five anchored replay tests pass, including allocation for a universe smaller
 than the configured capacity. Both books remain independent annual experiments.
+
+## Original multi-rate transformer strategy (current reference)
+
+The sizing clue identified a different original call path than the earlier
+anchored experiments: `optimal_trader/scripts/run_symbol_year_transformer_mtl.py`
+(lines around 2861 and 3022) calls `build_legacy_compatible_scores` from
+`scripts/multirate_transformer/trading_policy.py`, then the existing
+`run_shared_book_framework_comparison` in orchestrator's `shared_book.py`.
+The 0.80 authority-threshold results above are different strategies and must
+not be presented as this original multi-rate strategy.
+
+The original adapter percentile-ranks all four HITS components daily, sets
+entry scores from hubs, and constructs single-model long/short agreement from
+long-hub >= short-hub (long) versus short-hub > long-hub (short). The default
+optimal-trader planner enters on hub percentile >0.50 with direction agreement
+and exits when that agreement is lost. Although authority exit-score columns
+are produced, the supplied consensus counts control this call path's exits.
+Capacity is min(20, symbol count); cost is 0.5 bps commission plus 5 bps slippage.
+
+The unchanged pre-2024 v6 checkpoint was evaluated through the actual existing
+functions, not a replacement trading loop. Only prediction column names were
+adapted, with bounded annual panels converted at the original pandas API boundary.
+Polars still prepares data. Adjusted equity prices, original forward-return
+alignment, original costs and metric calculations were retained. In particular,
+there is no extra next-session-close execution shift in this reference run.
+
+| Year | Book | Return from initial $100,000 | Final equity | Sharpe | Max drawdown | Entries | Exits |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 2024 | Long | 16.88% | $116,883.61 | 1.349 | -10.27% | 86 | 80 |
+| 2024 | Short | -22.30% | $77,695.46 | -2.631 | -24.99% | 82 | 76 |
+| 2025 | Long | 24.26% | $124,256.14 | 1.406 | -15.26% | 115 | 108 |
+| 2025 | Short | -13.34% | $86,655.07 | -1.398 | -18.92% | 88 | 83 |
+
+The original `total_return` metric divides final equity by the first recorded
+(post-first-return) equity value, rather than initial capital. It consequently
+reports 17.1022%, -22.4952%, 23.5968%, and -12.2377% for these four rows. Those
+original values are preserved; the additional `capital_return` field reports
+the actual change from starting capital shown above. Sharpe uses mean daily net
+return / sample standard deviation * sqrt(252), with zero risk-free rate.
+
+These are independent annual equity books, not options or a combined long/short
+portfolio. No borrow costs/locates or forced terminal liquidation are added.
+Original net target-weight turnover accounting remains unchanged. This tests
+the new model under the old engine; it does not reproduce old model training.
+
+`platforms/backtesting_frameworks/existing_multirate_backtest.py` is the thin
+adapter reused by the epoch monitor. It imports the existing score policy and
+calls the existing engine directly; it contains no new trading loop. The 100B
+epoch monitor now uses this reference strategy and prints capital return,
+Sharpe, drawdown, entry events, exposure and capital-return change versus the
+previous epoch. Equities with no scores in the validation calendar are recorded
+as excluded from backtesting, while their older data remain eligible for training.
+
+Artifacts: `artifacts/multirate_recovery/1T/backtest_v6_existing_strategy/`, with
+verified reusable-adapter outputs under `verified/`. All four books matched the
+direct original-engine invocation to 1e-10 on equity, return, Sharpe, drawdown
+and event counts. Source files and input prices/scores have recorded hashes.
+Twelve epoch-monitor/shared-book tests passed.

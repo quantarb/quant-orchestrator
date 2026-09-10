@@ -225,3 +225,8 @@ comparison and its fixed-weight accounting limits are documented in
 [multirate-v6-backtest.md](multirate-v6-backtest.md).
 The epoch monitor can additionally score the full validation calendar and print
 anchored HITS long/short portfolio returns after each immutable epoch checkpoint.
+For the user-selected original transformer strategy, epoch evaluation now uses
+`existing_multirate_backtest.py`, a thin adapter calling the existing score-policy
+and shared-book functions. Data preparation stays in Polars; only one bounded
+annual panel crosses the original engine's pandas interface. The replacement
+0.80 authority-threshold replay is not the reference strategy.

@@ -55,7 +55,7 @@ def test_epoch_backtest_freezes_prices_and_reports_return_changes(tmp_path, monk
     import polars as pl
     from quant_orchestrator.research_tools.epoch_evaluation import anchored_epoch_backtest, format_backtest_report
     corpus=tmp_path/'corpus';corpus.mkdir()
-    pl.DataFrame({'symbol':['A'],'asset_class':['equity']}).write_csv(corpus/'taxonomy.csv')
+    pl.DataFrame({'symbol':['A','DELISTED'],'asset_class':['equity','equity']}).write_csv(corpus/'taxonomy.csv')
     dates=[date(2024,1,d) for d in (5,8,9)]
     calls=[]
     class Warehouse:
@@ -74,5 +74,5 @@ def test_epoch_backtest_freezes_prices_and_reports_return_changes(tmp_path, monk
             assert all(r['return_change_vs_previous_epoch']==0 for r in reports)
         previous=reports
     assert len(calls)==1 and calls[0]['adjustment']=='splits_and_dividends'
-    assert reports[0]['total_return']>0 and reports[1]['total_return']<0
+    assert reports[0]['capital_return']>0 and reports[1]['capital_return']==0
     assert 'backtest[2]' in format_backtest_report(reports)

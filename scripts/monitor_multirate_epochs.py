@@ -33,7 +33,7 @@ def main():
     parser.add_argument('--max-samples', type=int, default=256)
     parser.add_argument('--poll-seconds', type=float, default=10)
     parser.add_argument('--training-pid', type=int, help='Detect training exit without stopping or modifying it')
-    parser.add_argument('--backtest-anchored-hits', action='store_true', help='Score the full validation calendar and run ranked HITS long/short backtests after every epoch.')
+    parser.add_argument('--backtest-anchored-hits', action='store_true', help='Score the full validation calendar and run the original transformer HITS policy/shared-book engine after every epoch.')
     parser.add_argument('--once', action='store_true', help='Evaluate the latest complete epoch once; fail if none exists')
     args = parser.parse_args()
     command = json.loads(args.command_file.read_text())

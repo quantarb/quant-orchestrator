@@ -288,3 +288,11 @@ The portfolio uses strict rank >0.80 thresholds, top-20 capacity, allocation
 gate applies. These evaluation results do not update gradients or choose the
 saved checkpoint; checkpoint selection still uses training loss. Full-calendar
 inference/backtests add runtime and may contend with training for the GPU.
+
+The epoch portfolio policy was subsequently corrected to the original multi-rate
+transformer score adapter and shared-book engine (0.50 hub percentile plus
+direction agreement), rather than the separate anchored 0.80 authority policy.
+The latest section of `multirate-v6-backtest.md` records the exact call chain,
+original timing/accounting, and the distinction between original total_return
+and return from actual initial capital. This is the policy used for the 100B
+per-epoch backtests; no model training objectives were changed.
