@@ -419,3 +419,7 @@ from quant_orchestrator.monte_carlo import simulate_return_paths
 
 simulation = simulate_return_paths(returns, iterations=1000, horizon=252, block_size=5)
 ```
+
+The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
+within-step issuer encoding. See the [streaming milestone](docs/multirate-streaming-milestone.md) for the
+training contract, verification commands, and remaining real-data limits.

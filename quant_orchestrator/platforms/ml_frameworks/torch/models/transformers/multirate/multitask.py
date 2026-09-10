@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Hashable, Iterator, Mapping, Sequence
 
-import numpy as np
+import random
 import torch
 from torch import nn
 
@@ -48,7 +48,7 @@ class Corpus:
             for index, row in enumerate(self.rows):
                 groups.setdefault(self.batch_key(row), []).append(index)
             group_values = list(groups.values())
-            np.random.default_rng(seed + epoch).shuffle(group_values)
+            random.Random(seed + epoch).shuffle(group_values)
             pending: list[int] = []
             for group in group_values:
                 if pending and len(pending) + len(group) > self.batch_size:
@@ -67,28 +67,14 @@ class Corpus:
             if pending:
                 yield [self.rows[index] for index in pending]
             return
-        order = np.random.default_rng(seed + epoch).permutation(len(self.rows))
+        order = list(range(len(self.rows)))
+        random.Random(seed + epoch).shuffle(order)
         for start in range(0, len(order), self.batch_size):
             yield [self.rows[index] for index in order[start:start + self.batch_size]]
 
-    def batch_count(self) -> int:
-        if self.batch_key is None:
-            return (len(self.rows) + self.batch_size - 1) // self.batch_size
-        groups: dict[Hashable, int] = {}
-        for row in self.rows:
-            key = self.batch_key(row)
-            groups[key] = groups.get(key, 0) + 1
-        count = 0; pending = 0
-        for size in groups.values():
-            if size > self.batch_size:
-                if pending:
-                    count += 1; pending = 0
-                count += (size + self.batch_size - 1) // self.batch_size
-            elif pending and pending + size > self.batch_size:
-                count += 1; pending = size
-            else:
-                pending += size
-        return count + bool(pending)
+    def batch_count(self, *, seed: int = 0, epoch: int = 0) -> int:
+        # Packing depends on the shuffled group order; count that same order.
+        return sum(1 for _ in self.batches(seed=seed, epoch=epoch))
 
 
 CorpusTaskGroup = tuple[Corpus, tuple[Task, ...]]
@@ -164,7 +150,8 @@ class Trainer:
             for corpus, tasks in self.corpus_tasks
         ]
         pending = [item for group in grouped for item in group]
-        order = np.random.default_rng(self.seed + epoch).permutation(len(pending))
+        order = list(range(len(pending)))
+        random.Random(self.seed + epoch).shuffle(order)
         for index in order:
             yield pending[index]
 
@@ -184,7 +171,7 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             total = 0.0
             count = 0
-            total_batches = sum(corpus.batch_count() for corpus, _ in self.corpus_tasks)
+            total_batches = sum(corpus.batch_count(seed=self.seed, epoch=epoch) for corpus, _ in self.corpus_tasks)
             for step_index, (batch, tasks) in enumerate(self.batches(epoch)):
                 self.current_step = step_index
                 context = nullcontext()

@@ -205,3 +205,7 @@ Still missing:
 - Do not add live broker execution here.
 - Do not make the platform dependent on one ML framework or one backtesting engine.
 - Do not require every strategy to be implemented in every engine.
+
+The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
+within-step issuer encoding. See the [streaming milestone](multirate-streaming-milestone.md) for the
+training contract, verification commands, and remaining real-data limits.

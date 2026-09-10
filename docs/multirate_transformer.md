@@ -87,11 +87,11 @@ boundary. The training entry point also supports small physical batches with
 `--grad-accumulation-steps`, plus configurable `--d-model`, `--num-heads`, and
 `--layers`.
 
-The training entry point runs exactly these temporal tasks: family, industry,
-sector, subsector, and year document classification; next-token prediction for
-annual, quarterly, daily, and sparse rates; and masked-token prediction for
-those same four rates. Industry, sector, subsector, and year are labels on
-temporal documents; they do not create cross-sectional documents.
+The canonical training entry point includes document classification, Oracle/HITS
+supervision, and token/subtoken reconstruction and next-observation objectives.
+Actual supervision counts are recorded per task and asset class. The current
+issuer/instrument and bounded-memory contract is documented in
+[multirate-streaming-milestone.md](multirate-streaming-milestone.md).
 
 These are learned latent features for the supervised tasks; they are not
 persisted as an unbounded set of generated columns.

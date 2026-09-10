@@ -39,3 +39,7 @@ Current reusable code placement:
 - Context dimensions from `quant_warehouse.research_tools.build_security_context_panel` stay separate from model features. Use `attribute_model_scores` for score quality by year/sector/industry/regime and `attribute_strategy_returns` for additive gross, cost, and net contribution by the same dimensions.
 
 Notebook-only experiment glue should stay in the notebook until the same pattern is reused enough to justify package code.
+
+The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
+within-step issuer encoding. See the [streaming milestone](../docs/multirate-streaming-milestone.md) for the
+training contract, verification commands, and remaining real-data limits.

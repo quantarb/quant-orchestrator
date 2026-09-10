@@ -35,11 +35,13 @@ def _blocked_mask(
             device=device,
         )
     else:
-        if mask.ndim != 2 or mask.shape != (query_length, key_length):
+        if mask.ndim not in (2, 3) or mask.shape[-2:] != (query_length, key_length):
             raise ValueError("Transformer Engine masks must be [query, key]")
         blocked_2d = mask if mask.dtype == torch.bool else mask < 0
-        blocked = blocked_2d.to(torch.bool).view(1, 1, query_length, key_length)
-        blocked = blocked.expand(batch_size, 1, query_length, key_length)
+        if mask.ndim == 2:
+            blocked = blocked_2d.to(torch.bool).view(1, 1, query_length, key_length).expand(batch_size, 1, query_length, key_length)
+        else:
+            blocked = blocked_2d.to(torch.bool).reshape(batch_size, -1, query_length, key_length)
     if padding_mask is not None:
         if padding_mask.shape != (batch_size, key_length):
             raise ValueError("padding mask must be [batch, key]")
@@ -61,14 +63,14 @@ def _pad_attention_mask(
 ) -> torch.Tensor | None:
     if mask is None:
         return None
-    if mask.shape != (query_length, key_length):
+    if mask.shape[-2:] != (query_length, key_length):
         raise ValueError("Transformer Engine masks must be [query, key]")
     if (query_length, key_length) == (padded_query_length, padded_key_length):
         return mask
     padded = torch.ones(
-        (padded_query_length, padded_key_length), dtype=torch.bool, device=mask.device,
+        (*mask.shape[:-2], padded_query_length, padded_key_length), dtype=torch.bool, device=mask.device,
     )
-    padded[:query_length, :key_length] = mask.bool() if mask.dtype == torch.bool else mask < 0
+    padded[..., :query_length, :key_length] = mask.bool() if mask.dtype == torch.bool else mask < 0
     return padded
 
 

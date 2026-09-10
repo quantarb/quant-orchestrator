@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import copy
+import csv
+import resource
+from collections import Counter
 import json
 import math
 import os
@@ -23,6 +25,9 @@ import torch
 from torch import nn
 
 from quant_warehouse import Warehouse
+from quant_orchestrator.research_tools.streaming_context import StreamingContext
+from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision
+from quant_orchestrator.research_tools.multirate_objectives import next_observation_targets
 
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import (
     DOCUMENT_PROTOTYPE_STATS,
@@ -97,15 +102,63 @@ def _epoch_ns(value: object) -> int:
     return int(parsed.timestamp() * 1_000_000_000)
 
 
+def _date_expression(table: pl.DataFrame, column: str) -> pl.Expr:
+    value = pl.col(column)
+    if table.schema[column] == pl.String:
+        value = value.str.to_datetime(strict=False)
+    return value.cast(pl.Datetime, strict=False)
+
+
+def _normalization_stats(table, columns, *, cutoff=None, saved=None, symbols=None):
+    """Fit on historical rows only, or reuse a checkpoint without scanning data."""
+    if saved is not None:
+        mean, scale = saved
+        if len(mean) != len(columns) or len(scale) != len(columns):
+            raise ValueError("Checkpoint normalization dimensions do not match input columns")
+        if any(not math.isfinite(float(v)) for v in mean) or any(
+            not math.isfinite(float(v)) or float(v) <= 0 for v in scale
+        ):
+            raise ValueError("Checkpoint normalization must have finite means and positive scales")
+        return list(mean), list(scale)
+    values = table.lazy() if isinstance(table, pl.DataFrame) else table
+    if symbols is not None:
+        values = values.filter(pl.col("symbol").is_in(list(symbols)))
+    if cutoff is not None:
+        values = values.filter(pl.col("date") < _as_datetime(cutoff))
+    finite = [pl.when(pl.col(column).is_finite()).then(pl.col(column)) for column in columns]
+    stats = values.select(
+        *[value.mean().alias(f"mean_{i}") for i, value in enumerate(finite)],
+        *[value.std(ddof=0).alias(f"std_{i}") for i, value in enumerate(finite)],
+    ).collect(engine="streaming").row(0)
+    mean = [float(v) if v is not None and math.isfinite(float(v)) else 0.0 for v in stats[:len(columns)]]
+    scale = [float(v) if v is not None and math.isfinite(float(v)) and float(v) > 1e-6 else 1.0 for v in stats[len(columns):]]
+    return mean, scale
+
+
 def _is_missing(value: object) -> bool:
     return value is None or (isinstance(value, float) and math.isnan(value))
 
 
-def _encode_labels(values: pl.Series) -> tuple[torch.Tensor, list[str], dict[str, int]]:
+def _validate_inference_checkpoint(checkpoint):
+    missing = [name for name in ("normalization", "labels", "configuration")
+               if not isinstance(checkpoint.get(name), dict) or not checkpoint[name]]
+    normalization = checkpoint.get("normalization", {})
+    if isinstance(normalization, dict):
+        missing.extend(f"normalization.{rate}" for rate in ("annual", "quarterly", "daily", "sparse")
+                       if rate not in normalization)
+    if missing:
+        raise ValueError(
+            "Checkpoint lacks reproducible inference metadata: " + ", ".join(missing)
+            + ". Restore the exact training metadata or retrain with the current trainer; "
+            "normalization and label mappings cannot be fitted from live data."
+        )
+
+
+def _encode_labels(values: pl.Series, vocabulary=None) -> tuple[torch.Tensor, list[str], dict[str, int]]:
     normalized = values.cast(pl.String).fill_null("Unknown")
-    labels = sorted(normalized.unique().to_list())
+    labels = sorted(normalized.unique().to_list()) if vocabulary is None else list(vocabulary)
     mapping = {value: index for index, value in enumerate(labels)}
-    return torch.tensor([mapping[value] for value in normalized.to_list()], dtype=torch.long), labels, mapping
+    return torch.tensor([mapping.get(value, -100) for value in normalized.to_list()], dtype=torch.long), labels, mapping
 
 
 def _symbol_rows(table: pl.DataFrame, symbol: str) -> pl.DataFrame:
@@ -113,7 +166,7 @@ def _symbol_rows(table: pl.DataFrame, symbol: str) -> pl.DataFrame:
 
 
 def _read_parquet_polars(path: Path, columns: list[str] | None = None) -> pl.DataFrame:
-    """Read parquet with Polars streaming and keep it as a Polars table."""
+    """Collect a small metadata table (not a bounded-memory corpus reader)."""
     scan = pl.scan_parquet(path)
     if columns is not None:
         scan = scan.select(columns)
@@ -134,7 +187,11 @@ class _IndexedTable:
         ordered = table.sort(["symbol", "date"])
         for group in ordered.partition_by("symbol", maintain_order=True):
             symbol = str(group["symbol"][0]).upper()
-            dates = group["date"].cast(pl.Datetime, strict=False).cast(pl.Int64).to_torch().flatten()
+            # Convert explicitly to nanosecond epoch integers before crossing
+            # the Polars/Torch boundary.  Direct ``Datetime.to_torch()`` may
+            # rescale the values to microseconds, which would turn real dates
+            # into bogus 1970 prediction dates during inference.
+            dates = group["date"].cast(pl.Datetime, strict=False).dt.epoch("ns").to_torch().flatten()
             values = group.select(value_columns).fill_nan(None).fill_null(float("nan")).to_torch().to(torch.float32)
             targets = group[target_column].to_torch().to(torch.long) if target_column else None
             self.rows[symbol] = (dates, values, targets)
@@ -199,6 +256,9 @@ class _LazySample(dict):
         "annual", "annual_padding", "quarterly", "quarterly_padding",
         "daily", "daily_padding", "daily_dates", "sparse", "sparse_padding",
         "sparse_labels", "supervised_targets", "supervised_valid",
+        "annual_timestamps", "quarterly_timestamps", "daily_timestamps", "sparse_timestamps",
+        "issuer_daily", "issuer_daily_padding", "issuer_daily_timestamps",
+        "issuer_sparse", "issuer_sparse_padding", "issuer_sparse_timestamps",
     })
 
     def __init__(self, metadata: dict[str, object], factory):
@@ -210,6 +270,11 @@ class _LazySample(dict):
         if not self._loaded:
             super().update(self._factory())
             self._loaded = True
+
+    def release(self):
+        for key in self._LAZY_KEYS:
+            self.pop(key, None)
+        self._loaded = False
 
     def __getitem__(self, key):
         if key in self._LAZY_KEYS:
@@ -228,12 +293,12 @@ def _canonical_issuer_key(profile: object | None, symbol: str) -> str:
 
 
 def _window(table: pl.DataFrame, symbol: str, anchor: datetime, value_columns: list[str], length: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if isinstance(table, _IndexedTable):
+    if isinstance(table, (_IndexedTable, StreamingContext)):
         values, padding, dates, _ = table.window(symbol, anchor, length)
         return values, padding, dates
     rows = _symbol_rows(table, symbol).filter(pl.col("date") <= _as_datetime(anchor)).tail(length)
     values = rows.select(value_columns).fill_nan(None).fill_null(float("nan")).to_torch().to(torch.float32) if len(rows) else torch.empty((0, len(value_columns)), dtype=torch.float32)
-    dates = rows["date"].cast(pl.Datetime, strict=False).cast(pl.Int64).to_torch().flatten() if len(rows) else torch.empty(0, dtype=torch.long)
+    dates = rows["date"].cast(pl.Datetime, strict=False).dt.epoch("ns").to_torch().flatten() if len(rows) else torch.empty(0, dtype=torch.long)
     padding = torch.ones(length, dtype=torch.bool)
     output = torch.full((length, len(value_columns)), float("nan"), dtype=torch.float32)
     if len(rows):
@@ -243,7 +308,7 @@ def _window(table: pl.DataFrame, symbol: str, anchor: datetime, value_columns: l
 
 
 def _sparse_window(table: pl.DataFrame, symbol: str, anchor: datetime, value_columns: list[str], length: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if isinstance(table, _IndexedTable):
+    if isinstance(table, (_IndexedTable, StreamingContext)):
         values, padding, dates, targets = table.window(symbol, anchor, length)
         labels = torch.full((length,), -1, dtype=torch.long)
         if targets is not None and len(targets):
@@ -258,7 +323,7 @@ def _sparse_window(table: pl.DataFrame, symbol: str, anchor: datetime, value_col
         values[-len(rows):] = rows.select(value_columns).fill_nan(None).fill_null(float("nan")).to_torch().to(torch.float32)
         labels[-len(rows):] = rows["target_id"].to_torch().to(torch.long)
         padding[-len(rows):] = False
-        dates = rows["date"].cast(pl.Datetime, strict=False).cast(pl.Int64).to_torch().flatten()
+        dates = rows["date"].cast(pl.Datetime, strict=False).dt.epoch("ns").to_torch().flatten()
     return values, padding, labels, dates
 
 
@@ -289,7 +354,7 @@ def _add_option_state_features(
     options = option_panel
     options = options.with_columns(
         pl.col("symbol").cast(pl.String).str.to_uppercase().str.strip_chars(),
-        pl.col("entry_date").cast(pl.Datetime, strict=False).dt.truncate("1d"),
+        _date_expression(options, "entry_date").dt.truncate("1d"),
         pl.col("option_type").cast(pl.String).str.to_lowercase().str.strip_chars(),
     ).filter(pl.col("symbol").is_not_null() & pl.col("entry_date").is_not_null())
     if max_contracts_per_type > 0:
@@ -352,7 +417,7 @@ def _add_option_state_features(
         pl.col("symbol").cast(pl.String).str.to_uppercase().str.strip_chars(),
         pl.col("date").cast(pl.Datetime, strict=False).dt.truncate("1d"),
     ).sort(["symbol", "date"])
-    daily = daily.join(state, on=["symbol", "date"], how="left", suffix="_option")
+    daily = daily.join(state.lazy() if isinstance(daily, pl.LazyFrame) else state, on=["symbol", "date"], how="left", suffix="_option")
     daily = daily.with_columns([
         pl.col(column).forward_fill().over("symbol").cast(pl.Float32).alias(column)
         for column in option_columns
@@ -377,10 +442,10 @@ def _issuer_dte_bin_option_panel(
     issuer_map = dict(zip(taxonomy["symbol"].to_list(), taxonomy["issuer"].to_list()))
     result = panel.with_columns(
         pl.col("underlying_symbol").cast(pl.String).str.to_uppercase().str.strip_chars(),
-        pl.col("entry_date").cast(pl.Datetime, strict=False).dt.truncate("1d"),
+        _date_expression(panel, "entry_date").dt.truncate("1d"),
         pl.col("dte").cast(pl.Int64, strict=False),
     ).with_columns(
-        pl.col("underlying_symbol").replace(issuer_map, default=None).alias("_issuer"),
+        pl.col("underlying_symbol").replace_strict(issuer_map, default=None).alias("_issuer"),
         (pl.col("entry_bid") if "entry_bid" in panel.columns else pl.col("bid")).cast(pl.Float64, strict=False).alias("_bid"),
         (pl.col("entry_ask") if "entry_ask" in panel.columns else pl.col("ask")).cast(pl.Float64, strict=False).alias("_ask"),
         (pl.col("dte_contract_count") if "dte_contract_count" in panel.columns else pl.lit(1.0)).cast(pl.Float64, strict=False).fill_null(1.0).alias("_weight"),
@@ -521,8 +586,9 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, help="Load an existing multirate_mtl_model.pt for inference without optimizer steps.")
     parser.add_argument("--inference-only", action="store_true", help="Skip training and export predictions from --checkpoint.")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument(
         "--progress-every-batches", type=int, default=100,
         help="Print training progress every N batches; 0 disables batch progress logging.",
@@ -568,13 +634,14 @@ def main() -> None:
     )
     parser.add_argument("--compile-model", action="store_true", help="Compile the model with torch.compile.")
     parser.add_argument("--optimizer", choices=("adamw", "adamw8bit"), default="adamw")
-    parser.add_argument("--skip-embeddings", action="store_true", help="Do not retain or write evaluation embeddings.")
+    parser.add_argument("--skip-embeddings", action="store_true", default=True, help="Do not retain or write evaluation embeddings.")
     parser.add_argument("--skip-t-sne", action="store_true", help="Skip prototype t-SNE generation.")
     parser.add_argument("--skip-predictions", action="store_true", help="Do not export daily supervised-head predictions.")
     parser.add_argument("--train-end-date", help="Train only on document anchors before this YYYY-MM-DD date.")
     parser.add_argument("--train-symbols-file", type=Path, help="CSV of symbols permitted for training.")
     parser.add_argument("--test-symbols-file", type=Path, help="CSV of symbols reserved for evaluation.")
     parser.add_argument("--prediction-start-date", help="Export daily supervised-head scores on and after this YYYY-MM-DD date.")
+    parser.add_argument("--prediction-end-date", help="Optional inclusive final scoring date.")
     parser.add_argument("--option-panel", type=Path, help="Optional entry-time option candidate panel to add as-of daily state features.")
     parser.add_argument("--option-target-events", type=Path, help="Option-native HITS/Oracle sparse targets generated from bid/ask baskets.")
     parser.add_argument("--option-max-contracts", type=int, default=32, help="Per-symbol/date/type option rows retained by volume before aggregation; 0 keeps all rows.")
@@ -603,7 +670,7 @@ def main() -> None:
         help="Build and cache all samples, write cache metrics, then stop before model construction (benchmarking only).",
     )
     parser.add_argument(
-        "--stream-samples", action="store_true",
+        "--stream-samples", action="store_true", default=True,
         help="Keep sample metadata in memory and materialize rate arrays only per batch.",
     )
     parser.add_argument(
@@ -612,8 +679,15 @@ def main() -> None:
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    torch.manual_seed(args.seed)
+    if args.context_memmap_dir is not None:
+        parser.error("--context-memmap-dir is obsolete; bounded Polars windows use --context-cache-size")
     if args.inference_only and args.checkpoint is None:
         parser.error("--inference-only requires --checkpoint")
+    if args.option_panel is not None or args.option_target_events is not None:
+        parser.error("Prepare instrument observations and targets in the corpus before training; in-memory option-panel assembly is disabled")
+    if args.validation_fraction:
+        parser.error("Use --train-end-date for an explicit chronological holdout; fraction-based preprocessing is not supported")
     if args.skip_predictions:
         args.prediction_start_date = None
     mrl_dimensions = tuple(sorted({int(value) for value in args.mrl_dimensions.split(",") if value.strip()}, key=int))
@@ -648,7 +722,10 @@ def main() -> None:
     checkpoint_payload = None
     if args.inference_only and args.checkpoint is not None:
         checkpoint_payload = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        _validate_inference_checkpoint(checkpoint_payload)
         checkpoint_metrics = checkpoint_payload.get("metrics", {}) if isinstance(checkpoint_payload, dict) else {}
+        if checkpoint_metrics.get("feature_families") != feature_families:
+            raise ValueError("Corpus feature-family order does not match the checkpoint")
         # The checkpoint defines the sparse target schema used by its task
         # heads. Fresh live data may contain only a subset of those events.
         target_families = list(checkpoint_metrics.get("target_families", target_families))
@@ -658,12 +735,12 @@ def main() -> None:
     # Presence columns are useful for corpus diagnostics but are not model
     # inputs.  Avoid materializing them for the large 10B corpus.
     rate_columns = ["symbol", "date", *[f"value__{family}" for family in feature_families]]
-    annual = _read_parquet_polars(root / "annual.parquet", rate_columns)
-    quarterly = _read_parquet_polars(root / "quarterly.parquet", rate_columns)
-    daily = _read_parquet_polars(root / "daily.parquet", rate_columns)
+    annual = pl.scan_parquet(root / "annual.parquet").select(rate_columns)
+    quarterly = pl.scan_parquet(root / "quarterly.parquet").select(rate_columns)
+    daily = pl.scan_parquet(root / "daily.parquet").select(rate_columns)
     sparse_path = root / "sparse_events.parquet"
     if sparse_path.exists():
-        sparse = _read_parquet_polars(sparse_path)
+        sparse = pl.scan_parquet(sparse_path)
     else:
         sparse = pl.DataFrame({
             "symbol": pl.Series([], dtype=pl.String),
@@ -673,6 +750,8 @@ def main() -> None:
             "signal_value": pl.Series([], dtype=pl.Float32),
             **{f"text_{i}": pl.Series([], dtype=pl.Float32) for i in range(7)},
         })
+    if isinstance(sparse, pl.DataFrame):
+        sparse = sparse.lazy()
     # Apply a frozen DTE selection before normalization/index construction.
     # Otherwise a DTE-105 run needlessly scans every synthetic option symbol
     # in the full daily table.
@@ -706,7 +785,7 @@ def main() -> None:
     if args.option_target_events is not None:
         option_events = _read_parquet_polars(args.option_target_events)
         if not option_events.is_empty():
-            option_symbols = set(option_events["symbol"].astype(str).str.upper())
+            option_symbols = set(option_events["symbol"].cast(pl.String).str.to_uppercase().to_list())
             sparse_symbols = pl.col("symbol").cast(pl.String).str.to_uppercase()
             replace_families = {"equity.strategy.hits_graph", "equity.strategy.oracle_trades"}
             sparse = sparse.filter(~(sparse_symbols.is_in(list(option_symbols)) & pl.col("target_family").is_in(list(replace_families))))
@@ -743,6 +822,9 @@ def main() -> None:
     option_document_symbols: set[str] = set()
     option_document_start_dates: dict[str, datetime] = {}
     source_symbol_by_symbol: dict[str, str] = {}
+    if "underlying_symbol" in taxonomy.columns:
+        source_symbol_by_symbol = dict(taxonomy.select("symbol", "underlying_symbol").iter_rows())
+        option_document_symbols = {symbol for symbol, source in source_symbol_by_symbol.items() if symbol != source}
     option_entry_anchors = pl.DataFrame({"symbol": pl.Series([], dtype=pl.String), "date": pl.Series([], dtype=pl.Datetime)})
     if args.option_panel is not None:
         option_panel = issuer_quartile_panel if issuer_quartile_panel is not None else _read_parquet_polars(args.option_panel)
@@ -797,57 +879,35 @@ def main() -> None:
                 synthetic_taxonomy_rows.append(row)
         if synthetic_taxonomy_rows:
             taxonomy = pl.concat([taxonomy, pl.DataFrame(synthetic_taxonomy_rows)], how="vertical_relaxed")
-    if "event_date" in sparse:
+    if "event_date" in sparse.collect_schema().names():
         sparse = sparse.with_columns(pl.col("event_date").cast(pl.Datetime, strict=False).dt.truncate("1d"))
 
     # Derived target labels are supervised at their original event date. Their
     # delayed availability remains in ``date`` and therefore keeps them out
     # of the input context at the prediction date.
-    supervised_target_map: dict[tuple[str, datetime], dict[str, float]] = {}
-    if "event_date" in sparse:
-        target_channels = ["signal_value", *[f"text_{i}" for i in range(7)]]
-        supervised_rows = sparse.filter(pl.col("target_family").is_in([
-            "equity.strategy.hits_graph", "equity.strategy.oracle_trades",
-        ])).iter_rows(named=True)
-        for row in supervised_rows:
-            event_date = row.get("event_date")
-            if _is_missing(event_date):
-                continue
-            key = (str(row["symbol"]).upper(), _as_datetime(event_date))
-            values = {channel: float(row[channel]) for channel in target_channels if not _is_missing(row.get(channel))}
-            target_family = str(row["target_family"])
-            targets = supervised_target_map.setdefault(key, {})
-            if target_family == "equity.strategy.hits_graph":
-                for task_name, channel in zip(HITS_SUPERVISED_TASK_NAMES, target_channels):
-                    if channel in values:
-                        targets[task_name] = max(targets.get(task_name, float("-inf")), values[channel])
-            else:
-                for task_name, channel in zip(ORACLE_SUPERVISED_TASK_NAMES, target_channels[:4]):
-                    if channel in values:
-                        targets[task_name] = max(targets.get(task_name, 0.0), values[channel])
-            if target_family.startswith("fund_activity."):
-                activity_name = target_family.removeprefix("fund_activity.")
-                task_name = f"fund_activity_{activity_name}"
-            if task_name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES:
-                targets[task_name] = max(targets.get(task_name, 0.0), values.get("signal_value", 0.0))
-            if target_family.startswith("holder_activity."):
-                activity_name = target_family.removeprefix("holder_activity.")
-                task_name = f"holder_activity_{activity_name}"
-                if task_name in HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES:
-                    targets[task_name] = max(targets.get(task_name, 0.0), values.get("signal_value", 0.0))
+    supervised_target_map = StreamingSupervision(
+        sparse, cutoff=_as_datetime(args.train_end_date) if args.train_end_date else None,
+    )
+    if not args.inference_only:
+        coverage = supervised_target_map.coverage(
+            equity_symbols=set(taxonomy["symbol"].to_list()) - option_document_symbols,
+            option_symbols=option_document_symbols,
+            required_tasks=(*ORACLE_SUPERVISED_TASK_NAMES, *HITS_SUPERVISED_TASK_NAMES),
+        )
+        (output_dir / "supervision_coverage.json").write_text(json.dumps(coverage, indent=2))
+        print(f"[supervision] {coverage}", flush=True)
 
     daily_value_columns = [f"value__{family}" for family in feature_families]
     if option_columns:
         daily_value_columns.extend(option_columns)
     annual_value_columns = daily_value_columns
     quarterly_value_columns = daily_value_columns
-    sparse = sparse.sort(["symbol", "date", "event_date"] if "event_date" in sparse.columns else ["symbol", "date"])
-    # Multiple same-day disclosures become one sparse token while retaining
-    # the first available family and the mean numeric/text representation.
-    sparse = sparse.with_columns(pl.col("target_family").replace({name: i for i, name in enumerate(target_families)}, default=None).cast(pl.Int64).alias("target_id"))
+    # Preserve endpoint identity when multiple families occur on one date.
+    sparse = sparse.with_columns(pl.col("target_family").replace_strict(
+        {name: i for i, name in enumerate(target_families)}, default=None,
+    ).cast(pl.Int64).alias("target_id"))
     sparse_value_columns = ["signal_value", *[f"text_{i}" for i in range(7)]]
-    sparse = sparse.group_by(["symbol", "date"], maintain_order=True).agg(
-        pl.col("target_family").first(), pl.col("target_id").first(),
+    sparse = sparse.group_by(["symbol", "date", "target_family", "target_id"]).agg(
         *[pl.col(column).mean().alias(column) for column in sparse_value_columns],
     )
 
@@ -855,33 +915,32 @@ def main() -> None:
     # retaining NaN for coverage-aware missingness handling.
     rate_columns = {"annual": annual_value_columns, "quarterly": quarterly_value_columns, "daily": daily_value_columns}
     norms: dict[str, tuple[list[float], list[float]]] = {}
+    normalized_tables = {}
+    saved_norms = checkpoint_payload.get("normalization", {}) if checkpoint_payload else {}
+    normalization_symbols = None
+    if args.train_symbols_file:
+        selected = pl.read_csv(args.train_symbols_file)
+        column = "symbol" if "symbol" in selected.columns else selected.columns[0]
+        normalization_symbols = set(selected[column].cast(pl.String).str.to_uppercase().str.strip_chars())
     for name, columns in rate_columns.items():
-        values = pl.concat(
-            [table.select(columns) for table in (annual, quarterly, daily)],
-            how="vertical_relaxed",
+        table = {"annual": annual, "quarterly": quarterly, "daily": daily}[name]
+        mean, scale = _normalization_stats(
+            table, columns, cutoff=args.train_end_date, saved=saved_norms.get(name),
+            symbols=({source_symbol_by_symbol.get(symbol, symbol) for symbol in normalization_symbols} if normalization_symbols is not None and name in {"annual", "quarterly"} else normalization_symbols),
         )
-        stats = values.select(
-            *[pl.col(column).fill_nan(None).mean().alias(f"mean_{column}") for column in columns],
-            *[pl.col(column).fill_nan(None).std(ddof=0).alias(f"std_{column}") for column in columns],
-        ).row(0)
-        mean = [0.0 if value is None or not math.isfinite(float(value)) else float(value) for value in stats[:len(columns)]]
-        scale = [float(value) if value is not None and math.isfinite(float(value)) and float(value) > 1e-6 else 1.0 for value in stats[len(columns):]]
         norms[name] = (mean, scale)
         # Keep normalization in Polars; the model boundary receives only the
         # resulting per-window tensors later.
-        normalized = []
-        for table in (annual, quarterly, daily):
-            normalized.append(table.with_columns([
-                ((pl.col(column).cast(pl.Float32) - float(mean[index])) / float(scale[index])).alias(column)
-                for index, column in enumerate(columns)
-            ]))
-        annual, quarterly, daily = normalized
-    sparse_stats = sparse.select(
-        pl.col("signal_value").fill_nan(None).mean().alias("_sparse_mean"),
-        pl.col("signal_value").fill_nan(None).std(ddof=0).alias("_sparse_std"),
-    ).row(0)
-    sparse_mean = float(sparse_stats[0]) if sparse_stats[0] is not None else 0.0
-    sparse_scale = float(sparse_stats[1]) if sparse_stats[1] not in (None, 0.0) else 1.0
+        normalized_tables[name] = table.with_columns([
+            ((pl.col(column).cast(pl.Float32) - float(mean[index])) / float(scale[index])).alias(column)
+            for index, column in enumerate(columns)
+        ])
+    annual, quarterly, daily = (normalized_tables[name] for name in ("annual", "quarterly", "daily"))
+    sparse_mean_values, sparse_scale_values = _normalization_stats(
+        sparse, ["signal_value"], cutoff=args.train_end_date, saved=saved_norms.get("sparse"), symbols=normalization_symbols,
+    )
+    norms["sparse"] = (sparse_mean_values, sparse_scale_values)
+    sparse_mean, sparse_scale = sparse_mean_values[0], sparse_scale_values[0]
     sparse = sparse.with_columns(((pl.col("signal_value").cast(pl.Float32) - sparse_mean) / sparse_scale).alias("signal_value"))
     raw_sparse_columns = ["signal_value", *[f"text_{i}" for i in range(7)]]
     sparse_value_columns: list[str] = []
@@ -900,28 +959,21 @@ def main() -> None:
                 .alias(output_column)
             )
             sparse_value_columns.append(output_column)
-    sparse = sparse.with_columns(sparse_wide.select(sparse_wide_columns))
+    sparse = sparse.with_columns(sparse_wide_columns)
 
     # Build immutable columnar indexes once. All subsequent sample windows use
     # these arrays instead of repeatedly filtering Pandas frames.
-    if args.context_memmap_dir and (args.context_memmap_dir / "annual_index.json").exists():
-        annual_index = _IndexedTable.from_memmap(args.context_memmap_dir, "annual")
-        quarterly_index = _IndexedTable.from_memmap(args.context_memmap_dir, "quarterly")
-        daily_index = _IndexedTable.from_memmap(args.context_memmap_dir, "daily")
-        sparse_index = _IndexedTable.from_memmap(args.context_memmap_dir, "sparse")
-    else:
-        annual_index = _IndexedTable(annual, annual_value_columns)
-        quarterly_index = _IndexedTable(quarterly, quarterly_value_columns)
-        daily_index = _IndexedTable(daily, daily_value_columns)
-        sparse_index = _IndexedTable(sparse, sparse_value_columns, target_column="target_id")
-        if args.context_memmap_dir:
-            for name, index in (("annual", annual_index), ("quarterly", quarterly_index), ("daily", daily_index), ("sparse", sparse_index)):
-                index.save_memmap(args.context_memmap_dir, name)
+    # Feature histories stay lazy. Never concatenate the corpus into tensors
+    # or trust a potentially stale normalized context cache from another fit.
+    annual_index = StreamingContext(annual, annual_value_columns)
+    quarterly_index = StreamingContext(quarterly, quarterly_value_columns)
+    daily_index = StreamingContext(daily, daily_value_columns)
+    sparse_index = StreamingContext(sparse, sparse_value_columns, target_column="target_id")
 
     # A document can be anchored by a regular annual observation or by a
     # sparse event.  Using their union preserves early event history even
     # when annual fundamentals begin later for a symbol.
-    anchor_parts = [annual.select(["symbol", "date"]), sparse.select(["symbol", "date"])]
+    anchor_parts = [annual.select(["symbol", "date"]).collect(engine="streaming"), sparse.select(["symbol", "date"]).collect(engine="streaming")]
     if option_document_symbols:
         anchor_parts.append(option_entry_anchors)
     if option_target_map:
@@ -935,7 +987,7 @@ def main() -> None:
     # but that reduction would otherwise discard a current EOD scoring date.
     if args.inference_only and args.prediction_start_date and args.prediction_start_date != "1900-01-01":
         requested_anchor_date = _as_datetime(args.prediction_start_date)
-        exact_daily_anchors = daily.filter(pl.col("date") == requested_anchor_date).select(["symbol", "date"])
+        exact_daily_anchors = daily.filter(pl.col("date") >= requested_anchor_date).select(["symbol", "date"]).collect(engine="streaming")
         anchors = pl.concat([anchors, exact_daily_anchors], how="diagonal_relaxed").unique().sort(["symbol", "date"])
     anchors = anchors.with_columns(pl.col("date").dt.year().alias("year"))
     target_pairs = list(option_target_map)
@@ -951,10 +1003,20 @@ def main() -> None:
         anchors = pl.concat([regular_anchors, option_daily_anchors, option_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
     else:
         anchors = pl.concat([regular_anchors, option_daily_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
+    # Supervised losses use the final token at its own event date. Earlier
+    # tokens in an annual document can see issuer memory from the anchor.
+    if supervised_target_map:
+        event_anchors = supervised_target_map.anchors()
+        anchors = pl.concat([anchors, event_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
     if args.inference_only and args.prediction_start_date and args.prediction_start_date != "1900-01-01":
         requested_anchor_date = _as_datetime(args.prediction_start_date)
-        exact_daily_anchors = daily.filter(pl.col("date") == requested_anchor_date).select(["symbol", "date"])
+        exact_daily_anchors = daily.filter(pl.col("date") >= requested_anchor_date).select(["symbol", "date"]).collect(engine="streaming")
         anchors = pl.concat([anchors, exact_daily_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
+    if args.inference_only:
+        if args.prediction_start_date:
+            anchors = anchors.filter(pl.col("date") >= _as_datetime(args.prediction_start_date))
+        if args.prediction_end_date:
+            anchors = anchors.filter(pl.col("date") <= _as_datetime(args.prediction_end_date))
     empty_annual = annual.head(0)
     empty_quarterly = quarterly.head(0)
     empty_daily = daily.head(0)
@@ -991,6 +1053,8 @@ def main() -> None:
 
     def rate_version(rate: str, table, source: str, anchor: datetime) -> int:
         if rate in {"annual", "quarterly"}:
+            if isinstance(table, StreamingContext):
+                return table.version(source, anchor)
             if isinstance(table, _IndexedTable):
                 dates = table.rows.get(str(source).upper(), (torch.empty(0, dtype=torch.long), None, None))[0]
                 stop = int(torch.searchsorted(dates, torch.tensor(_epoch_ns(anchor), dtype=torch.long), right=True))
@@ -1028,21 +1092,36 @@ def main() -> None:
             continue
         source_symbol = source_symbol_by_symbol.get(symbol, symbol)
         def materialize(current_symbol=symbol, current_anchor=anchor, current_source=source_symbol):
-            annual_values, annual_padding, _ = cached_window("annual", annual_index, current_symbol, current_anchor, annual_value_columns, ANNUAL_WINDOW, current_source)
-            quarterly_values, quarterly_padding, _ = cached_window("quarterly", quarterly_index, current_symbol, current_anchor, quarterly_value_columns, QUARTERLY_WINDOW, current_source)
-            daily_values, daily_padding, daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_source)
+            annual_values, annual_padding, annual_dates = cached_window("annual", annual_index, current_symbol, current_anchor, annual_value_columns, ANNUAL_WINDOW, current_source)
+            quarterly_values, quarterly_padding, quarterly_dates = cached_window("quarterly", quarterly_index, current_symbol, current_anchor, quarterly_value_columns, QUARTERLY_WINDOW, current_source)
+            daily_values, daily_padding, daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_symbol)
             sparse_values, sparse_padding, sparse_labels, sparse_dates = cached_sparse_window(current_symbol, current_anchor)
+            issuer_daily, issuer_daily_padding, issuer_daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_source)
+            issuer_sparse, issuer_sparse_padding, _, issuer_sparse_dates = cached_sparse_window(current_source, current_anchor)
             supervised_targets = torch.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.float32)
             supervised_valid = torch.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.bool)
             if len(daily_dates):
                 offset = DAILY_WINDOW - len(daily_dates)
                 for position, date in enumerate(daily_dates):
-                    values = supervised_target_map.get((current_symbol, _as_datetime(date)), {})
+                    values = supervised_target_map.get((current_symbol, _as_datetime(date)), {}) if _as_datetime(date) == current_anchor else {}
                     for task_index, task_name in enumerate(SUPERVISED_TARGET_TASK_NAMES):
                         if task_name in values:
                             supervised_targets[offset + position, task_index] = values[task_name]
                             supervised_valid[offset + position, task_index] = True
+            def timestamps(dates, length):
+                result = torch.full((length,), torch.iinfo(torch.long).min, dtype=torch.long)
+                if len(dates):
+                    result[-len(dates):] = dates
+                return result
             return {
+                "issuer_daily": issuer_daily, "issuer_daily_padding": issuer_daily_padding,
+                "issuer_daily_timestamps": timestamps(issuer_daily_dates, DAILY_WINDOW),
+                "issuer_sparse": issuer_sparse, "issuer_sparse_padding": issuer_sparse_padding,
+                "issuer_sparse_timestamps": timestamps(issuer_sparse_dates, 16),
+                "annual_timestamps": timestamps(annual_dates, ANNUAL_WINDOW),
+                "quarterly_timestamps": timestamps(quarterly_dates, QUARTERLY_WINDOW),
+                "daily_timestamps": timestamps(daily_dates, DAILY_WINDOW),
+                "sparse_timestamps": timestamps(sparse_dates, 16),
                 "annual": annual_values, "annual_padding": annual_padding,
                 "quarterly": quarterly_values, "quarterly_padding": quarterly_padding,
                 "daily": daily_values, "daily_padding": daily_padding,
@@ -1053,6 +1132,8 @@ def main() -> None:
         metadata = {
             "symbol": symbol, "date": anchor.strftime("%Y-%m-%d"),
             "issuer": str(taxonomy_by_symbol[symbol]["issuer"]),
+            "asset_class": str(taxonomy_by_symbol[symbol].get("asset_class") or ("option" if symbol in option_document_symbols else "equity")),
+            "issuer_context_key": (source_symbol, _epoch_ns(anchor)),
             "annual_context_key": (source_symbol, rate_version("annual", annual_index, source_symbol, anchor)),
             "quarterly_context_key": (source_symbol, rate_version("quarterly", quarterly_index, source_symbol, anchor)),
             "sector": str(taxonomy_by_symbol[symbol]["sector"]), "subsector": str(taxonomy_by_symbol[symbol]["subsector"]),
@@ -1066,17 +1147,42 @@ def main() -> None:
     if args.max_samples:
         if args.max_samples < 1:
             parser.error("--max-samples must be positive when provided")
-        samples = sorted(samples, key=lambda item: (_as_datetime(item["date"]), str(item["symbol"])))[:args.max_samples]
+        ordered_samples = sorted(samples, key=lambda item: (_as_datetime(item["date"]), str(item["symbol"])))
+        count = min(args.max_samples, len(ordered_samples))
+        indices = [round(i * (len(ordered_samples) - 1) / max(1, count - 1)) for i in range(count)]
+        chosen = {(ordered_samples[i]["symbol"], ordered_samples[i]["date"]): ordered_samples[i] for i in indices}
+        if not args.inference_only:
+            rare = supervised_target_map.scan.filter(pl.any_horizontal(pl.col(name).is_not_null() for name in ORACLE_SUPERVISED_TASK_NAMES)).select("symbol", "date").collect(engine="streaming")
+            required = {(row[0], row[1].strftime("%Y-%m-%d")) for row in rare.iter_rows()}
+            last_by_symbol = {}
+            for item in ordered_samples:
+                if not args.train_end_date or item["date"] < args.train_end_date:
+                    last_by_symbol[item["symbol"]] = item
+            required.update((item["symbol"], item["date"]) for item in last_by_symbol.values())
+            for item in ordered_samples:
+                key = (item["symbol"], item["date"])
+                if key in required:
+                    chosen[key] = item
+            if len(required) > args.max_samples:
+                raise ValueError("--max-samples is too small to retain required supervised and final historical anchors")
+            optional = [key for key in chosen if key not in required]
+            for key in optional[max(0, args.max_samples - len(required)):]:
+                del chosen[key]
+        samples = sorted(chosen.values(), key=lambda item: (item["date"], item["symbol"]))
     frame = pl.DataFrame([{key: value for key, value in sample.items() if isinstance(value, (str, int))} for sample in samples])
     label_arrays: dict[str, torch.Tensor] = {}
     label_names: dict[str, list[str]] = {}
+    checkpoint_labels = checkpoint_payload.get("labels", {}) if checkpoint_payload else {}
+    label_fit_frame = frame
+    if args.train_end_date and not args.inference_only:
+        label_fit_frame = label_fit_frame.filter(pl.col("date") < args.train_end_date)
+    if normalization_symbols is not None:
+        label_fit_frame = label_fit_frame.filter(pl.col("symbol").is_in(list(normalization_symbols)))
     for task in DOCUMENT_TASK_NAMES[1:]:
-        label_arrays[task], label_names[task], _ = _encode_labels(frame[task])
-    if checkpoint_payload is not None and isinstance(checkpoint_payload.get("labels"), dict):
-        checkpoint_labels = checkpoint_payload["labels"]
-        for task in DOCUMENT_TASK_NAMES[1:]:
-            if task in checkpoint_labels:
-                label_names[task] = list(checkpoint_labels[task])
+        vocabulary = checkpoint_labels.get(task)
+        if vocabulary is None:
+            _, vocabulary, _ = _encode_labels(label_fit_frame[task])
+        label_arrays[task], label_names[task], _ = _encode_labels(frame[task], vocabulary)
     if option_columns:
         feature_families = [*feature_families, "options"]
     feature_family_dimensions = {family: 1 for family in feature_families if family != "options"}
@@ -1105,18 +1211,22 @@ def main() -> None:
     if train_symbols is not None and test_symbols is not None and train_symbols & test_symbols:
         raise ValueError("train and test symbol files overlap")
     evaluation_samples = samples
+    if args.train_end_date and not args.inference_only:
+        evaluation_samples = [sample for sample in samples if _as_datetime(sample["date"]) >= _as_datetime(args.train_end_date)]
     if test_symbols is not None:
         evaluation_samples = [sample for sample in samples if str(sample["symbol"]).upper() in test_symbols]
         if not evaluation_samples:
             raise ValueError("test symbol file does not match any corpus samples")
+    if args.prediction_end_date:
+        evaluation_samples = [sample for sample in evaluation_samples if _as_datetime(sample["date"]) <= _as_datetime(args.prediction_end_date)]
     if args.inference_only:
         if args.prediction_start_date and args.prediction_start_date != "1900-01-01":
             requested_date = _as_datetime(args.prediction_start_date)
-            evaluation_samples = [sample for sample in evaluation_samples if _as_datetime(sample["date"]) == requested_date]
+            evaluation_samples = [sample for sample in evaluation_samples if _as_datetime(sample["date"]) >= requested_date]
             if not evaluation_samples:
                 raise ValueError(f"No feature samples exist for requested inference date {requested_date.date()}")
             symbols_on_date = {str(sample["symbol"]).upper() for sample in evaluation_samples}
-            print(f"[multirate-inference] exact-date evaluation set: {len(symbols_on_date)} symbols on {requested_date.date()}", flush=True)
+            print(f"[multirate-inference] daily evaluation set: {len(evaluation_samples)} anchors, {len(symbols_on_date)} symbols from {requested_date.date()}", flush=True)
         else:
             latest_by_symbol: dict[str, dict[str, object]] = {}
             for sample in evaluation_samples:
@@ -1132,7 +1242,7 @@ def main() -> None:
         raise ValueError("train symbol file does not match any corpus samples")
     if args.train_end_date:
         train_end = _as_datetime(args.train_end_date)
-        train_samples = [sample for sample in samples if _as_datetime(sample["date"]) < train_end]
+        train_samples = [sample for sample in train_samples if _as_datetime(sample["date"]) < train_end]
         if not train_samples:
             raise ValueError(f"no training samples exist before {args.train_end_date}")
 
@@ -1171,6 +1281,11 @@ def main() -> None:
     # different width or depth.  Prefer explicit metadata and fall back to
     # the state-dict shapes for older checkpoints.
     if checkpoint_payload is not None:
+        saved_configuration = checkpoint_payload.get("configuration", {})
+        for key in ("d_model", "num_heads", "layers", "learned_aggregation_gate", "legacy_rate_fusion", "attention_backend", "disable_document_tasks"):
+            if key in saved_configuration:
+                setattr(args, key, saved_configuration[key])
+        enabled_document_tasks = () if args.disable_document_tasks else DOCUMENT_TASK_NAMES
         checkpoint_metrics = checkpoint_payload.get("metrics", {}) if isinstance(checkpoint_payload, dict) else {}
         state_dict = checkpoint_payload.get("state_dict", {}) if isinstance(checkpoint_payload, dict) else {}
         checkpoint_width = checkpoint_metrics.get("d_model")
@@ -1214,6 +1329,9 @@ def main() -> None:
     if mrl_dimensions:
         active_tasks = (*active_tasks, Task("mrl", spec="matryoshka_document_alignment", loss_weight=args.mrl_weight))
     expected_task_names = tuple(enabled_document_tasks) + SUPERVISED_TARGET_TASK_NAMES + PREDICTION_TASK_NAMES
+    asset_classes = checkpoint_payload.get("asset_classes") if checkpoint_payload else None
+    asset_classes = asset_classes or sorted({sample["asset_class"] for sample in samples})
+    asset_class_ids = {name: i for i, name in enumerate(asset_classes)}
     model = MultiRateTransformer(
         {"annual": len(annual_value_columns), "quarterly": len(quarterly_value_columns), "daily": len(daily_value_columns), "sparse": len(sparse_value_columns)},
         config=config,
@@ -1223,6 +1341,7 @@ def main() -> None:
             "daily": feature_family_dimensions,
             "sparse": {family: len(raw_sparse_columns) for family in target_families},
         },
+        modalities=asset_classes,
         tasks=model_tasks,
         prediction_tasks=task_bundle.prediction_tasks,
     ).to(device)
@@ -1245,6 +1364,7 @@ def main() -> None:
         model,
         [(task_bundle.corpus, active_tasks)],
         optimizer,
+        seed=args.seed,
         grad_accumulation_steps=args.grad_accumulation_steps,
         autocast_dtype=torch.float16 if args.mixed_precision else None,
         transformer_engine_fp8=args.fp8,
@@ -1257,6 +1377,40 @@ def main() -> None:
         parser.error("--progress-every-batches must be non-negative")
     if args.checkpoint_every_batches < 0:
         parser.error("--checkpoint-every-batches must be non-negative")
+    def issuer_inputs(batch, stack):
+        keys = {}
+        ids = []
+        for item in batch:
+            key = item["issuer_context_key"]
+            keys.setdefault(key, len(keys))
+            ids.append(keys[key])
+        payloads = {}
+        for rate in ("daily", "sparse"):
+            values = stack(f"issuer_{rate}").clone()
+            padding = stack(f"issuer_{rate}_padding").bool().clone()
+            # Auxiliary prediction heads use only their local rate states,
+            # never this supervised fusion path.
+            leading = padding[:, 0]
+            values[leading, 0] = 0.
+            padding[leading, 0] = False
+            payloads[rate] = {"values": values, "padding": padding,
+                "dates": stack(f"issuer_{rate}_timestamps"),
+                "context_ids": torch.tensor(ids, device=device)}
+        return payloads
+
+    task_observations = Counter()
+    task_loss_sums = Counter()
+    encoder_gradient_sums = Counter()
+    def record_gradient(name):
+        def record(gradient):
+            if not torch.isfinite(gradient).all():
+                raise RuntimeError(f"Nonfinite gradient in {name}")
+            encoder_gradient_sums[name] += float(gradient.detach().abs().sum())
+        return record
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad and name.startswith(("annual_encoder.", "quarterly_encoder.", "encoders.daily.", "encoders.sparse.", "instrument_fusion.")):
+            parameter.register_hook(record_gradient(name.split(".layers")[0] if ".layers" in name else name.split(".")[0]))
+
     def training_step(module: torch.nn.Module, batch: list[dict[str, object]], active_tasks):
         def stack(name: str) -> torch.Tensor:
             return torch.stack([item[name] if isinstance(item[name], torch.Tensor) else torch.as_tensor(item[name]) for item in batch]).to(device)
@@ -1287,7 +1441,7 @@ def main() -> None:
                 raw_shape = raw.shape
                 target_valid = torch.isfinite(raw).reshape(*raw_shape[:2], len(target_families), len(raw_sparse_columns)).any(dim=-1)
                 selected = target_valid & ~padding.unsqueeze(-1)
-                selected &= torch.rand(target_valid.shape, device=device, generator=mask_rng).lt(0.15)
+                selected &= torch.rand((*target_valid.shape[:2], 1), device=device, generator=mask_rng).lt(0.15)
                 expanded = selected.unsqueeze(-1).expand(*raw_shape[:2], len(target_families), len(raw_sparse_columns)).reshape(raw_shape)
                 batch_values = batch_values.clone(); batch_values[expanded] = float("nan")
             else:
@@ -1300,7 +1454,7 @@ def main() -> None:
                     offset += width
                 family_valid = torch.stack(family_valid, dim=-1)
                 selected = family_valid & ~padding.unsqueeze(-1)
-                selected &= torch.rand(selected.shape, device=device, generator=mask_rng).lt(0.15)
+                selected &= torch.rand((*selected.shape[:2], 1), device=device, generator=mask_rng).lt(0.15)
                 expanded = []
                 offset = 0
                 for family in feature_families:
@@ -1309,6 +1463,16 @@ def main() -> None:
                     offset += width
                 expanded = torch.cat(expanded, dim=-1)
                 batch_values = batch_values.clone(); batch_values[expanded] = float("nan")
+            if rate in {"annual", "quarterly"}:
+                representatives = {}
+                first = []
+                for index, item in enumerate(batch):
+                    key = item[f"{rate}_context_key"]
+                    representatives.setdefault(key, index)
+                    first.append(representatives[key])
+                first = torch.tensor(first, device=device)
+                batch_values = batch_values.index_select(0, first)
+                selected = selected.index_select(0, first)
             masked_batches[rate] = (batch_values, padding); masked_positions[rate] = selected
         daily_batch, daily_mask = masked_batches["daily"]
         annual_batch, annual_mask = masked_batches["annual"]
@@ -1332,9 +1496,11 @@ def main() -> None:
             daily_batch, annual_batch, quarterly_batch, sparse_batch,
             daily_padding_mask=daily_mask, annual_padding_mask=annual_mask,
             quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask,
-            daily_dates=torch.arange(DAILY_WINDOW, device=device), annual_dates=torch.arange(ANNUAL_WINDOW, device=device),
-            quarterly_dates=torch.arange(QUARTERLY_WINDOW, device=device), sparse_dates=torch.arange(16, device=device),
+            daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"),
+            quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"),
+            daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, DAILY_WINDOW),
             rate_context_ids=rate_context_ids,
+            issuer_streams=issuer_inputs(batch, stack),
             compute_document_outputs=not args.disable_document_tasks,
         )
         if tuple(output["document_outputs"]) + tuple(output["token_outputs"]) + tuple(output["prediction_outputs"]) != expected_task_names:
@@ -1359,8 +1525,13 @@ def main() -> None:
             if name not in active_names:
                 continue
             valid = supervised_valid[:, :, task_index] & ~daily_mask
+            valid[:, :-1] = False
             if not valid.any():
                 continue
+            if module.training:
+                task_observations[name] += int(valid.sum())
+                for row_index, item in enumerate(batch):
+                    task_observations[f"{item['asset_class']}:{name}"] += int(valid[row_index].sum())
             target = supervised_targets[:, :, task_index]
             prediction = output["token_outputs"][name].squeeze(-1)
             if name in ORACLE_SUPERVISED_TASK_NAMES or name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES or name in HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES:
@@ -1420,21 +1591,24 @@ def main() -> None:
                 / target_valid.sum(dim=-1).clamp_min(1)
             )
             padding = stack(f"{rate}_padding").bool()
-            valid_next = ~padding
-            valid_next[:, :-1] = valid_next[:, :-1] & valid_next[:, 1:]; valid_next[:, -1] = False
-            valid_next = valid_next.unsqueeze(-1).expand_as(target).clone(); valid_next &= target_valid
-            valid_next[:, :-1] = valid_next[:, :-1] & target_valid[:, 1:]
-            valid_next_token = (~padding).clone()
-            valid_next_token[:, :-1] &= token_valid[:, :-1] & token_valid[:, 1:]
-            valid_next_token[:, -1] = False
+            timestamps = stack(f"{rate}_timestamps")
+            next_target, valid_next = next_observation_targets(target, target_valid & ~padding.unsqueeze(-1), timestamps)
+            next_token_target, valid_next_token = next_observation_targets(
+                token_target.unsqueeze(-1), (token_valid & ~padding).unsqueeze(-1), timestamps,
+            )
+            next_token_target = next_token_target.squeeze(-1)
+            valid_next_token = valid_next_token.squeeze(-1)
+            if module.training:
+                task_observations[f"next_{rate}_subtoken"] += int(valid_next.sum())
+                task_observations[f"next_{rate}_token"] += int(valid_next_token.sum())
             next_subtoken_name = f"next_{rate}_subtoken"
             next_token_name = f"next_{rate}_token"
             next_subtoken_prediction = output["prediction_outputs"][next_subtoken_name].squeeze(-1)
             if next_subtoken_name in active_names and valid_next.any():
-                task_losses[next_subtoken_name] = nn.functional.mse_loss(next_subtoken_prediction[valid_next], target.roll(-1, dims=1)[valid_next])
+                task_losses[next_subtoken_name] = nn.functional.mse_loss(next_subtoken_prediction[valid_next], next_target[valid_next])
             next_token_prediction = output["prediction_outputs"][next_token_name].squeeze(-1)
             if next_token_name in active_names and valid_next_token.any():
-                task_losses[next_token_name] = nn.functional.mse_loss(next_token_prediction[valid_next_token], token_target.roll(-1, dims=1)[valid_next_token])
+                task_losses[next_token_name] = nn.functional.mse_loss(next_token_prediction[valid_next_token], next_token_target[valid_next_token])
             masked_valid = masked_positions[rate]
             masked_subtoken_name = f"masked_{rate}_subtoken"
             masked_token_name = f"masked_{rate}_token"
@@ -1445,6 +1619,14 @@ def main() -> None:
             masked_token_prediction = output["prediction_outputs"][masked_token_name].squeeze(-1)
             if masked_token_name in active_names and masked_token_valid.any():
                 task_losses[masked_token_name] = nn.functional.mse_loss(masked_token_prediction[masked_token_valid], token_target[masked_token_valid])
+        if module.training:
+            for name, loss in task_losses.items():
+                task_loss_sums[name] += float(loss.detach())
+            for rate in ("annual", "quarterly", "daily", "sparse"):
+                task_observations[f"masked_{rate}"] += int(masked_positions[rate].sum())
+        for item in batch:
+            if isinstance(item, _LazySample):
+                item.release()
         return task_losses
 
     validation_corpus = Corpus(
@@ -1475,7 +1657,7 @@ def main() -> None:
         validation_losses.append(val_loss)
         stopping_loss = val_loss if validation_samples else epoch_loss
         if stopping_loss < best_loss - args.min_delta:
-            best_loss = stopping_loss; best_state = copy.deepcopy(model.state_dict()); stale_epochs = 0
+            best_loss = stopping_loss; best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}; stale_epochs = 0
         else:
             stale_epochs += 1
         print(f"epoch {epoch + 1}/{args.epochs} loss={epoch_loss:.6f} validation_loss={val_loss:.6f}", flush=True)
@@ -1491,6 +1673,10 @@ def main() -> None:
         temporary_path = output_dir / "multirate_mtl_checkpoint_latest.pt.tmp"
         payload = {
             "state_dict": model.state_dict(),
+            "asset_classes": asset_classes,
+            "labels": label_names,
+            "normalization": norms,
+            "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
             "optimizer_state_dict": optimizer.state_dict(),
             "metrics": {
                 "epoch": epoch,
@@ -1542,11 +1728,27 @@ def main() -> None:
         on_batch_end=training_progress,
     )
 
+    (output_dir / "training_diagnostics.json").write_text(json.dumps({
+        "task_observations": dict(task_observations), "task_loss_sums": dict(task_loss_sums),
+        "encoder_gradient_abs_sum": dict(encoder_gradient_sums),
+        "peak_process_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+        "peak_cuda_allocated_mib": torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else 0,
+    }, indent=2))
+    if not args.inference_only:
+        missing = [f"{asset}:{name}" for asset in {sample["asset_class"] for sample in train_samples}
+                   for name in (*ORACLE_SUPERVISED_TASK_NAMES, *HITS_SUPERVISED_TASK_NAMES)
+                   if not task_observations[f"{asset}:{name}"]]
+        if missing:
+            raise ValueError(f"Training completed without observed supervision for: {missing}")
+
     if best_state is not None:
         model.load_state_dict(best_state)
 
     model.eval(); predictions: dict[str, list[torch.Tensor]] = {name: [] for name in enabled_document_tasks[1:]}; states: list[torch.Tensor] = []; family_states: list[torch.Tensor] = []; family_valid_rows: list[torch.Tensor] = []
     prediction_rows: list[dict[str, object]] = []
+    prediction_count = 0
+    prediction_temporary = output_dir / "supervised_predictions.csv.tmp"
+    prediction_temporary.write_text("")
     prediction_start = _as_datetime(args.prediction_start_date) if args.prediction_start_date else None
     family_correct = 0
     family_total = 0
@@ -1578,21 +1780,29 @@ def main() -> None:
             annual_batch, annual_mask = context("annual", "annual_padding")
             quarterly_batch, quarterly_mask = context("quarterly", "quarterly_padding")
             sparse_batch, sparse_padding_mask = context("sparse", "sparse_padding")
-            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=torch.arange(DAILY_WINDOW, device=device), annual_dates=torch.arange(ANNUAL_WINDOW, device=device), quarterly_dates=torch.arange(QUARTERLY_WINDOW, device=device), sparse_dates=torch.arange(16, device=device))
+            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, issuer_streams=issuer_inputs(batch, stack), daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"), quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"), daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, DAILY_WINDOW))
             if prediction_start is not None:
                 score_names = tuple(SUPERVISED_TARGET_TASK_NAMES)
                 score_arrays = {
-                    name: torch.sigmoid(output["token_outputs"][name].squeeze(-1)).cpu()
+                    name: (output["token_outputs"][name].squeeze(-1) if name in HITS_SUPERVISED_TASK_NAMES else torch.sigmoid(output["token_outputs"][name].squeeze(-1))).cpu()
                     for name in score_names
                 }
                 for row_index, item in enumerate(batch):
                     dates = [_as_datetime(value) for value in item["daily_dates"]]
                     offset = DAILY_WINDOW - len(dates)
                     for date_index, date in enumerate(dates):
-                        if date < prediction_start:
+                        if date < prediction_start or date != _as_datetime(item["date"]):
                             continue
                         score_row = {name: float(values[row_index, offset + date_index]) for name, values in score_arrays.items()}
                         prediction_rows.append({"symbol": item["symbol"], "date": date.strftime("%Y-%m-%d"), **score_row})
+            if prediction_rows:
+                with prediction_temporary.open("a", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(prediction_rows[0]))
+                    if prediction_count == 0:
+                        writer.writeheader()
+                    writer.writerows(prediction_rows)
+                prediction_count += len(prediction_rows)
+                prediction_rows.clear()
             if not args.skip_embeddings:
                 states.append(output["document_prototypes"].cpu())
             family_labels = torch.arange(len(family_names), device=device).view(1, -1).expand(len(batch), -1)
@@ -1621,14 +1831,21 @@ def main() -> None:
                 family_correct += int((family_predictions[family_valid] == family_labels[family_valid]).sum())
                 family_total += int(family_valid.sum())
             for name in predictions: predictions[name].append(output["document_outputs"][name].argmax(dim=-1).cpu())
+            for item in batch:
+                if isinstance(item, _LazySample):
+                    item.release()
     evaluation_label_arrays = {
         name: torch.tensor([sample[f"{name}_label"] for sample in evaluation_samples], dtype=torch.long)
         for name in predictions
     }
-    task_accuracy = {
-        name: float(torch.cat(predictions[name]).eq(evaluation_label_arrays[name]).float().mean())
-        for name in predictions
-    }
+    task_accuracy = {}
+    for name in predictions:
+        targets = evaluation_label_arrays[name]
+        known = targets != -100
+        task_accuracy[name] = (
+            float(torch.cat(predictions[name])[known].eq(targets[known]).float().mean())
+            if known.any() and predictions[name] else None
+        )
     if "family" in enabled_document_tasks:
         task_accuracy["family"] = family_correct / max(1, family_total)
     metrics = {"device": str(device), "samples": len(samples), "training_samples": len(train_samples), "feature_families": feature_families, "target_families": target_families, "family_labels": family_names, "tasks": [*expected_task_names, *(["mrl"] if mrl_dimensions else [])], "losses": losses, "best_loss": best_loss, "epochs_completed": len(losses), "patience": args.patience, "min_delta": args.min_delta, "task_accuracy": task_accuracy, "rates": ["annual", "quarterly", "daily", "sparse"], "backbone": config.backbone, "document_tasks_disabled": args.disable_document_tasks, "learned_aggregation_gate": args.learned_aggregation_gate, "mrl": bool(mrl_dimensions), "mrl_dimensions": list(mrl_dimensions), "mrl_weight": args.mrl_weight, "train_end_date": args.train_end_date, "prediction_start_date": args.prediction_start_date}
@@ -1673,9 +1890,13 @@ def main() -> None:
         },
     }
     (output_dir / "training_summary.json").write_text(json.dumps(metrics, indent=2))
-    torch.save({"state_dict": model.state_dict(), "metrics": metrics, "labels": label_names}, output_dir / "multirate_mtl_model.pt")
-    if prediction_rows:
-        pl.DataFrame(prediction_rows).sort(["date", "symbol"]).write_csv(output_dir / "supervised_predictions.csv")
+    torch.save({"state_dict": model.state_dict(), "metrics": metrics, "labels": label_names,
+                "normalization": norms, "asset_classes": asset_classes,
+                "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}}, output_dir / "multirate_mtl_model.pt")
+    if prediction_count:
+        os.replace(prediction_temporary, output_dir / "supervised_predictions.csv")
+    else:
+        prediction_temporary.unlink(missing_ok=True)
     if args.learned_aggregation_gate:
         gate = model.auto_feature_engineer.aggregation_gate
         if gate.family_logits is not None:

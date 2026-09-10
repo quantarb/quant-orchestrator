@@ -169,8 +169,8 @@ class AutoFeatureEngineer(nn.Module):
 
         if dates is None:
             dates = torch.arange(length, device=values.device)
-        if dates.ndim != 1 or dates.shape[0] != length:
-            raise ValueError("dates must have shape [sequence]")
+        if dates.shape not in ((length,), (batch, length)):
+            raise ValueError("dates must have shape [sequence] or [batch, sequence]")
 
         tokens = family_states + self.position[:length].view(1, length, 1, -1)
         token_padding = family_presence.eq(0)
@@ -184,13 +184,16 @@ class AutoFeatureEngineer(nn.Module):
         # first position for every document also gives left-padded queries a
         # legal causal key.
         document_padding[:, 0] = False
-        temporal_mask = dates[None, :] > dates[:, None]
+        temporal_mask = dates.unsqueeze(-2) > dates.unsqueeze(-1)
+        if temporal_mask.ndim == 3:
+            temporal_mask = temporal_mask.repeat_interleave(family_count * self.temporal_attention.num_heads, dim=0)
         attended, _ = self.temporal_attention(
             document_tokens,
             document_tokens,
             document_tokens,
             attn_mask=temporal_mask,
             key_padding_mask=document_padding,
+            need_weights=False,
         )
         attended = torch.nan_to_num(attended, nan=0.0, posinf=0.0, neginf=0.0)
         attended = attended.reshape(batch, family_count, length, d_model).permute(0, 2, 1, 3)

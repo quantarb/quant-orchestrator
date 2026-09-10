@@ -75,7 +75,7 @@ class CoverageAwareInput(nn.Module):
         observed_features = torch.isfinite(values)
         clean = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
         inferred_presence = torch.stack([
-            observed_features[..., self.slices[name]].all(dim=-1)
+            observed_features[..., self.slices[name]].any(dim=-1)
             for name in self.family_names
         ], dim=-1)
         if family_presence is None:

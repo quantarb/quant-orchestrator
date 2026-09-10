@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 import pytest
 
 
@@ -15,7 +15,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 def test_issuer_dte_selection_aggregates_contract_features_into_synthetic_rows() -> None:
-    panel = pd.DataFrame(
+    panel = pl.DataFrame(
         [
             {
                 "symbol": "AAPL_C_100",
@@ -58,12 +58,12 @@ def test_issuer_dte_selection_aggregates_contract_features_into_synthetic_rows()
             },
         ]
     )
-    taxonomy = pd.DataFrame({"issuer": ["AAPL"]}, index=pd.Index(["AAPL"], name="symbol"))
+    taxonomy = pl.DataFrame({"symbol": ["AAPL"], "issuer": ["AAPL"]})
 
     result = MODULE._issuer_dte_bin_option_panel(panel, taxonomy, bin_count=1)
 
     assert len(result) == 2
-    call = result.loc[result["option_type"].eq("call")].iloc[0]
+    call = result.filter(pl.col("option_type") == "call").row(0, named=True)
     assert call["symbol"] == "OPT_SYNTH_AAPL_C_DTE30"
     assert call["contract_symbol"] == call["symbol"]
     assert bool(call["synthetic_option"])
@@ -74,7 +74,7 @@ def test_issuer_dte_selection_aggregates_contract_features_into_synthetic_rows()
 
 
 def test_issuer_dte_selection_uses_liquidity_weighted_bid_ask() -> None:
-    panel = pd.DataFrame(
+    panel = pl.DataFrame(
         [
             {
                 "symbol": "AAPL_C_100", "contract_symbol": "AAPL_C_100",
@@ -90,10 +90,10 @@ def test_issuer_dte_selection_uses_liquidity_weighted_bid_ask() -> None:
             },
         ]
     )
-    taxonomy = pd.DataFrame({"issuer": ["AAPL"]}, index=pd.Index(["AAPL"], name="symbol"))
+    taxonomy = pl.DataFrame({"symbol": ["AAPL"], "issuer": ["AAPL"]})
 
     result = MODULE._issuer_dte_bin_option_panel(panel, taxonomy, bin_count=1)
-    call = result.iloc[0]
+    call = result.row(0, named=True)
 
     assert call["entry_bid"] == pytest.approx(2.5)
     assert call["entry_ask"] == pytest.approx(3.5)
