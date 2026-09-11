@@ -47,7 +47,9 @@ represent irregular gaps; NTP evaluation compares each family with persistence.
 Sequence training (`--training-sequence-stride 128`) packs event dates into overlapping
 Polars windows and supervises each event once. Issuer streams retain history at
 the sequence start plus dated updates. The epoch monitor drains immutable epoch
-checkpoints and prints separate annual backtests without restarting training.
+checkpoints and prints separate annual backtests. `--epoch-evaluation-dir` makes
+training wait for those reports before starting the next epoch;
+`--resume-training` restores checkpoint weights, optimizer, and batch position.
 Optional BF16 autocast is available for measured precision/batch-size comparisons.
 Masked and next-observation objectives reconstruct individual values at token
 and subtoken levels. Subtoken MTP masks features within each family; token MTP

@@ -27,6 +27,7 @@ from torch import nn
 from quant_warehouse import Warehouse
 from quant_orchestrator.research_tools.streaming_context import StreamingContext, StreamingFamilyContext, context_ordered_anchors
 from quant_orchestrator.research_tools.sequence_training import sequence_anchors, window_supervision
+from quant_orchestrator.research_tools.epoch_evaluation import wait_for_epoch_backtest
 from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups, input_event_families
 from quant_orchestrator.research_tools.multirate_objectives import (
     RECONSTRUCTION_CONTRACT, reconstruction_mask, reconstruction_targets, family_channels, feature_family_layout,
@@ -691,12 +692,18 @@ def main() -> None:
     )
     parser.add_argument('--training-sequence-stride', type=int, default=0,
                         help='Supervise all event dates in overlapping chunks; 0 keeps one anchor per event. Must be smaller than daily-window.')
+    parser.add_argument('--resume-training', action='store_true', help='Restore checkpoint weights, optimizer, and epoch/batch position')
+    parser.add_argument('--epoch-evaluation-dir', type=Path, help='Wait for monitor backtest reports after each epoch before training continues')
     parser.add_argument(
         "--max-samples", type=int, default=0,
         help="Optional deterministic cap on samples for a fast end-to-end smoke run.",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    if args.resume_training and (args.checkpoint is None or args.inference_only):
+        parser.error('--resume-training requires --checkpoint and cannot be used for inference')
+    if args.epoch_evaluation_dir and args.checkpoint_every_batches <= 0:
+        parser.error('--epoch-evaluation-dir requires checkpoint-every-batches > 0')
     args.reconstruction_contract = RECONSTRUCTION_CONTRACT
     if args.reconstruction_weight < 0:
         parser.error("--reconstruction-weight must be non-negative")
@@ -746,7 +753,7 @@ def main() -> None:
     if not sparse_input_families:
         sparse_input_families = ["__empty_sparse_family__"]
     checkpoint_payload = None
-    if args.inference_only and args.checkpoint is not None:
+    if (args.inference_only or args.resume_training) and args.checkpoint is not None:
         checkpoint_payload = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
         _validate_inference_checkpoint(checkpoint_payload)
         checkpoint_metrics = checkpoint_payload.get("metrics", {}) if isinstance(checkpoint_payload, dict) else {}
@@ -1456,6 +1463,21 @@ def main() -> None:
         optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=2e-4, weight_decay=1e-4)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+    resume_epoch = resume_batch = 0
+    if args.resume_training:
+        if args.grad_accumulation_steps != 1:
+            parser.error('Training resume currently requires grad-accumulation-steps=1')
+        optimizer.load_state_dict(checkpoint_payload['optimizer_state_dict'])
+        saved = checkpoint_payload['metrics']
+        resume_epoch = int(saved['epoch']) + int(saved.get('epoch_complete',False))
+        resume_batch = 0 if saved.get('epoch_complete') else int(saved['batch'])
+        print(f'[multirate-resume] epoch={resume_epoch+1} completed_batches={resume_batch} optimizer_restored=true',flush=True)
+        if 'torch_rng_state' in checkpoint_payload:
+            torch.set_rng_state(checkpoint_payload['torch_rng_state'])
+            if device.type == 'cuda' and 'cuda_rng_state_all' in checkpoint_payload:
+                torch.cuda.set_rng_state_all(checkpoint_payload['cuda_rng_state_all'])
+        else:
+            print('[multirate-resume] checkpoint has no RNG state; stochastic continuation is not bit-for-bit identical',flush=True)
     trainer = Trainer(
         model,
         [(task_bundle.corpus, active_tasks)],
@@ -1510,7 +1532,10 @@ def main() -> None:
         if parameter.requires_grad and name.startswith(("annual_encoder.", "quarterly_encoder.", "encoders.daily.", "encoders.sparse.", "instrument_fusion.", "information_age.", "auto_feature_engineer.elapsed_time.")):
             parameter.register_hook(record_gradient(name.split(".layers")[0] if ".layers" in name else name.split(".")[0]))
 
+    epoch_clocks = {}
     def training_step(module: torch.nn.Module, batch: list[dict[str, object]], active_tasks):
+        if module.training:
+            epoch_clocks.setdefault(trainer.current_epoch,perf_counter())
         stack = BatchTensors(batch, device)
 
         def context(name: str, padding_name: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1733,7 +1758,10 @@ def main() -> None:
             best_loss = stopping_loss; best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}; stale_epochs = 0
         else:
             stale_epochs += 1
-        print(f"epoch {epoch + 1}/{args.epochs} loss={epoch_loss:.6f} validation_loss={val_loss:.6f}", flush=True)
+        scope = 'remaining_batches' if epoch == resume_epoch and resume_batch else 'full_epoch'
+        print(f"epoch {epoch + 1}/{args.epochs} loss={epoch_loss:.6f} validation_loss={val_loss:.6f} loss_scope={scope}", flush=True)
+        if args.epoch_evaluation_dir:
+            wait_for_epoch_backtest(args.epoch_evaluation_dir,epoch+1)
         if stale_epochs >= max(1, args.patience):
             print(f"early stopping after epoch {epoch + 1}; best_loss={best_loss:.6f}", flush=True)
             return True
@@ -1751,6 +1779,8 @@ def main() -> None:
             "normalization": norms,
             "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
             "optimizer_state_dict": optimizer.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": torch.cuda.get_rng_state_all() if device.type == 'cuda' else [],
             "task_family_observations": dict(task_family_observations),
             "metrics": {
                 "epoch": epoch,
@@ -1781,8 +1811,9 @@ def main() -> None:
         if interval <= 0 or (batch_index % interval and batch_index != total_batches):
             if args.checkpoint_every_batches <= 0 or (batch_index % args.checkpoint_every_batches and batch_index != total_batches):
                 return
-        elapsed = perf_counter() - training_started
-        rate = batch_index / max(elapsed, 1e-6)
+        elapsed = perf_counter() - epoch_clocks.get(epoch,training_started)
+        processed = batch_index - (resume_batch if epoch == resume_epoch else 0)
+        rate = processed / max(elapsed, 1e-6)
         remaining = (total_batches - batch_index) / max(rate, 1e-6)
         samples_done = min(len(train_samples), batch_index * args.batch_size)
         memory = ""
@@ -1801,11 +1832,15 @@ def main() -> None:
         ):
             save_batch_checkpoint(epoch, batch_index, batch_loss, epoch_complete=batch_index == total_batches)
 
+    if args.epoch_evaluation_dir and not args.inference_only:
+        wait_for_epoch_backtest(args.epoch_evaluation_dir,resume_epoch)
     losses = [] if args.inference_only else trainer.fit(
         args.epochs,
         training_step,
         on_epoch_end=epoch_end,
         on_batch_end=training_progress,
+        start_epoch=resume_epoch,
+        start_batch=resume_batch,
     )
 
     (output_dir / "training_diagnostics.json").write_text(json.dumps({

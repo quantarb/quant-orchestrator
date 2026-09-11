@@ -136,3 +136,18 @@ def test_monitor_drains_immutable_epochs_after_trainer_exits(tmp_path,monkeypatc
     monitor.main()
     assert calls==['epoch_0001','epoch_0002']
     assert json.loads((out/'status.json').read_text())['completed_epoch']==2
+
+
+def test_epoch_gate_waits_for_both_metrics_and_backtest(tmp_path,monkeypatch):
+    import json
+    from quant_orchestrator.research_tools import epoch_evaluation as evaluation
+    out=tmp_path/'epoch_0003';out.mkdir()
+    (out/'epoch_metrics.json').write_text(json.dumps({'epoch':3}))
+    waits=[]
+    def finish(seconds):
+        waits.append(seconds)
+        (out/'backtest_metrics.json').write_text(json.dumps([{'side':'long','capital_return':.1}]))
+    monkeypatch.setattr(evaluation.time,'sleep',finish)
+    evaluation.wait_for_epoch_backtest(tmp_path,3)
+    assert waits==[5]
+    assert json.loads((tmp_path/'training_gate.json').read_text())['stage']=='backtest_complete'

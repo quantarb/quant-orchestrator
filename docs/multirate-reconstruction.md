@@ -382,3 +382,26 @@ projecting roughly 46 minutes per training epoch versus six hours for v6. This
 is an early throughput estimate, not a completed-epoch measurement; per-epoch
 2024–2026 inference/backtesting adds time. The 57 sequence, context, masking,
 causality, and epoch-monitor checks passed.
+
+### Synchronous epoch backtests and checkpoint continuation
+
+The $100B v7 run now uses `--resume-training --checkpoint ...
+--epoch-evaluation-dir ...` to restore model parameters, optimizer state, and the
+saved epoch/batch cursor. `Trainer.fit` skips already completed batches using
+the original seeded epoch ordering. The restart snapshot is epoch 4, batch 70;
+the trainer first waits for reports through epoch 3, then completes epoch 4.
+Every later epoch waits for both its evaluation metrics and backtest results
+before the next epoch starts. The existing epoch-1 scoring process is retained
+until completion, after which a supervisor replaces the monitor's training PID.
+
+The restart uses the same corpus, model, Polars sequence pipeline, and original
+2024/2025/2026 YTD strategy. Artifacts include `synchronous_resume_snapshot.json`,
+`synchronous_resume_command.json`, and `restart_synchronous_training.py` in the
+100B run root. `training_gate.json` reports the blocking evaluation epoch.
+
+The older checkpoint did not record RNG state, so this continuation preserves
+weights and optimizer updates but is not bit-for-bit identical to uninterrupted
+stochastic training. New batch checkpoints include CPU/CUDA RNG states. The
+resumed partial epoch's printed loss covers remaining batches only, and best-loss
+selection restarts over the continued epochs. Progress speed and ETA now use
+elapsed time within the current epoch, excluding waits for evaluation.

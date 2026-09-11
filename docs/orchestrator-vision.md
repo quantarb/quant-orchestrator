@@ -250,3 +250,8 @@ supervised date and subsequent updates; variable lengths are padded per batch.
 This reuses the older sequence-level training approach without restoring pandas
 or full-corpus feature tensors. The epoch monitor queues immutable checkpoints
 so training and annual backtest reporting can progress at different speeds.
+
+Training can opt into synchronous epoch evaluation with
+`--epoch-evaluation-dir`: both the model-evaluation report and portfolio report
+must exist before the next epoch starts. `--resume-training` restores the saved
+weights, optimizer and batch cursor; immutable epoch reports are retained.

@@ -1,7 +1,31 @@
 """Fixed-set NTP trends and immutable snapshots for a running training process."""
 import json
 import re
+import time
 from pathlib import Path
+
+
+def wait_for_epoch_backtest(directory, epoch, *, poll_seconds=5):
+    """Block training until the monitor has committed metrics and portfolio results."""
+    if epoch <= 0:
+        return
+    directory=Path(directory)
+    report=directory/f'epoch_{epoch:04d}'
+    print(f'[epoch-gate] waiting_for_backtest epoch={epoch}',flush=True)
+    directory.mkdir(parents=True,exist_ok=True)
+    (directory/'training_gate.json').write_text(json.dumps(dict(stage='waiting_for_backtest',epoch=epoch)))
+    while True:
+        failure=directory/'failure.json'
+        if failure.exists():
+            raise RuntimeError(f'Epoch evaluation failed: {failure.read_text()}')
+        if (report/'epoch_metrics.json').exists() and (report/'backtest_metrics.json').exists():
+            metrics=json.loads((report/'epoch_metrics.json').read_text())
+            backtest=json.loads((report/'backtest_metrics.json').read_text())
+            if metrics['epoch']==epoch and backtest:
+                break
+        time.sleep(poll_seconds)
+    (directory/'training_gate.json').write_text(json.dumps(dict(stage='backtest_complete',epoch=epoch)))
+    print(f'[epoch-gate] backtest_complete epoch={epoch}',flush=True)
 
 
 def option(command, flag):

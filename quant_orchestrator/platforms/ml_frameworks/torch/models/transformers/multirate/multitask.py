@@ -162,10 +162,14 @@ class Trainer:
         *,
         on_epoch_end: EpochEnd | None = None,
         on_batch_end: BatchEnd | None = None,
+        start_epoch: int = 0,
+        start_batch: int = 0,
     ) -> list[float]:
         """Run shared-gradient training and return mean loss per epoch."""
         losses: list[float] = []
-        for epoch in range(epochs):
+        if not 0 <= start_epoch < epochs or start_batch < 0:
+            raise ValueError('Invalid training resume position')
+        for epoch in range(start_epoch, epochs):
             self.current_epoch = epoch
             self.model.train()
             self.optimizer.zero_grad(set_to_none=True)
@@ -173,6 +177,8 @@ class Trainer:
             count = 0
             total_batches = sum(corpus.batch_count(seed=self.seed, epoch=epoch) for corpus, _ in self.corpus_tasks)
             for step_index, (batch, tasks) in enumerate(self.batches(epoch)):
+                if epoch == start_epoch and step_index < start_batch:
+                    continue
                 self.current_step = step_index
                 context = nullcontext()
                 if self.transformer_engine_fp8:
