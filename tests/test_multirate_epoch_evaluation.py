@@ -162,3 +162,31 @@ def test_evaluation_batch_override_preserves_training_command_and_dates():
     assert result[result.index('--prediction-start-date')+1]=='2024-01-02'
     assert result[result.index('--max-samples')+1]=='0'
     assert '--inference-only' in result and '--skip-predictions' not in result
+
+
+@pytest.mark.parametrize('year,price_symbol',[(2021,'ANTM'),(2024,'ELV')])
+def test_explicit_price_mapping_preserves_score_identity_and_adjustment(tmp_path,monkeypatch,year,price_symbol):
+    from datetime import date
+    import json
+    import polars as pl
+    from quant_orchestrator.research_tools.epoch_evaluation import anchored_epoch_backtest
+    corpus=tmp_path/'corpus';corpus.mkdir()
+    pl.DataFrame({'symbol':['ANTM'],'asset_class':['equity']}).write_csv(corpus/'taxonomy.csv')
+    mapping=tmp_path/'mapping.json'
+    mapping.write_text(json.dumps({'ANTM':{'symbol':'ELV','effective_date':'2022-06-28'}}))
+    out=tmp_path/'epoch_1';out.mkdir()
+    pl.DataFrame({'symbol':['ANTM'],'date':[date(year,1,5)]}).write_csv(out/'supervised_predictions.csv')
+    calls=[]
+    class Warehouse:
+        def read_prices(self,symbol,**kwargs):
+            calls.append((symbol,kwargs))
+            return pl.DataFrame({'date':[date(year,1,5)],'close':[100.]})
+    def replay(scores,prices,output):
+        assert scores.collect()['symbol'].to_list()==['ANTM']
+        assert prices.collect()['symbol'].to_list()==['ANTM']
+        return [{'side':'long','capital_return':0.}]
+    monkeypatch.setattr('quant_warehouse.Warehouse',Warehouse)
+    monkeypatch.setattr('quant_orchestrator.platforms.backtesting_frameworks.existing_multirate_backtest.run_existing_multirate_backtest',replay)
+    anchored_epoch_backtest(['python','train','--corpus',str(corpus),'--backtest-price-symbols',str(mapping)],out,f'{year}-01-01',f'{year}-12-31')
+    assert calls[0][0]==price_symbol
+    assert calls[0][1]['adjustment']=='splits_and_dividends'

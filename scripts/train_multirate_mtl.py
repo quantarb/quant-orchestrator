@@ -27,6 +27,7 @@ from torch import nn
 from quant_warehouse import Warehouse
 from quant_orchestrator.research_tools.streaming_context import StreamingContext, StreamingFamilyContext, context_ordered_anchors
 from quant_orchestrator.research_tools.sequence_training import sequence_anchors, window_supervision
+from quant_orchestrator.research_tools.document_sequences import DOCUMENT_CONTRACT, document_anchors, document_window, prediction_positions, validate_document_predictions
 from quant_orchestrator.research_tools.epoch_evaluation import wait_for_epoch_backtest
 from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups, input_event_families
 from quant_orchestrator.research_tools.multirate_objectives import (
@@ -691,9 +692,12 @@ def main() -> None:
         "--stream-samples", action="store_true", default=True,
         help="Keep sample metadata in memory and materialize rate arrays only per batch.",
     )
+    parser.add_argument('--sequence-mode', choices=('rolling', 'documents'), default=None,
+                        help='Fresh runs default to calendar-quarter documents; inference restores the checkpoint contract.')
     parser.add_argument('--training-sequence-stride', type=int, default=0,
                         help='Supervise all event dates in overlapping chunks; 0 keeps one anchor per event. Must be smaller than daily-window.')
     parser.add_argument('--resume-training', action='store_true', help='Restore checkpoint weights, optimizer, and epoch/batch position')
+    parser.add_argument('--backtest-price-symbols', type=Path, help='Explicit dated ticker-change mapping for adjusted backtest price reads.')
     parser.add_argument('--epoch-evaluation-dir', type=Path, help='Wait for monitor backtest reports after each epoch before training continues')
     parser.add_argument(
         "--max-samples", type=int, default=0,
@@ -769,6 +773,15 @@ def main() -> None:
         for key in ('annual_window', 'quarterly_window', 'daily_window', 'issuer_context'):
             if key in checkpoint_payload['configuration']:
                 setattr(args, key, checkpoint_payload['configuration'][key])
+    saved_sequence = (checkpoint_payload or {}).get('configuration', {}).get('sequence_mode', 'rolling')
+    if checkpoint_payload and args.sequence_mode is not None and args.sequence_mode != saved_sequence:
+        raise ValueError('Sequence mode differs from checkpoint; document scoring requires a document-trained checkpoint')
+    args.sequence_mode = saved_sequence if checkpoint_payload else (args.sequence_mode or 'documents')
+    args.document_contract = DOCUMENT_CONTRACT if args.sequence_mode == 'documents' else None
+    if checkpoint_payload and args.sequence_mode == 'documents' and checkpoint_payload['configuration'].get('document_contract') != DOCUMENT_CONTRACT:
+        raise ValueError('Document layout differs from checkpoint; retrain with the current document contract')
+    if args.sequence_mode == 'documents' and args.legacy_rate_fusion:
+        parser.error('Document scoring requires date-aware independent rate fusion')
     if min(args.annual_window, args.quarterly_window, args.daily_window) < 2:
         parser.error('Rate windows must contain at least two observations')
     ANNUAL_WINDOW, QUARTERLY_WINDOW, DAILY_WINDOW = args.annual_window, args.quarterly_window, args.daily_window
@@ -1075,7 +1088,7 @@ def main() -> None:
         anchors = pl.concat([regular_anchors, option_daily_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
     # Supervised losses use the final token at its own event date. Earlier
     # tokens in an annual document can see issuer memory from the anchor.
-    if supervised_target_map:
+    if supervised_target_map and args.sequence_mode != 'documents':
         event_anchors = supervised_target_map.anchors()
         if args.training_sequence_stride and not args.inference_only:
             sequence_rows, sequence_report = sequence_anchors(daily, event_anchors,
@@ -1098,6 +1111,17 @@ def main() -> None:
             anchors = anchors.filter(pl.col("date") >= _as_datetime(args.prediction_start_date))
         if args.prediction_end_date:
             anchors = anchors.filter(pl.col("date") <= _as_datetime(args.prediction_end_date))
+    if args.sequence_mode == 'documents':
+        anchors = document_anchors((daily, annual, quarterly, sparse),
+            start=args.prediction_start_date if args.inference_only else None,
+            end=args.prediction_end_date if args.inference_only else None,
+            cutoff=args.train_end_date if not args.inference_only else None)
+        (output_dir/'document_coverage.json').write_text(json.dumps(dict(
+            contract=DOCUMENT_CONTRACT, documents=anchors.height,
+            symbols=anchors['symbol'].n_unique(), daily_history=DAILY_WINDOW,
+            training_cutoff=args.train_end_date, prediction_start=args.prediction_start_date,
+            prediction_end=args.prediction_end_date), indent=2))
+    expected_document_dates = daily.select('symbol', 'date').filter(pl.col('symbol').is_in(taxonomy['symbol'].to_list()))
     empty_annual = annual.head(0)
     empty_quarterly = quarterly.head(0)
     empty_daily = daily.head(0)
@@ -1178,28 +1202,53 @@ def main() -> None:
         if symbol not in taxonomy_symbols:
             continue
         source_symbol = source_symbol_by_symbol.get(symbol, symbol)
-        supervision_start = row.get('supervision_start')
+        supervision_start = row.get('document_start') if args.sequence_mode == 'documents' else row.get('supervision_start')
         def materialize(current_symbol=symbol, current_anchor=anchor, current_source=source_symbol,
                         current_supervision_start=supervision_start):
-            daily_values, daily_padding, daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_symbol)
-            if current_supervision_start is not None:
-                annual_values, annual_padding, annual_dates, _ = annual_index.sequence_window(current_source,current_supervision_start,current_anchor,ANNUAL_WINDOW)
-                quarterly_values, quarterly_padding, quarterly_dates, _ = quarterly_index.sequence_window(current_source,current_supervision_start,current_anchor,QUARTERLY_WINDOW)
-                sparse_values, sparse_padding, sparse_dates, sparse_labels = sparse_index.sequence_window(current_symbol,current_supervision_start,current_anchor,sparse_window_length)
-                issuer_daily, issuer_daily_padding, issuer_daily_dates, _ = daily_index.sequence_window(current_source,current_supervision_start,current_anchor,DAILY_WINDOW)
-                if current_source == current_symbol:
-                    issuer_sparse, issuer_sparse_padding, issuer_sparse_dates = sparse_values,sparse_padding,sparse_dates
-                else:
-                    issuer_sparse, issuer_sparse_padding, issuer_sparse_dates, _ = sparse_index.sequence_window(current_source,current_supervision_start,current_anchor,sparse_window_length)
+            if args.sequence_mode == 'documents':
+                streams = {}
+                for rate, index, source, history in (
+                    ('daily', daily_index, current_symbol, DAILY_WINDOW),
+                    ('annual', annual_index, current_source, ANNUAL_WINDOW),
+                    ('quarterly', quarterly_index, current_source, QUARTERLY_WINDOW),
+                    ('sparse', sparse_index, current_symbol, sparse_window_length),
+                    ('issuer_daily', daily_index, current_source, DAILY_WINDOW),
+                    ('issuer_sparse', sparse_index, current_source, sparse_window_length)):
+                    if source == current_symbol and rate.startswith('issuer_'):
+                        streams[rate] = streams[rate.removeprefix('issuer_')]
+                    else:
+                        streams[rate] = document_window(index, source, current_supervision_start, current_anchor, history)
+                daily_values, daily_padding, daily_dates, _, _ = streams['daily']
+                annual_values, annual_padding, annual_dates, _, _ = streams['annual']
+                quarterly_values, quarterly_padding, quarterly_dates, _, _ = streams['quarterly']
+                sparse_values, sparse_padding, sparse_dates, _, sparse_labels = streams['sparse']
+                issuer_daily, issuer_daily_padding, issuer_daily_dates, _, _ = streams['issuer_daily']
+                issuer_sparse, issuer_sparse_padding, issuer_sparse_dates, _, _ = streams['issuer_sparse']
             else:
-                annual_values, annual_padding, annual_dates = cached_window("annual", annual_index, current_symbol, current_anchor, annual_value_columns, ANNUAL_WINDOW, current_source)
-                quarterly_values, quarterly_padding, quarterly_dates = cached_window("quarterly", quarterly_index, current_symbol, current_anchor, quarterly_value_columns, QUARTERLY_WINDOW, current_source)
-                sparse_values, sparse_padding, sparse_labels, sparse_dates = cached_sparse_window(current_symbol, current_anchor)
-                issuer_daily, issuer_daily_padding, issuer_daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_source)
-                issuer_sparse, issuer_sparse_padding, _, issuer_sparse_dates = cached_sparse_window(current_source, current_anchor)
-            supervised_targets = torch.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.float32)
-            supervised_valid = torch.zeros((DAILY_WINDOW, len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.bool)
-            if args.training_sequence_stride and not args.inference_only:
+                daily_values, daily_padding, daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_symbol)
+                if current_supervision_start is not None:
+                    annual_values, annual_padding, annual_dates, _ = annual_index.sequence_window(current_source,current_supervision_start,current_anchor,ANNUAL_WINDOW)
+                    quarterly_values, quarterly_padding, quarterly_dates, _ = quarterly_index.sequence_window(current_source,current_supervision_start,current_anchor,QUARTERLY_WINDOW)
+                    sparse_values, sparse_padding, sparse_dates, sparse_labels = sparse_index.sequence_window(current_symbol,current_supervision_start,current_anchor,sparse_window_length)
+                    issuer_daily, issuer_daily_padding, issuer_daily_dates, _ = daily_index.sequence_window(current_source,current_supervision_start,current_anchor,DAILY_WINDOW)
+                    if current_source == current_symbol:
+                        issuer_sparse, issuer_sparse_padding, issuer_sparse_dates = sparse_values,sparse_padding,sparse_dates
+                    else:
+                        issuer_sparse, issuer_sparse_padding, issuer_sparse_dates, _ = sparse_index.sequence_window(current_source,current_supervision_start,current_anchor,sparse_window_length)
+                else:
+                    annual_values, annual_padding, annual_dates = cached_window("annual", annual_index, current_symbol, current_anchor, annual_value_columns, ANNUAL_WINDOW, current_source)
+                    quarterly_values, quarterly_padding, quarterly_dates = cached_window("quarterly", quarterly_index, current_symbol, current_anchor, quarterly_value_columns, QUARTERLY_WINDOW, current_source)
+                    sparse_values, sparse_padding, sparse_labels, sparse_dates = cached_sparse_window(current_symbol, current_anchor)
+                    issuer_daily, issuer_daily_padding, issuer_daily_dates = cached_window("daily", daily_index, current_symbol, current_anchor, daily_value_columns, DAILY_WINDOW, current_source)
+                    issuer_sparse, issuer_sparse_padding, _, issuer_sparse_dates = cached_sparse_window(current_source, current_anchor)
+            supervised_targets = torch.zeros((len(daily_values), len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.float32)
+            supervised_valid = torch.zeros_like(supervised_targets, dtype=torch.bool)
+            if args.sequence_mode == 'documents' and not args.inference_only:
+                supervised_targets, supervised_valid = window_supervision(
+                    supervised_target_map, current_symbol, daily_dates, length=len(daily_values),
+                    tasks=SUPERVISED_TARGET_TASK_NAMES, start=current_supervision_start, end=current_anchor,
+                    positions=slice(1, len(daily_dates)+1))
+            elif args.training_sequence_stride and not args.inference_only:
                 if current_supervision_start is not None:
                     supervised_targets, supervised_valid = window_supervision(
                         supervised_target_map, current_symbol, daily_dates, length=DAILY_WINDOW,
@@ -1223,14 +1272,14 @@ def main() -> None:
                 annual_padding = torch.ones(len(annual_values), dtype=torch.bool)
                 quarterly_padding = torch.ones(len(quarterly_values), dtype=torch.bool)
                 annual_dates = quarterly_dates = []
-            return {
+            result = {
                 "issuer_daily": issuer_daily, "issuer_daily_padding": issuer_daily_padding,
                 "issuer_daily_timestamps": timestamps(issuer_daily_dates, len(issuer_daily)),
                 "issuer_sparse": issuer_sparse, "issuer_sparse_padding": issuer_sparse_padding,
                 "issuer_sparse_timestamps": timestamps(issuer_sparse_dates, len(issuer_sparse)),
                 "annual_timestamps": timestamps(annual_dates, len(annual_values)),
                 "quarterly_timestamps": timestamps(quarterly_dates, len(quarterly_values)),
-                "daily_timestamps": timestamps(daily_dates, DAILY_WINDOW),
+                "daily_timestamps": timestamps(daily_dates, len(daily_values)),
                 "sparse_timestamps": timestamps(sparse_dates, len(sparse_values)),
                 "annual": annual_values, "annual_padding": annual_padding,
                 "quarterly": quarterly_values, "quarterly_padding": quarterly_padding,
@@ -1239,8 +1288,14 @@ def main() -> None:
                 "sparse": sparse_values, "sparse_padding": sparse_padding, "sparse_labels": sparse_labels,
                 "supervised_targets": supervised_targets, "supervised_valid": supervised_valid,
             }
+            if args.sequence_mode == 'documents':
+                for rate, payload in streams.items():
+                    result[f'{rate}_timestamps'] = payload[3]
+            return result
         metadata = {
             "symbol": symbol, "date": anchor.strftime("%Y-%m-%d"),
+            "sequence_mode": args.sequence_mode,
+            "document_start": _as_datetime(supervision_start).strftime('%Y-%m-%d') if supervision_start is not None else None,
             "issuer": str(taxonomy_by_symbol[symbol]["issuer"]),
             "asset_class": str(taxonomy_by_symbol[symbol]["asset_class"]),
             "issuer_context_key": (source_symbol, _epoch_ns(anchor), str(supervision_start)),
@@ -1632,7 +1687,7 @@ def main() -> None:
             quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask,
             daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"),
             quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"),
-            daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, DAILY_WINDOW),
+            daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, daily_batch.shape[1]),
             rate_context_ids=rate_context_ids,
             issuer_streams=issuer_inputs(batch, stack),
             **{f"{rate}_family_presence": family_channels(
@@ -1651,7 +1706,7 @@ def main() -> None:
                 quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask,
                 daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"),
                 quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"),
-                daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, DAILY_WINDOW),
+                daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, daily_batch.shape[1]),
                 rate_context_ids=rate_context_ids,
                 **{f"{rate}_family_presence": family_channels(
                     torch.isfinite(stack(rate)) & ~stack(f"{rate}_padding").bool().unsqueeze(-1),
@@ -1681,7 +1736,7 @@ def main() -> None:
             if name not in active_names:
                 continue
             valid = supervised_valid[:, :, task_index] & ~daily_mask
-            if not args.training_sequence_stride:
+            if args.sequence_mode != 'documents' and not args.training_sequence_stride:
                 valid[:, :-1] = False
             if not valid.any():
                 continue
@@ -1906,16 +1961,17 @@ def main() -> None:
         # than the training step. Keep the scalable training batch size, but use a
         # bounded evaluation batch to avoid accelerator kernel failures on large
         # corpora.
-        eval_batch_size = min(args.batch_size, 128 if args.inference_only else 64)
+        eval_batch_size = min(args.batch_size, 128 if args.inference_only and args.sequence_mode != 'documents' else 64)
         evaluation_started = perf_counter()
         for start in range(0, len(evaluation_samples), eval_batch_size):
             batch = evaluation_samples[start:start + eval_batch_size]
             if args.inference_only:
                 batch_symbols = ",".join(dict.fromkeys(str(item.get("symbol", "?")) for item in batch))
                 print(
-                    f"[multirate-inference] scoring symbols {start + 1}-{start + len(batch)}/{len(evaluation_samples)}: {batch_symbols} "
+                    f"[multirate-inference] scoring {'documents' if args.sequence_mode == 'documents' else 'symbols'} {start + 1}-{start + len(batch)}/{len(evaluation_samples)}: {batch_symbols} "
                     f"elapsed_s={perf_counter() - evaluation_started:.1f} "
-                    f"observations_per_s={start / max(perf_counter() - evaluation_started, 1e-9):.2f}",
+                    f"observations_per_s={start / max(perf_counter() - evaluation_started, 1e-9):.2f} "
+                    f"score_rows={prediction_count} score_rows_per_s={prediction_count / max(perf_counter() - evaluation_started, 1e-9):.2f}",
                     flush=True,
                 )
             stack = BatchTensors(batch, device)
@@ -1938,7 +1994,9 @@ def main() -> None:
                 unique = {key: index for index, key in enumerate(dict.fromkeys(keys))}
                 if len(unique) < len(batch):
                     inference_context_ids[rate] = torch.tensor([unique[key] for key in keys], device=device)
-            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, compute_document_outputs=not args.skip_embeddings or not args.disable_document_tasks, rate_context_ids=inference_context_ids, issuer_streams=issuer_inputs(batch, stack), daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"), quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"), daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, DAILY_WINDOW))
+            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, compute_document_outputs=not args.skip_embeddings or not args.disable_document_tasks, rate_context_ids=inference_context_ids,
+                **({f"{rate}_family_presence": family_channels(torch.isfinite(stack(rate)) & ~stack(f"{rate}_padding").bool().unsqueeze(-1), widths).any(-1)
+                    for rate, widths in reconstruction_widths.items()} if args.sequence_mode == 'documents' else {}), issuer_streams=issuer_inputs(batch, stack), daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"), quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"), daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, daily_batch.shape[1]))
             for rate, widths in reconstruction_widths.items():
                 ntp_audit.update([str(item["symbol"]) for item in batch], rate,
                     sparse_input_families if rate == "sparse" else list(feature_family_dimensions), widths,
@@ -1950,13 +2008,9 @@ def main() -> None:
                     for name in score_names
                 }
                 for row_index, item in enumerate(batch):
-                    dates = [_as_datetime(value) for value in item["daily_dates"]]
-                    offset = DAILY_WINDOW - len(dates)
-                    for date_index, date in enumerate(dates):
-                        if date < prediction_start or date != _as_datetime(item["date"]):
-                            continue
-                        score_row = {name: float(values[row_index, offset + date_index]) for name, values in score_arrays.items()}
-                        prediction_rows.append({"symbol": item["symbol"], "date": date.strftime("%Y-%m-%d"), "information_date": item["date"], **score_row})
+                    for position, date in prediction_positions(item, start=args.prediction_start_date):
+                        score_row = {name: float(values[row_index, position]) for name, values in score_arrays.items()}
+                        prediction_rows.append({"symbol": item["symbol"], "date": date, "information_date": date, **score_row})
             if prediction_rows:
                 with prediction_temporary.open("a", newline="") as handle:
                     writer = csv.DictWriter(handle, fieldnames=list(prediction_rows[0]))
@@ -2027,6 +2081,8 @@ def main() -> None:
     })
     metrics.update({
         "evaluation_samples": len(evaluation_samples),
+        "sequence_mode": args.sequence_mode, "prediction_rows": prediction_count,
+        "scoring_seconds": perf_counter() - evaluation_started,
         "train_symbols": sorted(train_symbols) if train_symbols is not None else None,
         "test_symbols": sorted(test_symbols) if test_symbols is not None else None,
         "cacheable_rate_states": config.cacheable_rate_states,
@@ -2073,6 +2129,16 @@ def main() -> None:
     torch.save({"state_dict": model.state_dict(), "metrics": metrics, "labels": label_names,
                 "normalization": norms, "asset_classes": asset_classes,
                 "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}}, output_dir / "multirate_mtl_model.pt")
+    if args.inference_only and args.sequence_mode == 'documents' and not args.max_samples and args.prediction_start_date:
+        expected = expected_document_dates.filter(pl.col('date') >= _as_datetime(args.prediction_start_date))
+        if args.prediction_end_date:
+            expected = expected.filter(pl.col('date') <= _as_datetime(args.prediction_end_date))
+        if test_symbols is not None:
+            expected = expected.filter(pl.col('symbol').is_in(test_symbols))
+        if not prediction_count:
+            raise ValueError('Document inference produced no daily scores')
+        coverage = validate_document_predictions(pl.scan_csv(prediction_temporary, try_parse_dates=True), expected)
+        (output_dir/'prediction_coverage.json').write_text(json.dumps(coverage, indent=2))
     if prediction_count:
         os.replace(prediction_temporary, output_dir / "supervised_predictions.csv")
         (output_dir / "prediction_timing.json").write_text(json.dumps({

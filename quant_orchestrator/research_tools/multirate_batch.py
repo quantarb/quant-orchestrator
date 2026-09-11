@@ -15,11 +15,14 @@ class BatchTensors:
             rows = [torch.as_tensor(item[name]) for item in self.batch]
             if len({row.shape for row in rows}) > 1:
                 length=max(row.shape[0] for row in rows)
-                fill = True if name.endswith('_padding') else torch.iinfo(torch.long).min if name.endswith('_timestamps') else float('nan')
+                right_pad = all(item.get('sequence_mode') == 'documents' for item in self.batch)
+                fill = (True if name.endswith('_padding') else
+                        (torch.iinfo(torch.long).max if right_pad else torch.iinfo(torch.long).min) if name.endswith('_timestamps') else
+                        False if rows[0].dtype == torch.bool else 0 if name == 'supervised_targets' else float('nan'))
                 padded=[]
                 for row in rows:
                     prefix=torch.full((length-row.shape[0],*row.shape[1:]),fill,dtype=row.dtype)
-                    padded.append(torch.cat([prefix,row]))
+                    padded.append(torch.cat([row,prefix] if right_pad else [prefix,row]))
                 rows=padded
             self.tensors[name] = torch.stack(rows).to(self.device)
         return self.tensors[name]

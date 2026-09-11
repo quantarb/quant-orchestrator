@@ -27,7 +27,7 @@ def sequence_anchors(daily: pl.LazyFrame, events: pl.DataFrame, *, cutoff: str,
 
 
 def window_supervision(store, symbol: str, dates: torch.Tensor, *, length: int,
-                       tasks: tuple[str, ...], start: datetime, end: datetime):
+                       tasks: tuple[str, ...], start: datetime, end: datetime, positions=None):
     """One bounded query and exact-date join; context-only positions have no label."""
     targets=torch.zeros((length,len(tasks)),dtype=torch.float32)
     valid=torch.zeros_like(targets,dtype=torch.bool)
@@ -39,6 +39,7 @@ def window_supervision(store, symbol: str, dates: torch.Tensor, *, length: int,
     joined=index.lazy().join(labels,on='date',how='left',maintain_order='left').select(*tasks).collect(engine='streaming')
     block=joined.select(pl.all().cast(pl.Float32).fill_nan(None).fill_null(float('nan'))).to_torch()
     observed=torch.isfinite(block)
-    targets[-len(dates):]=block.nan_to_num()
-    valid[-len(dates):]=observed
+    positions = slice(-len(dates), None) if positions is None else positions
+    targets[positions]=block.nan_to_num()
+    valid[positions]=observed
     return targets,valid

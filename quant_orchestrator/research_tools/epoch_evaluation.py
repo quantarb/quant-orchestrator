@@ -110,17 +110,34 @@ def anchored_epoch_backtest(command, directory, start, end, previous=None, *, pe
         excluded_no_calendar_scores=sorted(set(equity_symbols)-set(symbols))),indent=2))
     cache.mkdir(parents=True, exist_ok=True)
     warehouse = Warehouse()
+    mapping_path = option(command, '--backtest-price-symbols')
+    mappings = json.loads(Path(mapping_path).read_text()) if mapping_path else {}
+    price_sources = {symbol: symbol for symbol in symbols}
+    for symbol in symbols:
+        mapping = mappings.get(symbol)
+        if mapping:
+            from datetime import date
+            effective = date.fromisoformat(mapping['effective_date']).isoformat()
+            if start < effective <= end:
+                raise ValueError(f'Backtest interval crosses ticker change for {symbol}; prepare a continuous adjusted price snapshot')
+            if start >= effective:
+                price_sources[symbol] = mapping['symbol']
+    provenance = dict(symbols=price_sources, dated_mappings=mappings, adjustment='splits_and_dividends')
+    provenance_path = cache/'price_sources.json'
+    if provenance_path.exists() and json.loads(provenance_path.read_text()) != provenance:
+        raise ValueError('Frozen backtest price mapping differs; use a new price snapshot directory')
     paths = []
     for symbol in symbols:
         path = cache/f'{symbol}.parquet'
         if not path.exists():
-            frame = warehouse.read_prices(symbol,provider='fmp',start=start,end=end,adjustment='splits_and_dividends')
+            frame = warehouse.read_prices(price_sources[symbol],provider='fmp',start=start,end=end,adjustment='splits_and_dividends')
             if frame.is_empty():
                 raise ValueError(f'Missing adjusted backtest prices for {symbol}')
             temporary = path.with_suffix('.tmp')
             frame.select(pl.lit(symbol).alias('symbol'),'date','close').write_parquet(temporary)
             temporary.replace(path)
         paths.append(path)
+    provenance_path.write_text(json.dumps(provenance,indent=2))
     scores = score_scan.filter(pl.col('symbol').is_in(symbols))
     reports = run_existing_multirate_backtest(scores,pl.scan_parquet(paths),directory/'backtest_existing_strategy')
     for report in reports:

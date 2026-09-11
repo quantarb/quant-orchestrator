@@ -103,9 +103,9 @@ def main():
                         # Larger evaluation batches amortize Python/kernel overhead.
                         # Keep substantial headroom for wide family reconstruction.
                         if free_bytes >= 48 * 1024**3:
-                            inference_batch = 128
+                            inference_batch = 64 if option(command, '--sequence-mode') == 'documents' else 128
                         elif free_bytes >= 24 * 1024**3:
-                            inference_batch = 64
+                            inference_batch = 32 if option(command, '--sequence-mode') == 'documents' else 64
                     invocation = evaluation_command(command, checkpoint.resolve(), directory.resolve(),
                         args.validation_start, args.validation_end, 0 if args.backtest_anchored_hits else args.max_samples,
                         batch_size=inference_batch)
