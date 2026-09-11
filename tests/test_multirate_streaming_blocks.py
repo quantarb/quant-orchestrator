@@ -84,3 +84,66 @@ def test_anchor_ordering_preserves_rows_and_reuses_bounded_issuer_metadata():
         if len(cache)>32:cache.popitem(last=False)
     assert misses==114
     assert len(cache)==32
+
+
+def test_indexed_sequences_match_query_reference_across_years_and_cache_eviction():
+    start = datetime(2018, 1, 1)
+    frame = pl.DataFrame({'symbol': ['A'] * 1800,
+        'date': [start + timedelta(days=i) for i in range(1800)],
+        'x': [None if i % 7 == 0 else float(i) for i in range(1800)]})
+    index = StreamingContext(frame.lazy(), ['x'])
+    for begin, end in [(500,700),(600,850),(3,9),(1600,1799),(700,750)]:
+        args=('A', start+timedelta(days=begin), start+timedelta(days=end),32)
+        actual=index.sequence_window(*args); expected=index._uncached_sequence_window(*args)
+        for a,b in zip(actual,expected):
+            if a is not None:torch.testing.assert_close(a,b,equal_nan=True,rtol=0,atol=0)
+    assert index.cache_hits > 0
+    index.sequence_cache_limit=128
+    actual=index.sequence_window('A',start,start+timedelta(days=900),32)
+    expected=index._uncached_sequence_window('A',start,start+timedelta(days=900),32)
+    for a,b in zip(actual,expected):
+        if a is not None:torch.testing.assert_close(a,b,equal_nan=True,rtol=0,atol=0)
+
+
+def test_sparse_sequence_reserves_each_family_history_and_matches_reference():
+    from quant_orchestrator.research_tools.streaming_context import StreamingFamilyContext
+    rows=[]
+    for year in range(2010,2025):
+        for month in range(1,13):
+            rows.append({'symbol':'A','date':datetime(year,month,1),'target_family':'fast','x':float(month),'y':None})
+        if year % 2 == 0:
+            rows.append({'symbol':'A','date':datetime(year,1,1),'target_family':'slow','x':None,'y':float(year)})
+    index=StreamingFamilyContext(pl.DataFrame(rows).lazy(),['x','y'],families=['fast','slow','absent'],history_per_family=3)
+    for start,end in [(datetime(2020,5,1),datetime(2021,2,1)),(datetime(2020,6,1),datetime(2021,3,1))]:
+        actual=index.sequence_window('A',start,end,9)
+        expected=index._uncached_family_sequence_window('A',start,end,9)
+        for a,b in zip(actual,expected):
+            if a is not None:torch.testing.assert_close(a,b,equal_nan=True,rtol=0,atol=0)
+    assert index.cache_hits > 0
+    assert index.sequence_cache_bytes <= index.sequence_cache_limit
+
+
+def test_disk_index_reopens_without_source_reads_and_preserves_causal_slices(tmp_path):
+    frame=pl.DataFrame({'symbol':['A']*5,'date':[datetime(2020,1,d) for d in range(1,6)],'x':[1.,None,3.,4.,5.]})
+    first=StreamingContext(frame.lazy(),['x'],index_directory=tmp_path)
+    args=('A',datetime(2020,1,2),datetime(2020,1,4),2)
+    expected=first._uncached_sequence_window(*args)
+    actual=first.sequence_window(*args)
+    reopened=StreamingContext(frame.head(0).lazy(),['x'],index_directory=tmp_path)
+    cached=reopened.sequence_window(*args)
+    for values in [actual,cached]:
+        for a,b in zip(values,expected):
+            if a is not None:torch.testing.assert_close(a,b,equal_nan=True,rtol=0,atol=0)
+    values,padding,dates,_=reopened.window('A',datetime(2020,1,3),2)
+    torch.testing.assert_close(values[:,0],torch.tensor([float('nan'),3.]),equal_nan=True)
+    assert dates.max()==pl.Series([datetime(2020,1,3)]).dt.epoch('ns')[0]
+
+
+def test_oversized_disk_index_falls_back_to_bounded_windows(tmp_path):
+    frame=pl.DataFrame({'symbol':['A']*10,'date':[datetime(2020,1,d) for d in range(1,11)],'x':list(range(10))})
+    context=StreamingContext(frame.lazy(),['x'],index_directory=tmp_path)
+    context.index_build_limit=40
+    result=context.sequence_window('A',datetime(2020,1,2),datetime(2020,1,5),2)
+    assert result[0][:,0].tolist()==[0.,1.,2.,3.,4.]
+    assert 'A' in context._oversized_issuers
+    assert not list(tmp_path.glob('*.pt'))

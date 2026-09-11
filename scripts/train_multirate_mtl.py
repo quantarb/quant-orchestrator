@@ -1016,10 +1016,28 @@ def main() -> None:
     # these arrays instead of repeatedly filtering Pandas frames.
     # Feature histories stay lazy. Never concatenate the corpus into tensors
     # or trust a potentially stale normalized context cache from another fit.
-    annual_index = StreamingContext(annual, annual_value_columns)
-    quarterly_index = StreamingContext(quarterly, quarterly_value_columns)
-    daily_index = StreamingContext(daily, daily_value_columns)
-    sparse_index = StreamingFamilyContext(sparse, sparse_value_columns, families=sparse_input_families)
+    # Cache only normalized observations, never trainable encoder outputs.
+    # Fits with different data, normalization or feature layouts cannot share files.
+    import hashlib
+    index_payload = {
+        'version': 'bounded-issuer-tensors-v1', 'inputs': input_fingerprint,
+        'normalization': norms, 'columns': rate_columns,
+        'sparse_columns': sparse_value_columns, 'sparse_families': sparse_input_families,
+        'issuer_context': args.issuer_context,
+    }
+    if args.option_panel is not None or args.option_target_events is not None:
+        index_payload['option_configuration'] = {key: str(value) for key, value in vars(args).items() if key.startswith('option_')}
+        index_payload['option_input_sha256'] = {}
+        for source in (args.option_panel, args.option_target_events):
+            if source is not None:
+                with source.open('rb') as handle:
+                    index_payload['option_input_sha256'][str(source.resolve())] = hashlib.file_digest(handle, 'sha256').hexdigest()
+    index_signature = hashlib.sha256(json.dumps(index_payload, sort_keys=True).encode()).hexdigest()
+    index_root = root.parent / 'normalized_context_indexes' / index_signature
+    annual_index = StreamingContext(annual, annual_value_columns, index_directory=index_root/'annual')
+    quarterly_index = StreamingContext(quarterly, quarterly_value_columns, index_directory=index_root/'quarterly')
+    daily_index = StreamingContext(daily, daily_value_columns, index_directory=index_root/'daily')
+    sparse_index = StreamingFamilyContext(sparse, sparse_value_columns, families=sparse_input_families, index_directory=index_root/'sparse')
     sparse_window_length = sparse_index.window_length
 
     # A document can be anchored by a regular annual observation or by a
@@ -2017,6 +2035,12 @@ def main() -> None:
     })
     metrics["input_fingerprint"] = input_fingerprint
     metrics["feature_family_dimensions"] = feature_family_dimensions
+    metrics["normalized_context_indexes"] = {
+        "directory": str(index_root), "fingerprint": index_signature,
+        "max_build_tensor_bytes": annual_index.index_build_limit,
+        "max_mapped_issuers_per_rate": 8,
+        "contents": "normalized observations only; no trainable encoded states",
+    }
     metrics["streaming_blocks"] = {rate: {"hits": index.cache_hits, "misses": index.cache_misses, "max_blocks": 32 * (len(sparse_input_families) if rate == "sparse" else 1), "extra_rows_per_block": 1024}
         for rate, index in {"annual": annual_index, "quarterly": quarterly_index, "daily": daily_index, "sparse": sparse_index}.items()}
     metrics["context_cache"] = {
