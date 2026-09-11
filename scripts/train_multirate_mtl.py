@@ -50,6 +50,7 @@ from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multir
     DOCUMENT_TASK_NAMES,
     FUND_ACTIVITY_SUPERVISED_TASK_NAMES,
     HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES,
+    TRADE_EVENT_SUPERVISED_TASK_NAMES,
     HITS_SUPERVISED_TASK_NAMES,
     ORACLE_SUPERVISED_TASK_NAMES,
     PREDICTION_TASK_NAMES,
@@ -1673,7 +1674,7 @@ def main() -> None:
                     task_observations[f"{asset}:{name}"] += count
             target = supervised_targets[:, :, task_index]
             prediction = output["token_outputs"][name].squeeze(-1)
-            if name in ORACLE_SUPERVISED_TASK_NAMES or name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES or name in HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES:
+            if name in ORACLE_SUPERVISED_TASK_NAMES or name in FUND_ACTIVITY_SUPERVISED_TASK_NAMES or name in HOLDER_ACTIVITY_SUPERVISED_TASK_NAMES or name in TRADE_EVENT_SUPERVISED_TASK_NAMES:
                 task_losses[name] = nn.functional.binary_cross_entropy_with_logits(prediction[valid], target[valid])
             else:
                 task_losses[name] = nn.functional.smooth_l1_loss(prediction[valid], target[valid])
