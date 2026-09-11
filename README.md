@@ -430,6 +430,8 @@ the sequence start plus dated updates. The epoch monitor drains immutable epoch
 checkpoints and prints separate annual backtests. `--epoch-evaluation-dir` makes
 training wait for those reports before starting the next epoch;
 `--resume-training` restores checkpoint weights, optimizer, and batch position.
+Completed epochs can also be compared with an optional predicted-Oracle gate via
+`research_tools.oracle_gate_comparison`, using the same frozen backtest inputs.
 Optional BF16 autocast is available for measured precision/batch-size comparisons.
 Masked and next-observation objectives reconstruct individual values at token
 and subtoken levels. Subtoken MTP masks features within each family; token MTP

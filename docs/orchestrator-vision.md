@@ -255,3 +255,8 @@ Training can opt into synchronous epoch evaluation with
 `--epoch-evaluation-dir`: both the model-evaluation report and portfolio report
 must exist before the next epoch starts. `--resume-training` restores the saved
 weights, optimizer and batch cursor; immutable epoch reports are retained.
+
+`research_tools.oracle_gate_comparison` compares predicted-Oracle entry/exit
+permission against completed epoch baselines using their exact frozen price
+snapshots and score calendars. The optional gate is implemented in the existing
+backtest score adapter; original trading-engine logic and training remain intact.

@@ -204,3 +204,39 @@ verified reusable-adapter outputs under `verified/`. All four books matched the
 direct original-engine invocation to 1e-10 on equity, return, Sharpe, drawdown
 and event counts. Source files and input prices/scores have recorded hashes.
 Twelve epoch-monitor/shared-book tests passed.
+
+## Fresh v8 Oracle-gate comparison
+
+The optional `oracle_gate=True` variant in `existing_multirate_backtest.py` adds
+predicted Oracle permission to the same original score policy and shared-book
+engine. HITS ranks are computed on the full original universe before gating.
+Entries require the side's Oracle probability >= 0.5, strictly above the
+opposite side, plus existing HITS eligibility. Sell/cover probability >= 0.5
+vetoes entry and closes the corresponding position. Losing Oracle direction or
+existing HITS agreement also closes it. A side probability falling below 0.5
+alone blocks new entries but does not force an existing position out. This is
+an additional gate on the current strategy, not a restoration of the earlier
+Oracle replay's different sizing, issuer cap, costs, or execution timing.
+
+`research_tools.oracle_gate_comparison.compare_epoch_oracle_gate` reuses each
+completed epoch's full predictions and frozen baseline price files. Capacity,
+5% sizing for this universe, adjusted prices, 5.5-bps costs, and execution remain
+identical. No training data, weights, or thresholds are fitted by this comparison.
+The detached watcher under the fresh run's evaluation directory compares epochs
+as they complete and writes `epoch_NNNN/oracle_gate_comparison.json` plus the
+native engine artifacts under `epoch_NNNN/oracle_gate/{year}/`.
+
+Epoch-3 long results (2026 ends September 9):
+
+| Period | Original return | Gated return | Original Sharpe | Gated Sharpe | Gated mean exposure |
+|---|---:|---:|---:|---:|---:|
+| 2024 | 53.63% | 7.07% | 2.66 | 2.14 | 9.98% |
+| 2025 | 32.79% | 3.21% | 1.55 | 0.72 | 12.52% |
+| 2026 YTD | 14.04% | 6.74% | 1.77 | 2.34 | 13.55% |
+
+Gated maximum drawdowns were 1.12%, 3.98%, and 1.87% respectively. Epoch 1
+made no gated trades on either side. Epoch 2 gated long returns were 17.32%,
+2.99%, and 9.77%; gated shorts made no trades across epochs 1–3. Their 0% return
+reflects cash, not a successful short selection. The 0.5 gate did not improve
+long total returns in these comparisons; its lower exposure reduced drawdowns.
+The ungated baseline remains the primary run; both variants are retained.
