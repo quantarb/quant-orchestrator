@@ -96,18 +96,33 @@ def main():
                     checkpoint = directory / 'model.pt'
                     snapshot.replace(checkpoint)
                     status('evaluating', epoch=epoch+1)
+                    inference_batch = min(int(option(command, '--batch-size') or 32), 64)
+                    device_name = option(command, '--device') or 'cpu'
+                    if device_name.startswith('cuda') and torch.cuda.is_available():
+                        free_bytes, _ = torch.cuda.mem_get_info(torch.device(device_name))
+                        # Larger evaluation batches amortize Python/kernel overhead.
+                        # Keep substantial headroom for wide family reconstruction.
+                        if free_bytes >= 48 * 1024**3:
+                            inference_batch = 128
+                        elif free_bytes >= 24 * 1024**3:
+                            inference_batch = 64
                     invocation = evaluation_command(command, checkpoint.resolve(), directory.resolve(),
-                        args.validation_start, args.validation_end, 0 if args.backtest_anchored_hits else args.max_samples)
+                        args.validation_start, args.validation_end, 0 if args.backtest_anchored_hits else args.max_samples,
+                        batch_size=inference_batch)
                     (directory / 'command.json').write_text(json.dumps(invocation, indent=2))
+                    inference_started = time.monotonic()
                     with (directory / 'inference.log').open('w') as log:
                         result = subprocess.run(invocation, stdout=log, stderr=subprocess.STDOUT)
                     if result.returncode:
                         raise RuntimeError(f'Epoch {epoch+1} evaluation failed; inspect {directory / "inference.log"}')
                     report = trend_report(epoch+1, json.loads((directory/'ntp_evaluation.json').read_text()), previous)
+                    report['inference_seconds'] = time.monotonic() - inference_started
                     if args.backtest_anchored_hits:
-                        status('backtesting', epoch=epoch+1)
+                        backtest_started = time.monotonic()
+                        status('backtesting', epoch=epoch+1, inference_seconds=report['inference_seconds'])
                         backtest = yearly_epoch_backtests if args.backtest_by_year else anchored_epoch_backtest
                         previous_backtest = backtest(command, directory, args.validation_start, args.validation_end, previous_backtest)
+                        report['backtest_seconds'] = time.monotonic() - backtest_started
                         print(f"backtest_epoch: {epoch+1}\n" + format_backtest_report(previous_backtest), flush=True)
                     (directory/'epoch_metrics.json').write_text(json.dumps(report, indent=2))
                     print(format_epoch_report(report), flush=True)

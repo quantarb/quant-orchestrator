@@ -1204,7 +1204,7 @@ def main() -> None:
                     supervised_targets, supervised_valid = window_supervision(
                         supervised_target_map, current_symbol, daily_dates, length=DAILY_WINDOW,
                         tasks=SUPERVISED_TARGET_TASK_NAMES, start=current_supervision_start, end=current_anchor)
-            elif len(daily_dates):
+            elif len(daily_dates) and not args.inference_only:
                 offset = DAILY_WINDOW - len(daily_dates)
                 for position, date in enumerate(daily_dates):
                     values = supervised_target_map.get((current_symbol, _as_datetime(date)), {}) if _as_datetime(date) == current_anchor else {}
@@ -1780,6 +1780,12 @@ def main() -> None:
         scope = 'remaining_batches' if epoch == resume_epoch and resume_batch else 'full_epoch'
         print(f"epoch {epoch + 1}/{args.epochs} loss={epoch_loss:.6f} validation_loss={val_loss:.6f} loss_scope={scope}", flush=True)
         if args.epoch_evaluation_dir:
+            # Release unused activation reservations before the evaluator starts
+            # another CUDA process. Model and optimizer tensors remain intact.
+            import gc
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
             wait_for_epoch_backtest(args.epoch_evaluation_dir,epoch+1)
         if stale_epochs >= max(1, args.patience):
             print(f"early stopping after epoch {epoch + 1}; best_loss={best_loss:.6f}", flush=True)
@@ -1880,7 +1886,7 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    evaluation_samples = sorted(evaluation_samples, key=lambda item: (item["date"], item["symbol"]))
+    evaluation_samples = sorted(evaluation_samples, key=lambda item: (item["symbol"], item["date"]))
     model.eval(); predictions: dict[str, list[torch.Tensor]] = {name: [] for name in enabled_document_tasks[1:]}; states: list[torch.Tensor] = []; family_states: list[torch.Tensor] = []; family_valid_rows: list[torch.Tensor] = []
     prediction_rows: list[dict[str, object]] = []
     prediction_count = 0
@@ -1900,13 +1906,16 @@ def main() -> None:
         # than the training step. Keep the scalable training batch size, but use a
         # bounded evaluation batch to avoid accelerator kernel failures on large
         # corpora.
-        eval_batch_size = min(args.batch_size, 64)
+        eval_batch_size = min(args.batch_size, 128 if args.inference_only else 64)
+        evaluation_started = perf_counter()
         for start in range(0, len(evaluation_samples), eval_batch_size):
             batch = evaluation_samples[start:start + eval_batch_size]
             if args.inference_only:
                 batch_symbols = ",".join(dict.fromkeys(str(item.get("symbol", "?")) for item in batch))
                 print(
-                    f"[multirate-inference] scoring symbols {start + 1}-{start + len(batch)}/{len(evaluation_samples)}: {batch_symbols}",
+                    f"[multirate-inference] scoring symbols {start + 1}-{start + len(batch)}/{len(evaluation_samples)}: {batch_symbols} "
+                    f"elapsed_s={perf_counter() - evaluation_started:.1f} "
+                    f"observations_per_s={start / max(perf_counter() - evaluation_started, 1e-9):.2f}",
                     flush=True,
                 )
             stack = BatchTensors(batch, device)
@@ -1923,7 +1932,13 @@ def main() -> None:
             annual_batch, annual_mask = context("annual", "annual_padding")
             quarterly_batch, quarterly_mask = context("quarterly", "quarterly_padding")
             sparse_batch, sparse_padding_mask = context("sparse", "sparse_padding")
-            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, issuer_streams=issuer_inputs(batch, stack), daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"), quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"), daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, DAILY_WINDOW))
+            inference_context_ids = {}
+            for rate in ("annual", "quarterly"):
+                keys = [item[f"{rate}_context_key"] for item in batch]
+                unique = {key: index for index, key in enumerate(dict.fromkeys(keys))}
+                if len(unique) < len(batch):
+                    inference_context_ids[rate] = torch.tensor([unique[key] for key in keys], device=device)
+            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, compute_document_outputs=not args.skip_embeddings or not args.disable_document_tasks, rate_context_ids=inference_context_ids, issuer_streams=issuer_inputs(batch, stack), daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"), quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"), daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, DAILY_WINDOW))
             for rate, widths in reconstruction_widths.items():
                 ntp_audit.update([str(item["symbol"]) for item in batch], rate,
                     sparse_input_families if rate == "sparse" else list(feature_family_dimensions), widths,
@@ -1952,24 +1967,25 @@ def main() -> None:
                 prediction_rows.clear()
             if not args.skip_embeddings:
                 states.append(output["document_prototypes"].cpu())
-            family_labels = torch.arange(len(family_names), device=device).view(1, -1).expand(len(batch), -1)
-            family_valid = torch.zeros((len(batch), len(family_names)), dtype=torch.bool, device=device)
-            for rate in ("annual", "quarterly", "daily", "sparse"):
-                raw = stack(rate)
-                if rate == "sparse":
-                    local_count, width, family_offset = len(sparse_input_families), len(raw_sparse_columns), len(feature_family_dimensions)
-                    observed = torch.isfinite(raw).reshape(raw.shape[0], raw.shape[1], local_count, width).any(dim=-1).any(dim=1)
-                else:
-                    family_offset = 0
-                    offset = 0
-                    family_observed = []
-                    for family in feature_family_dimensions:
-                        width = feature_family_dimensions[family]
-                        family_observed.append(torch.isfinite(raw[:, :, offset:offset + width]).any(dim=-1).any(dim=1))
-                        offset += width
-                    observed = torch.stack(family_observed, dim=1)
-                    local_count = len(feature_family_dimensions)
-                family_valid[:, family_offset:family_offset + local_count] |= observed
+            if not args.skip_embeddings or "family" in enabled_document_tasks:
+                family_labels = torch.arange(len(family_names), device=device).view(1, -1).expand(len(batch), -1)
+                family_valid = torch.zeros((len(batch), len(family_names)), dtype=torch.bool, device=device)
+                for rate in ("annual", "quarterly", "daily", "sparse"):
+                    raw = stack(rate)
+                    if rate == "sparse":
+                        local_count, width, family_offset = len(sparse_input_families), len(raw_sparse_columns), len(feature_family_dimensions)
+                        observed = torch.isfinite(raw).reshape(raw.shape[0], raw.shape[1], local_count, width).any(dim=-1).any(dim=1)
+                    else:
+                        family_offset = 0
+                        offset = 0
+                        family_observed = []
+                        for family in feature_family_dimensions:
+                            width = feature_family_dimensions[family]
+                            family_observed.append(torch.isfinite(raw[:, :, offset:offset + width]).any(dim=-1).any(dim=1))
+                            offset += width
+                        observed = torch.stack(family_observed, dim=1)
+                        local_count = len(feature_family_dimensions)
+                    family_valid[:, family_offset:family_offset + local_count] |= observed
             if not args.skip_embeddings:
                 family_states.append(output["family_document_prototypes"].cpu())
                 family_valid_rows.append(family_valid.cpu())

@@ -151,3 +151,14 @@ def test_epoch_gate_waits_for_both_metrics_and_backtest(tmp_path,monkeypatch):
     evaluation.wait_for_epoch_backtest(tmp_path,3)
     assert waits==[5]
     assert json.loads((tmp_path/'training_gate.json').read_text())['stage']=='backtest_complete'
+
+
+def test_evaluation_batch_override_preserves_training_command_and_dates():
+    from quant_orchestrator.research_tools.epoch_evaluation import evaluation_command
+    base=['python','train.py','--batch-size','32','--corpus','corpus','--skip-predictions']
+    result=evaluation_command(base,'model.pt','evaluation','2024-01-02','2026-09-09',0,batch_size=128)
+    assert base[base.index('--batch-size')+1]=='32'
+    assert result[result.index('--batch-size')+1]=='128'
+    assert result[result.index('--prediction-start-date')+1]=='2024-01-02'
+    assert result[result.index('--max-samples')+1]=='0'
+    assert '--inference-only' in result and '--skip-predictions' not in result

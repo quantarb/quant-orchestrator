@@ -39,7 +39,8 @@ def test_subtoken_temporal_task_factory_defines_exact_contract():
     assert bundle.task_names == TEMPORAL_MTL_TASK_NAMES
     assert len(bundle.corpus) == 1
     assert len(bundle.document_tasks) == 7
-    assert len(bundle.supervised_tasks) == 22
+    assert len(bundle.supervised_tasks) == 26
+    assert {"government_is_buy", "government_is_sell", "insider_is_buy", "insider_is_sell"} <= {task.task_name for task in bundle.supervised_tasks}
     assert len(bundle.prediction_tasks) == 16
     assert {task.level for task in bundle.prediction_tasks if task.task_name in SUBTOKEN_PREDICTION_TASK_NAMES} == {"subtoken"}
     assert {task.level for task in bundle.prediction_tasks if task.task_name in TOKEN_PREDICTION_TASK_NAMES} == {"token"}

@@ -32,7 +32,7 @@ def option(command, flag):
     return command[command.index(flag) + 1] if flag in command else None
 
 
-def evaluation_command(command, checkpoint, output, start, end, max_samples):
+def evaluation_command(command, checkpoint, output, start, end, max_samples, *, batch_size=None):
     command = list(command)
     for flag in ('--skip-predictions', '--inference-only'):
         if flag in command:
@@ -44,6 +44,13 @@ def evaluation_command(command, checkpoint, output, start, end, max_samples):
             command[command.index(flag) + 1] = value
         else:
             command += [flag, value]
+    if batch_size is not None:
+        if batch_size < 1:
+            raise ValueError('Inference batch size must be positive')
+        if '--batch-size' in command:
+            command[command.index('--batch-size')+1] = str(batch_size)
+        else:
+            command += ['--batch-size', str(batch_size)]
     return command + ['--inference-only']
 
 

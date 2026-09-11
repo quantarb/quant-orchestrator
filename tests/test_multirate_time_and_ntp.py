@@ -105,3 +105,48 @@ def test_empty_family_coverage_is_reported_instead_of_silently_omitted(tmp_path)
     assert len(rows) == 2
     assert all(row['values'] == 0 and row['model_mse'] is None for row in rows)
     audit.close()
+
+
+def test_audit_first_prediction_survives_batch_duplicates_and_cache_eviction(tmp_path):
+    values = torch.tensor([[[1.], [3.], [6.]]]).repeat(3, 1, 1)
+    dates = torch.tensor([[1, 2, 3]]).repeat(3, 1) * DAY_NS
+    padding = torch.zeros(3, 3, dtype=torch.bool)
+    targets = reconstruction_targets(values, padding, dates, torch.zeros_like(values, dtype=torch.bool), (1,))
+    predictions = {'next_daily_' + level: targets['next_' + level][0].clone() for level in ('token', 'subtoken')}
+    # X repeats within the batch, with deliberately worse later predictions.
+    for prediction in predictions.values():
+        prediction[2] += 100
+    audit = NTPPersistenceAudit(tmp_path / 'duplicates.sqlite')
+    audit.update(['X', 'Y', 'X'], 'daily', ['price'], (1,), values, padding, dates, predictions)
+    initial = audit.report()
+    assert all(row['unique_pairs'] == 4 and row['model_mse'] == 0 for row in initial['metrics'])
+    assert audit.duplicate_pairs_skipped == 4
+    # Evict X/Y naturally, then revisit with worse predictions. SQLite must
+    # retain the original values, independently of the bounded Python cache.
+    for i in range(10):
+        audit.update([f'other{i}'], 'daily', ['price'], (1,), values[:1], padding[:1], dates[:1],
+                     {name: prediction[:1] for name, prediction in predictions.items()})
+    audit.update(['X', 'Y'], 'daily', ['price'], (1,), values[:2], padding[:2], dates[:2],
+                 {name: prediction[:2] + 100 for name, prediction in predictions.items()})
+    assert all(row['unique_pairs'] == 24 and row['model_mse'] == 0 for row in audit.report()['metrics'])
+    audit.close()
+
+
+def test_vectorized_successors_match_row_loop_for_gaps_ties_and_missing_families():
+    from quant_orchestrator.research_tools.multirate_objectives import next_observation_targets
+    generator = torch.Generator().manual_seed(23)
+    for length in (1, 2, 17, 252):
+        dates = torch.randint(0, 4, (3, length), generator=generator).cumsum(1) * DAY_NS
+        valid = torch.rand(3, length, 5, generator=generator) > .65
+        valid[:, :, 0] = False
+        valid[0, :, 1] = True
+        values = torch.randn(3, length, 5, generator=generator)
+        following = torch.full((3, length + 1, 5), length, dtype=torch.long)
+        for index in range(length - 1, -1, -1):
+            following[:, index] = torch.where(valid[:, index], index, following[:, index + 1])
+        later = torch.searchsorted(dates.contiguous(), dates.contiguous(), right=True)
+        indices = following.gather(1, later.unsqueeze(-1).expand(-1, -1, 5))
+        expected = values.gather(1, indices.clamp_max(length - 1)), (indices < length) & valid
+        actual = next_observation_targets(values, valid, dates)
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)

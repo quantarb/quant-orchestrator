@@ -1,6 +1,8 @@
 """Disk-deduplicated, per-family NTP comparison with last-known-value persistence."""
 import sqlite3
+from collections import OrderedDict
 import torch
+import numpy as np
 from .multirate_objectives import family_channels, reconstruction_targets, next_observation_targets
 
 
@@ -11,6 +13,8 @@ class NTPPersistenceAudit:
         self.connection.execute('CREATE TABLE IF NOT EXISTS pairs (symbol TEXT, rate TEXT, level TEXT, family TEXT, source INTEGER, target INTEGER, n INTEGER, model_error REAL, baseline_error REAL, PRIMARY KEY(symbol,rate,level,family,source,target))')
         self.start_ns, self.end_ns = start_ns, end_ns
         self.groups = set()
+        self._recent_pairs = OrderedDict()
+        self.duplicate_pairs_skipped = 0
 
     @torch.no_grad()
     def update(self, symbols, rate, names, widths, values, padding, dates, predictions):
@@ -41,11 +45,40 @@ class NTPPersistenceAudit:
             baseline_error = torch.where(keep, (family_channels(baseline, widths).double() - target.double()).square(), 0).sum(-1)
             if not torch.isfinite(model_error).all() or not torch.isfinite(baseline_error).all():
                 raise ValueError('Nonfinite NTP evaluation errors')
-            indices = (counts > 0).nonzero().cpu().tolist()
-            counts, model_error, baseline_error, future, source = [t.cpu() for t in (counts, model_error, baseline_error, future, dates)]
-            for b, t, f in indices:
-                inserts.append((symbols[b], rate, level, names[f], int(source[b,t]), int(future[b,t,f]),
-                    int(counts[b,t,f]), float(model_error[b,t,f]), float(baseline_error[b,t,f])))
+            # Gather columns on-device, then transfer each column once. Python
+            # scalar indexing previously repeated millions of tiny tensor operations.
+            b, t, f = (counts > 0).nonzero(as_tuple=True)
+            columns = [b, f, dates[b,t], future[b,t,f], counts[b,t,f],
+                       model_error[b,t,f], baseline_error[b,t,f]]
+            host_columns = [column.cpu().numpy() for column in columns]
+            # Rolling windows repeat most source/target pairs within a batch.
+            # Deduplicate in native array code before converting rows to Python;
+            # return_index preserves the original first-observation semantics.
+            symbol_ids = {symbol: index for index, symbol in enumerate(dict.fromkeys(symbols))}
+            row_symbols = np.asarray([symbol_ids[symbol] for symbol in symbols], dtype=np.int64)
+            keys = np.rec.fromarrays([row_symbols[host_columns[0]], *host_columns[1:4]])
+            _, first = np.unique(keys, return_index=True)
+            first.sort()
+            self.duplicate_pairs_skipped += len(keys) - len(first)
+            host_columns = [column[first].tolist() for column in host_columns]
+            for bi, fi, source, target, count, model_sum, baseline_sum in zip(*host_columns):
+                group = (symbols[bi], rate, level)
+                if group not in self._recent_pairs:
+                    self._recent_pairs[group] = set()
+                    if len(self._recent_pairs) > 16:
+                        self._recent_pairs.popitem(last=False)
+                self._recent_pairs.move_to_end(group)
+                seen = self._recent_pairs[group]
+                key = (names[fi], source, target)
+                if key in seen:
+                    self.duplicate_pairs_skipped += 1
+                    continue
+                # SQLite remains authoritative after eviction. Forgetting a key
+                # only costs another INSERT OR IGNORE; it never changes a result.
+                if len(seen) >= 32768:
+                    seen.clear()
+                seen.add(key)
+                inserts.append((symbols[bi], rate, level, names[fi], source, target, count, model_sum, baseline_sum))
         self.connection.executemany('INSERT OR IGNORE INTO pairs VALUES (?,?,?,?,?,?,?,?,?)', inserts)
         self.connection.commit()
 

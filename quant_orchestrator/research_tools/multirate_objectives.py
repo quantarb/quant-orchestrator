@@ -90,9 +90,14 @@ def reconstruction_targets(values, padding, dates, selected, widths, *, family_s
 def next_observation_targets(values, valid, dates):
     """Skip absent families and same-date rows without exposing the target."""
     batch, length, families = values.shape
-    following = torch.full((batch, length + 1, families), length, device=values.device, dtype=torch.long)
-    for index in range(length - 1, -1, -1):
-        following[:, index] = torch.where(valid[:, index], index, following[:, index + 1])
+    rows = torch.arange(length, device=values.device).view(1, -1, 1)
+    # A suffix minimum finds the next observed row for every family at once.
+    # The former date loop launched one CUDA operation per history row, once
+    # again for every family. Integer indices preserve exact target selection.
+    candidates = torch.where(valid, rows, length)
+    following = candidates.flip(1).cummin(1).values.flip(1)
+    following = torch.cat((following, torch.full((batch, 1, families), length,
+                                                device=values.device, dtype=torch.long)), dim=1)
     later = torch.searchsorted(dates.contiguous(), dates.contiguous(), right=True)
     indices = following.gather(1, later.unsqueeze(-1).expand(-1, -1, families))
     exists = (indices < length) & valid
