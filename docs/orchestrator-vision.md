@@ -260,3 +260,8 @@ weights, optimizer and batch cursor; immutable epoch reports are retained.
 permission against completed epoch baselines using their exact frozen price
 snapshots and score calendars. The optional gate is implemented in the existing
 backtest score adapter; original trading-engine logic and training remain intact.
+
+The comparison accepts `mode="directional"` for relative buy/short agreement
+without an absolute Oracle entry threshold or sell/cover veto. Directional
+artifacts use `oracle_directional_gate` paths, preserving strict and baseline
+results. The fresh v8 workflow watches completed epochs for both comparisons.

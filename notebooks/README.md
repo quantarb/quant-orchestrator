@@ -51,7 +51,9 @@ checkpoints and prints separate annual backtests. `--epoch-evaluation-dir` makes
 training wait for those reports before starting the next epoch;
 `--resume-training` restores checkpoint weights, optimizer, and batch position.
 Completed epochs can also be compared with an optional predicted-Oracle gate via
-`research_tools.oracle_gate_comparison`, using the same frozen backtest inputs.
+`research_tools.oracle_gate_comparison`, using the same frozen backtest inputs. Pass `mode="directional"` to require only
+buy-versus-short agreement in addition to HITS; the strict threshold/exit-veto
+comparison remains separately available.
 Optional BF16 autocast is available for measured precision/batch-size comparisons.
 Masked and next-observation objectives reconstruct individual values at token
 and subtoken levels. Subtoken MTP masks features within each family; token MTP

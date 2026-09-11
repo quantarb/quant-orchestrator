@@ -240,3 +240,26 @@ made no gated trades on either side. Epoch 2 gated long returns were 17.32%,
 reflects cash, not a successful short selection. The 0.5 gate did not improve
 long total returns in these comparisons; its lower exposure reduced drawdowns.
 The ungated baseline remains the primary run; both variants are retained.
+
+### Directional-only comparison
+
+`compare_epoch_oracle_gate(directory, mode="directional")` adds only buy > short
+for long entry/holding and short > buy for short entry/holding to the original
+HITS permissions. Ties permit neither side. There is no absolute Oracle entry
+threshold and sell/cover do not veto trades. HITS ranks are computed before the
+gate and remain unchanged. Prices, capacity, costs and execution stay identical.
+Outputs are separate under `oracle_directional_gate/{year}/` and
+`oracle_directional_gate_comparison.json`. The fresh v8 directional watcher
+completed epochs 1–3 and waits for subsequent completed epoch baselines.
+
+Epoch 3 capital returns (separate $100,000 annual books, 2026 through Sept 9):
+
+| Period | Original long | Directional long | Original short | Directional short |
+|---|---:|---:|---:|---:|
+| 2024 | 53.63% | 6.31% | -31.29% | -34.17% |
+| 2025 | 32.79% | 7.00% | -32.43% | -26.83% |
+| 2026 YTD | 14.04% | 16.61% | -12.42% | -22.67% |
+
+Directional long exposure averaged 27.24%, 28.78%, and 36.60%, respectively;
+short exposure averaged 93.93%, 94.84%, and 93.69%. Results vary substantially
+across epochs; this comparison does not establish a consistent improvement.
