@@ -405,3 +405,20 @@ stochastic training. New batch checkpoints include CPU/CUDA RNG states. The
 resumed partial epoch's printed loss covers remaining batches only, and best-loss
 selection restarts over the continued epochs. Progress speed and ETA now use
 elapsed time within the current epoch, excluding waits for evaluation.
+
+### Fresh synchronous $100B run (v8, current)
+
+The user explicitly requested a new model from scratch. The resumed v7 trainer,
+its supervisor, and its evaluation processes were stopped; their artifacts are
+retained. The active run is `100B/train_sequence_fresh_v8/`, recorded in
+`training_command_fresh_v8.json` and `launch_manifest.json`. There is no checkpoint
+argument and no resume flag: weights and optimizer initialize fresh at epoch 1
+of 12. The existing frozen corpus supplies pre-2024 training data, using the same
+Polars sequence pipeline and $100B universe.
+
+The run passes `--epoch-evaluation-dir` from the beginning. Each completed epoch
+waits for its own 2024, 2025, and 2026 YTD (through September 9) evaluation and
+original-strategy backtests before advancing. It uses a new evaluation directory,
+so no old epoch report can satisfy the wait. Logs are `training_fresh_v8.log`,
+`epoch_validation_fresh_v8.log`, and `supervisor_fresh_v8.log`. The detached
+`start_fresh_training_v8.py` supervisor propagates monitor failures to the trainer.
