@@ -1833,7 +1833,9 @@ def main() -> None:
             save_batch_checkpoint(epoch, batch_index, batch_loss, epoch_complete=batch_index == total_batches)
 
     if args.epoch_evaluation_dir and not args.inference_only:
-        wait_for_epoch_backtest(args.epoch_evaluation_dir,resume_epoch)
+        args.epoch_evaluation_dir.mkdir(parents=True,exist_ok=True)
+        (args.epoch_evaluation_dir/'training_gate.json').write_text(json.dumps(
+            dict(stage='training',epoch=resume_epoch+1)))
     losses = [] if args.inference_only else trainer.fit(
         args.epochs,
         training_step,

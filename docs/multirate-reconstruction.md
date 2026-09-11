@@ -389,14 +389,14 @@ The $100B v7 run now uses `--resume-training --checkpoint ...
 --epoch-evaluation-dir ...` to restore model parameters, optimizer state, and the
 saved epoch/batch cursor. `Trainer.fit` skips already completed batches using
 the original seeded epoch ordering. The restart snapshot is epoch 4, batch 70;
-the trainer first waits for reports through epoch 3, then completes epoch 4.
+the trainer resumes epoch 4 immediately, without waiting for earlier reports.
 Every later epoch waits for both its evaluation metrics and backtest results
-before the next epoch starts. The existing epoch-1 scoring process is retained
-until completion, after which a supervisor replaces the monitor's training PID.
+before the next epoch starts. The active scoring process is retained until completion, after which a
+supervisor replaces the monitor's training PID.
 
 The restart uses the same corpus, model, Polars sequence pipeline, and original
 2024/2025/2026 YTD strategy. Artifacts include `synchronous_resume_snapshot.json`,
-`synchronous_resume_command.json`, and `restart_synchronous_training.py` in the
+`synchronous_resume_command.json`, and `resume_training_now.py` in the
 100B run root. `training_gate.json` reports the blocking evaluation epoch.
 
 The older checkpoint did not record RNG state, so this continuation preserves
