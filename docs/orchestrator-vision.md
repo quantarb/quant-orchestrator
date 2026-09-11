@@ -265,3 +265,8 @@ The comparison accepts `mode="directional"` for relative buy/short agreement
 without an absolute Oracle entry threshold or sell/cover veto. Directional
 artifacts use `oracle_directional_gate` paths, preserving strict and baseline
 results. The fresh v8 workflow watches completed epochs for both comparisons.
+
+`research_tools.multirate_source_inventory` stages broad warehouse histories
+using bounded Polars reads and records missing sources, schemas, historical
+coverage and ambiguous cadence. See `docs/multirate-expanded-coverage.md`; this
+audit is preparation for expanded training, not a completed expanded model.

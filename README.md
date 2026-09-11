@@ -440,3 +440,8 @@ and subtoken levels. Subtoken MTP masks features within each family; token MTP
 masks whole families. NTP predicts coherent next family and combined-token observations.
 See the [reconstruction contract](docs/multirate-reconstruction.md) for the objective details, checkpoint
 requirements, executed diagnostic scope, and longer-history 1T experiment.
+
+`research_tools.multirate_source_inventory` stages broad warehouse histories
+using bounded Polars reads and records missing sources, schemas, historical
+coverage and ambiguous cadence. See `docs/multirate-expanded-coverage.md`; this
+audit is preparation for expanded training, not a completed expanded model.
