@@ -78,6 +78,8 @@ def prediction_positions(item, *, start=None):
         if item.get('sequence_mode') in ('documents', 'annual_memory'):
             if date < item['document_start'] or date > item['date']:
                 continue
+            if item.get('daily_score_valid') is not None and not item['daily_score_valid'][position+1]:
+                continue
             yield position + 1, date
         elif date == item['date']:
             yield len(item['daily']) - len(item['daily_dates']) + position, date

@@ -29,7 +29,7 @@ from quant_orchestrator.research_tools.streaming_context import StreamingContext
 from quant_orchestrator.research_tools.sequence_training import sequence_anchors, window_supervision
 from quant_orchestrator.research_tools.document_sequences import DOCUMENT_CONTRACT, document_anchors, document_window, prediction_positions, validate_document_predictions
 from quant_orchestrator.research_tools.document_sequences import TRAINING_DOCUMENT_CONTRACT, issuer_observation_dates
-from quant_orchestrator.research_tools.annual_memory import ANNUAL_CONTRACT, AnnualCorpus, AnnualMemory, annual_window
+from quant_orchestrator.research_tools.annual_memory import ANNUAL_CONTRACT, AnnualCorpus, AnnualMemory, annual_window, inference_interval, cold_inference_anchors
 from quant_orchestrator.research_tools.epoch_evaluation import wait_for_epoch_backtest
 from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups, input_event_families
 from quant_orchestrator.research_tools.multirate_objectives import (
@@ -265,7 +265,7 @@ class _LazySample(dict):
 
     _LAZY_KEYS = frozenset({
         "annual", "annual_padding", "quarterly", "quarterly_padding",
-        "daily", "daily_padding", "daily_dates", "sparse", "sparse_padding",
+        "daily", "daily_padding", "daily_dates", "daily_score_valid", "sparse", "sparse_padding",
         "sparse_labels", "supervised_targets", "supervised_valid",
         "annual_timestamps", "quarterly_timestamps", "daily_timestamps", "sparse_timestamps",
         "issuer_daily", "issuer_daily_padding", "issuer_daily_timestamps",
@@ -949,8 +949,14 @@ def main() -> None:
 
     # Outcome-derived labels remain on their original event dates. Retain the
     # supervised scan before excluding these families entirely from inputs.
+    if args.inference_only and args.sequence_mode == 'annual_memory':
+        annual, quarterly, daily, sparse = [inference_interval(table,args.prediction_start_date,args.prediction_end_date)
+                                            for table in (annual,quarterly,daily,sparse)]
+    price_column = 'value__price.close' if 'value__price.close' in daily.collect_schema().names() else None
+    scoring_dates = (daily.filter(pl.col(price_column).is_finite()) if price_column else daily).select('symbol','date')
     supervised_target_map = StreamingSupervision(
-        sparse, cutoff=_as_datetime(args.train_end_date) if args.train_end_date else None,
+        sparse.filter(pl.lit(False)) if args.inference_only else sparse,
+        cutoff=_as_datetime(args.train_end_date) if args.train_end_date else None,
     )
     if not args.inference_only:
         supervised_target_map.materialize(output_dir / 'supervised_labels.parquet')
@@ -962,11 +968,10 @@ def main() -> None:
         print(f"[supervision] {coverage}", flush=True)
 
     training_document_dates = None
-    if args.sequence_mode == 'annual_memory' or (args.sequence_mode == 'documents' and not args.inference_only):
+    if args.sequence_mode in ('documents','annual_memory') and not args.inference_only:
         training_document_dates = [issuer_observation_dates(table) for table in (daily, annual, quarterly, sparse)]
         # Actual target dates can precede disclosure dates in the sparse inputs.
-        if not args.inference_only or (args.sequence_mode == 'annual_memory' and args.train_end_date):
-            training_document_dates.append(supervised_target_map.scan.select('symbol', 'date'))
+        training_document_dates.append(supervised_target_map.scan.select('symbol', 'date'))
 
     sparse, sparse_input_families = input_event_families(sparse, sparse_input_families)
 
@@ -1053,6 +1058,9 @@ def main() -> None:
         'sparse_columns': sparse_value_columns, 'sparse_families': sparse_input_families,
         'issuer_context': args.issuer_context,
     }
+    if args.inference_only and args.sequence_mode == 'annual_memory':
+        # Interval-filtered indexes must never overwrite full training history.
+        index_payload['inference_interval'] = [args.prediction_start_date,args.prediction_end_date]
     if args.option_panel is not None or args.option_target_events is not None:
         index_payload['option_configuration'] = {key: str(value) for key, value in vars(args).items() if key.startswith('option_')}
         index_payload['option_input_sha256'] = {}
@@ -1133,15 +1141,15 @@ def main() -> None:
             cutoff=args.train_end_date if not args.inference_only else None,
             period='1y' if args.sequence_mode == 'annual_memory' else '3mo')
         if args.inference_only and args.sequence_mode == 'annual_memory':
-            score_years = document_anchors((daily, annual, quarterly, sparse), start=args.prediction_start_date, end=args.prediction_end_date, period='1y')
-            anchors = pl.concat([anchors, score_years]).group_by('symbol','document_start').agg(pl.col('date').max()).sort('symbol','date')
+            anchors = cold_inference_anchors((daily,annual,quarterly,sparse),args.prediction_start_date,args.prediction_end_date)
         (output_dir/'document_coverage.json').write_text(json.dumps(dict(
             contract=args.document_contract, training_document_contract=args.training_document_contract,
             documents=anchors.height,
+            inference_initialization='empty_memory_no_warmup' if args.inference_only and args.sequence_mode == 'annual_memory' else None,
             symbols=anchors['symbol'].n_unique(), daily_history=0 if args.sequence_mode == 'annual_memory' else DAILY_WINDOW,
             training_cutoff=args.train_end_date, prediction_start=args.prediction_start_date,
             prediction_end=args.prediction_end_date), indent=2))
-    expected_document_dates = daily.select('symbol', 'date').filter(pl.col('symbol').is_in(taxonomy['symbol'].to_list()))
+    expected_document_dates = scoring_dates.filter(pl.col('symbol').is_in(taxonomy['symbol'].to_list()))
     empty_annual = annual.head(0)
     empty_quarterly = quarterly.head(0)
     empty_daily = daily.head(0)
@@ -1293,6 +1301,7 @@ def main() -> None:
                 quarterly_padding = torch.ones(len(quarterly_values), dtype=torch.bool)
                 annual_dates = quarterly_dates = []
             result = {
+                'daily_score_valid': torch.isfinite(daily_values[:,daily_value_columns.index(price_column)]).tolist() if price_column else None,
                 "issuer_daily": issuer_daily, "issuer_daily_padding": issuer_daily_padding,
                 "issuer_daily_timestamps": timestamps(issuer_daily_dates, len(issuer_daily)),
                 "issuer_sparse": issuer_sparse, "issuer_sparse_padding": issuer_sparse_padding,

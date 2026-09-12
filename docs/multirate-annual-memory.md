@@ -22,15 +22,20 @@ RNG state, and diagnostics. A signature rejects resumes with changed input files
 sample dates, batch size, or seed. Raw history is not repeated across annual
 boundaries. The model still checks its 512-position capacity without truncation.
 
-Inference rebuilds memory chronologically under frozen checkpoint weights,
-including eligible years before the requested score interval. Training-event date
-metadata before the recorded training cutoff is retained for matching warmup year
-selection; target values are not model inputs. All requested scoring dates remain
-in the inference calendar. A mid-year query replays the same prior years and only
-the available prefix of the current year. Backtests use the existing adjusted-price
-anchored-HITS engine and frozen yearly price snapshots.
+Inference starts with empty recurrent memory at the requested prediction start
+and processes no earlier observations. A mid-year or single-day request clips
+its first document to that exact start, without replaying the earlier part of
+the year. Memory carries forward only inside the requested evaluation interval.
+Explicit start and end dates are required. This cold-start policy was requested
+for backtesting; it does not load training memory or replay training history.
 
-Validation artifacts are under
+Trading scores are emitted only on dates with finite native instrument prices.
+Shared macro/peer dates remain input context within the requested interval but
+do not generate trade rows for inactive or delisted instruments. Coverage checks
+use this price-observation calendar. The existing adjusted-price anchored-HITS
+engine and frozen yearly price snapshots remain the portfolio evaluator.
+
+The initial implementation validation (with historical replay) is recorded under
 `artifacts/multirate_recovery/10B/annual_memory_smoke/`. The smoke retains 1,751
 numeric fields for AAPL, MSFT and their eight stored option paths, with data from
 2020. Both epochs completed training, full 2024–2026 scoring, and separate yearly
@@ -45,3 +50,6 @@ Core and regression validation covers 106 tests, including CPU-exact model,
 optimizer and recurrent-state resume; actual GPU resume is also compared with
 an uninterrupted run in `resume_comparison.json`. See `prefix_comparison.json`,
 `result.json`, and the per-epoch prediction/backtest reports for executable evidence.
+
+
+The full $10B epoch-one no-warmup evaluation completed: 2,385 documents, 511,815 price-date scores, no missing/duplicate/unexpected/nonfinite predictions, and all 2024/2025/2026-through-September-9 long/short books. Scoring took 200.42 seconds versus 1,234.02 seconds with historical replay; the portfolio backtests took 13.75 seconds. The previous replay attempt failed on a macro-only ABMD trading calendar; observed-price scoring removes that invalid calendar. Evidence: `artifacts/multirate_recovery/10B/no_warmup_backtest_verification.json`.

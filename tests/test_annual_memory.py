@@ -5,6 +5,7 @@ import pytest
 import torch
 from quant_orchestrator.research_tools.annual_memory import AnnualCorpus, AnnualMemory, annual_window
 from quant_orchestrator.research_tools.document_sequences import document_anchors
+from quant_orchestrator.research_tools.annual_memory import cold_inference_anchors, inference_interval
 from quant_orchestrator.research_tools.streaming_context import StreamingContext, StreamingFamilyContext
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import MultiRateTransformer, MultiRateTransformerConfig, MultiRateTaskSpec
 
@@ -21,6 +22,21 @@ def test_year_boundaries_include_january_first_and_no_previous_raw_history():
     sparse=StreamingFamilyContext(scan.with_columns(pl.lit('f').alias('target_family')),['x'],families=['f'])
     result=annual_window(sparse,'X',datetime(2024,1,1),datetime(2024,12,31))
     assert result[0][~result[1]].flatten().tolist()==[2.,3.,4.]
+
+
+def test_cold_inference_excludes_prior_years_and_pre_start_days():
+    dates=[datetime(2023,12,31),datetime(2024,1,2),datetime(2024,6,3),datetime(2024,12,31),datetime(2025,1,2)]
+    scan=pl.DataFrame({'symbol':['X']*5,'date':dates,'x':[1.,2.,3.,4.,5.]}).lazy()
+    anchors=cold_inference_anchors([scan],'2024-06-03','2025-01-02')
+    assert anchors['document_start'].to_list()==[datetime(2024,6,3),datetime(2025,1,1)]
+    first=anchors.row(0,named=True)
+    values,padding,*_=annual_window(StreamingContext(scan,['x']),'X',first['document_start'],first['date'])
+    assert values[~padding].flatten().tolist()==[3.,4.]
+    last_day=cold_inference_anchors([scan],'2025-01-02','2025-01-02')
+    assert last_day.height==1 and last_day['document_start'][0]==dates[-1]
+    assert inference_interval(scan,'2025-01-02','2025-01-02').collect().height==1
+    with pytest.raises(ValueError,match='requires explicit'):
+        inference_interval(scan,None,'2025-01-02')
 
 
 def rows():

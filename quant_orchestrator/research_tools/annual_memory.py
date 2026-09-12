@@ -3,8 +3,25 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 import random
 import torch
+import polars as pl
+from .document_sequences import document_anchors
 
 ANNUAL_CONTRACT = 'calendar_year_recurrent_v1'
+
+
+def inference_interval(scan, start, end):
+    """No historical warmup: expose only requested observations to inference."""
+    if not start or not end:
+        raise ValueError('Annual inference requires explicit prediction start and end dates')
+    first, last = datetime.fromisoformat(start), datetime.fromisoformat(end)
+    if last < first:
+        raise ValueError('Prediction end precedes start')
+    return scan.filter(pl.col('date').is_between(first,last))
+
+
+def cold_inference_anchors(scans, start, end):
+    anchors = document_anchors([inference_interval(s,start,end) for s in scans],period='1y')
+    return anchors.with_columns(pl.col('document_start').clip(lower_bound=datetime.fromisoformat(start)))
 
 
 def annual_window(index, symbol, start, end):

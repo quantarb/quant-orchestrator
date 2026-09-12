@@ -57,6 +57,13 @@ def test_context_only_schema_cannot_create_issuer_documents():
     assert issuer_observation_dates(scan).collect().is_empty()
 
 
+def test_macro_only_dates_are_not_trading_scores():
+    item={'sequence_mode':'annual_memory','document_start':'2024-01-02','date':'2024-01-04',
+          'daily_dates':['2024-01-02','2024-01-03','2024-01-04'],
+          'daily_score_valid':[False,True,False,True]}
+    assert list(prediction_positions(item))==[(1,'2024-01-02'),(3,'2024-01-04')]
+
+
 def test_actual_event_dates_retain_quarters_before_disclosure():
     disclosure=pl.DataFrame({'symbol':['X'],'date':[datetime(2023,4,5)],'signal_value':[1.]}).lazy()
     targets=pl.DataFrame({'symbol':['X','X'],'date':[datetime(2023,3,31),datetime(2023,4,20)]}).lazy()
