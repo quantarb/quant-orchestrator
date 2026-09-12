@@ -98,7 +98,7 @@ def main():
                     status('evaluating', epoch=epoch+1)
                     inference_batch = min(int(option(command, '--batch-size') or 32), 64)
                     device_name = option(command, '--device') or 'cpu'
-                    if device_name.startswith('cuda') and torch.cuda.is_available():
+                    if device_name.startswith('cuda') and torch.cuda.is_available() and option(command, '--sequence-mode') != 'annual_memory':
                         free_bytes, _ = torch.cuda.mem_get_info(torch.device(device_name))
                         # Larger evaluation batches amortize Python/kernel overhead.
                         # Keep substantial headroom for wide family reconstruction.

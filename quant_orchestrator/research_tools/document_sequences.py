@@ -25,8 +25,8 @@ def issuer_observation_dates(scan):
     return scan.filter(observed).select('symbol', 'date')
 
 
-def document_anchors(scans, *, start=None, end=None, cutoff=None):
-    """Collect only date metadata; each observation belongs to one quarter.
+def document_anchors(scans, *, start=None, end=None, cutoff=None, period='3mo'):
+    """Collect date metadata; each observation belongs to one calendar period.
 
     Boundaries are fixed independently of future observations and reporting
     dates. A partial live quarter therefore has the same start as its replay.
@@ -38,7 +38,9 @@ def document_anchors(scans, *, start=None, end=None, cutoff=None):
         dates = dates.filter(pl.col('date') < datetime.fromisoformat(cutoff))
     if end:
         dates = dates.filter(pl.col('date') <= datetime.fromisoformat(end))
-    dates = dates.with_columns(pl.col('date').dt.truncate('3mo').alias('document_start'))
+    if period not in ('3mo', '1y'):
+        raise ValueError('Document period must be 3mo or 1y')
+    dates = dates.with_columns(pl.col('date').dt.truncate(period).alias('document_start'))
     anchors = dates.group_by('symbol', 'document_start').agg(pl.col('date').max()).sort('symbol', 'date')
     if start:
         anchors = anchors.filter(pl.col('date') >= datetime.fromisoformat(start))
@@ -73,7 +75,7 @@ def prediction_positions(item, *, start=None):
     for position, date in enumerate(item['daily_dates']):
         if start is not None and date < start:
             continue
-        if item.get('sequence_mode') == 'documents':
+        if item.get('sequence_mode') in ('documents', 'annual_memory'):
             if date < item['document_start'] or date > item['date']:
                 continue
             yield position + 1, date

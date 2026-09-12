@@ -29,6 +29,7 @@ from quant_orchestrator.research_tools.streaming_context import StreamingContext
 from quant_orchestrator.research_tools.sequence_training import sequence_anchors, window_supervision
 from quant_orchestrator.research_tools.document_sequences import DOCUMENT_CONTRACT, document_anchors, document_window, prediction_positions, validate_document_predictions
 from quant_orchestrator.research_tools.document_sequences import TRAINING_DOCUMENT_CONTRACT, issuer_observation_dates
+from quant_orchestrator.research_tools.annual_memory import ANNUAL_CONTRACT, AnnualCorpus, AnnualMemory, annual_window
 from quant_orchestrator.research_tools.epoch_evaluation import wait_for_epoch_backtest
 from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups, input_event_families
 from quant_orchestrator.research_tools.multirate_objectives import (
@@ -693,8 +694,8 @@ def main() -> None:
         "--stream-samples", action="store_true", default=True,
         help="Keep sample metadata in memory and materialize rate arrays only per batch.",
     )
-    parser.add_argument('--sequence-mode', choices=('rolling', 'documents'), default=None,
-                        help='Fresh runs default to calendar-quarter documents; inference restores the checkpoint contract.')
+    parser.add_argument('--sequence-mode', choices=('rolling', 'documents', 'annual_memory'), default=None,
+                        help='documents uses calendar quarters; annual_memory carries detached learned state between calendar years; inference restores the checkpoint contract.')
     parser.add_argument('--training-sequence-stride', type=int, default=0,
                         help='Supervise all event dates in overlapping chunks; 0 keeps one anchor per event. Must be smaller than daily-window.')
     parser.add_argument('--resume-training', action='store_true', help='Restore checkpoint weights, optimizer, and epoch/batch position')
@@ -778,13 +779,15 @@ def main() -> None:
     if checkpoint_payload and args.sequence_mode is not None and args.sequence_mode != saved_sequence:
         raise ValueError('Sequence mode differs from checkpoint; document scoring requires a document-trained checkpoint')
     args.sequence_mode = saved_sequence if checkpoint_payload else (args.sequence_mode or 'documents')
-    args.document_contract = DOCUMENT_CONTRACT if args.sequence_mode == 'documents' else None
-    args.training_document_contract = TRAINING_DOCUMENT_CONTRACT if args.sequence_mode == 'documents' else None
-    if args.resume_training and args.sequence_mode == 'documents' and checkpoint_payload['configuration'].get('training_document_contract') != TRAINING_DOCUMENT_CONTRACT:
+    args.document_contract = ANNUAL_CONTRACT if args.sequence_mode == 'annual_memory' else DOCUMENT_CONTRACT if args.sequence_mode == 'documents' else None
+    args.training_document_contract = ANNUAL_CONTRACT if args.sequence_mode == 'annual_memory' else TRAINING_DOCUMENT_CONTRACT if args.sequence_mode == 'documents' else None
+    if args.resume_training and args.sequence_mode in ('documents', 'annual_memory') and checkpoint_payload['configuration'].get('training_document_contract') != args.training_document_contract:
         raise ValueError('Training document selection changed; start a fresh run instead of restoring an incompatible batch cursor')
-    if checkpoint_payload and args.sequence_mode == 'documents' and checkpoint_payload['configuration'].get('document_contract') != DOCUMENT_CONTRACT:
+    if checkpoint_payload and args.sequence_mode in ('documents', 'annual_memory') and checkpoint_payload['configuration'].get('document_contract') != args.document_contract:
         raise ValueError('Document layout differs from checkpoint; retrain with the current document contract')
-    if args.sequence_mode == 'documents' and args.legacy_rate_fusion:
+    if args.sequence_mode == 'annual_memory' and (args.validation_fraction or args.max_samples):
+        parser.error('annual_memory requires complete chronological streams: use a smaller corpus instead of --max-samples or --validation-fraction')
+    if args.sequence_mode in ('documents', 'annual_memory') and args.legacy_rate_fusion:
         parser.error('Document scoring requires date-aware independent rate fusion')
     if min(args.annual_window, args.quarterly_window, args.daily_window) < 2:
         parser.error('Rate windows must contain at least two observations')
@@ -959,10 +962,11 @@ def main() -> None:
         print(f"[supervision] {coverage}", flush=True)
 
     training_document_dates = None
-    if args.sequence_mode == 'documents' and not args.inference_only:
+    if args.sequence_mode == 'annual_memory' or (args.sequence_mode == 'documents' and not args.inference_only):
         training_document_dates = [issuer_observation_dates(table) for table in (daily, annual, quarterly, sparse)]
         # Actual target dates can precede disclosure dates in the sparse inputs.
-        training_document_dates.append(supervised_target_map.scan.select('symbol', 'date'))
+        if not args.inference_only or (args.sequence_mode == 'annual_memory' and args.train_end_date):
+            training_document_dates.append(supervised_target_map.scan.select('symbol', 'date'))
 
     sparse, sparse_input_families = input_event_families(sparse, sparse_input_families)
 
@@ -1099,7 +1103,7 @@ def main() -> None:
         anchors = pl.concat([regular_anchors, option_daily_anchors], how="diagonal_relaxed").unique(["symbol", "date"])
     # Supervised losses use the final token at its own event date. Earlier
     # tokens in an annual document can see issuer memory from the anchor.
-    if supervised_target_map and args.sequence_mode != 'documents':
+    if supervised_target_map and args.sequence_mode not in ('documents', 'annual_memory'):
         event_anchors = supervised_target_map.anchors()
         if args.training_sequence_stride and not args.inference_only:
             sequence_rows, sequence_report = sequence_anchors(daily, event_anchors,
@@ -1122,15 +1126,19 @@ def main() -> None:
             anchors = anchors.filter(pl.col("date") >= _as_datetime(args.prediction_start_date))
         if args.prediction_end_date:
             anchors = anchors.filter(pl.col("date") <= _as_datetime(args.prediction_end_date))
-    if args.sequence_mode == 'documents':
+    if args.sequence_mode in ('documents', 'annual_memory'):
         anchors = document_anchors(training_document_dates if training_document_dates is not None else (daily, annual, quarterly, sparse),
-            start=args.prediction_start_date if args.inference_only else None,
+            start=args.prediction_start_date if args.inference_only and args.sequence_mode != 'annual_memory' else None,
             end=args.prediction_end_date if args.inference_only else None,
-            cutoff=args.train_end_date if not args.inference_only else None)
+            cutoff=args.train_end_date if not args.inference_only else None,
+            period='1y' if args.sequence_mode == 'annual_memory' else '3mo')
+        if args.inference_only and args.sequence_mode == 'annual_memory':
+            score_years = document_anchors((daily, annual, quarterly, sparse), start=args.prediction_start_date, end=args.prediction_end_date, period='1y')
+            anchors = pl.concat([anchors, score_years]).group_by('symbol','document_start').agg(pl.col('date').max()).sort('symbol','date')
         (output_dir/'document_coverage.json').write_text(json.dumps(dict(
-            contract=DOCUMENT_CONTRACT, training_document_contract=args.training_document_contract,
+            contract=args.document_contract, training_document_contract=args.training_document_contract,
             documents=anchors.height,
-            symbols=anchors['symbol'].n_unique(), daily_history=DAILY_WINDOW,
+            symbols=anchors['symbol'].n_unique(), daily_history=0 if args.sequence_mode == 'annual_memory' else DAILY_WINDOW,
             training_cutoff=args.train_end_date, prediction_start=args.prediction_start_date,
             prediction_end=args.prediction_end_date), indent=2))
     expected_document_dates = daily.select('symbol', 'date').filter(pl.col('symbol').is_in(taxonomy['symbol'].to_list()))
@@ -1214,10 +1222,10 @@ def main() -> None:
         if symbol not in taxonomy_symbols:
             continue
         source_symbol = source_symbol_by_symbol.get(symbol, symbol)
-        supervision_start = row.get('document_start') if args.sequence_mode == 'documents' else row.get('supervision_start')
+        supervision_start = row.get('document_start') if args.sequence_mode in ('documents', 'annual_memory') else row.get('supervision_start')
         def materialize(current_symbol=symbol, current_anchor=anchor, current_source=source_symbol,
                         current_supervision_start=supervision_start):
-            if args.sequence_mode == 'documents':
+            if args.sequence_mode in ('documents', 'annual_memory'):
                 streams = {}
                 for rate, index, source, history in (
                     ('daily', daily_index, current_symbol, DAILY_WINDOW),
@@ -1229,7 +1237,7 @@ def main() -> None:
                     if source == current_symbol and rate.startswith('issuer_'):
                         streams[rate] = streams[rate.removeprefix('issuer_')]
                     else:
-                        streams[rate] = document_window(index, source, current_supervision_start, current_anchor, history)
+                        streams[rate] = annual_window(index, source, current_supervision_start, current_anchor) if args.sequence_mode == 'annual_memory' else document_window(index, source, current_supervision_start, current_anchor, history)
                 daily_values, daily_padding, daily_dates, _, _ = streams['daily']
                 annual_values, annual_padding, annual_dates, _, _ = streams['annual']
                 quarterly_values, quarterly_padding, quarterly_dates, _, _ = streams['quarterly']
@@ -1255,7 +1263,7 @@ def main() -> None:
                     issuer_sparse, issuer_sparse_padding, _, issuer_sparse_dates = cached_sparse_window(current_source, current_anchor)
             supervised_targets = torch.zeros((len(daily_values), len(SUPERVISED_TARGET_TASK_NAMES)), dtype=torch.float32)
             supervised_valid = torch.zeros_like(supervised_targets, dtype=torch.bool)
-            if args.sequence_mode == 'documents' and not args.inference_only:
+            if args.sequence_mode in ('documents', 'annual_memory') and not args.inference_only:
                 supervised_targets, supervised_valid = window_supervision(
                     supervised_target_map, current_symbol, daily_dates, length=len(daily_values),
                     tasks=SUPERVISED_TARGET_TASK_NAMES, start=current_supervision_start, end=current_anchor,
@@ -1300,7 +1308,7 @@ def main() -> None:
                 "sparse": sparse_values, "sparse_padding": sparse_padding, "sparse_labels": sparse_labels,
                 "supervised_targets": supervised_targets, "supervised_valid": supervised_valid,
             }
-            if args.sequence_mode == 'documents':
+            if args.sequence_mode in ('documents', 'annual_memory'):
                 for rate, payload in streams.items():
                     result[f'{rate}_timestamps'] = payload[3]
             return result
@@ -1398,7 +1406,7 @@ def main() -> None:
             raise ValueError("test symbol file does not match any corpus samples")
     if args.prediction_end_date:
         evaluation_samples = [sample for sample in evaluation_samples if _as_datetime(sample["date"]) <= _as_datetime(args.prediction_end_date)]
-    if args.inference_only:
+    if args.inference_only and args.sequence_mode != 'annual_memory':
         if args.prediction_start_date and args.prediction_start_date != "1900-01-01":
             requested_date = _as_datetime(args.prediction_start_date)
             evaluation_samples = [sample for sample in evaluation_samples if _as_datetime(sample["date"]) >= requested_date]
@@ -1566,13 +1574,24 @@ def main() -> None:
             print('[multirate-resume] checkpoint has no RNG state; stochastic continuation is not bit-for-bit identical',flush=True)
     trainer = Trainer(
         model,
-        [(task_bundle.corpus, active_tasks)],
+        [(AnnualCorpus(train_samples,args.batch_size) if args.sequence_mode == 'annual_memory' else task_bundle.corpus, active_tasks)],
         optimizer,
         seed=args.seed,
         grad_accumulation_steps=args.grad_accumulation_steps,
         autocast_dtype=getattr(torch, args.autocast_dtype) if args.mixed_precision else None,
         transformer_engine_fp8=args.fp8,
     )
+    annual_state = AnnualMemory()
+    annual_training_signature = hashlib.sha256(json.dumps({
+        'inputs':input_fingerprint, 'batch_size':args.batch_size, 'seed':args.seed,
+        'samples':[(r['symbol'],r['document_start'],r['date']) for r in train_samples],
+    },sort_keys=True).encode()).hexdigest() if args.sequence_mode == 'annual_memory' else None
+    if args.resume_training and args.sequence_mode == 'annual_memory':
+        if 'annual_memory_state' not in checkpoint_payload:
+            raise ValueError('Annual checkpoint is missing recurrent memory')
+        if checkpoint_payload.get('annual_training_signature') != annual_training_signature:
+            raise ValueError('Annual resume requires identical corpus, samples, batch size and seed')
+        annual_state.load_state_dict(checkpoint_payload['annual_memory_state'])
     best_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
     stale_epochs = 0
@@ -1608,6 +1627,10 @@ def main() -> None:
     task_family_observations = Counter()
     task_loss_sums = Counter()
     encoder_gradient_sums = Counter()
+    if args.resume_training:
+        for name, counter in [('task_observations',task_observations),('task_family_observations',task_family_observations),
+                              ('task_loss_sums',task_loss_sums),('encoder_gradient_sums',encoder_gradient_sums)]:
+            counter.update(checkpoint_payload.get(name,{}))
     def record_gradient(name):
         def record(gradient):
             if not torch.isfinite(gradient).all():
@@ -1620,6 +1643,10 @@ def main() -> None:
 
     epoch_clocks = {}
     def training_step(module: torch.nn.Module, batch: list[dict[str, object]], active_tasks):
+        memory_input = None
+        if args.sequence_mode == 'annual_memory':
+            annual_state.begin_epoch(trainer.current_epoch)
+            memory_input = annual_state.inputs(batch, module)
         if module.training:
             epoch_clocks.setdefault(trainer.current_epoch,perf_counter())
         stack = BatchTensors(batch, device)
@@ -1693,6 +1720,8 @@ def main() -> None:
             "quarterly": quarterly_context_ids if torch.unique(quarterly_context_ids).numel() < len(batch) else None,
             "sparse": sparse_context_ids if torch.unique(sparse_context_ids).numel() < len(batch) else None,
         }
+        if memory_input is not None:
+            rate_context_ids = {}
         output = module(
             daily_batch, annual_batch, quarterly_batch, sparse_batch,
             daily_padding_mask=daily_mask, annual_padding_mask=annual_mask,
@@ -1706,7 +1735,7 @@ def main() -> None:
                 torch.isfinite(stack(rate)) & ~stack(f"{rate}_padding").bool().unsqueeze(-1),
                 reconstruction_widths[rate],
             ).any(-1) for rate in reconstruction_widths},
-            compute_document_outputs=not args.disable_document_tasks,
+            compute_document_outputs=not args.disable_document_tasks, annual_memory=memory_input,
         )
         token_predictions = {}
         if args.self_supervision in ("both", "masked"):
@@ -1724,7 +1753,7 @@ def main() -> None:
                     torch.isfinite(stack(rate)) & ~stack(f"{rate}_padding").bool().unsqueeze(-1),
                     reconstruction_widths[rate],
                 ).any(-1) for rate in reconstruction_widths},
-                compute_document_outputs=False,
+                compute_document_outputs=False, annual_memory=memory_input,
             )["prediction_outputs"].items() if name.startswith("masked_") and name.endswith("_token")}
         if tuple(output["document_outputs"]) + tuple(output["token_outputs"]) + tuple(output["prediction_outputs"]) != expected_task_names:
             raise RuntimeError("model task outputs do not match the temporal token+subtoken MTL contract")
@@ -1748,7 +1777,7 @@ def main() -> None:
             if name not in active_names:
                 continue
             valid = supervised_valid[:, :, task_index] & ~daily_mask
-            if args.sequence_mode != 'documents' and not args.training_sequence_stride:
+            if args.sequence_mode not in ('documents', 'annual_memory') and not args.training_sequence_stride:
                 valid[:, :-1] = False
             if not valid.any():
                 continue
@@ -1808,6 +1837,8 @@ def main() -> None:
                 task_loss_sums[name] += float(loss.detach())
             for rate in ("annual", "quarterly", "daily", "sparse"):
                 task_observations[f"masked_{rate}"] += int(masked_positions[rate].sum())
+        if memory_input is not None:
+            annual_state.update(batch, output)
         for item in batch:
             if isinstance(item, _LazySample):
                 item.release()
@@ -1871,9 +1902,14 @@ def main() -> None:
             "normalization": norms,
             "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
             "optimizer_state_dict": optimizer.state_dict(),
+            "annual_memory_state": annual_state.state_dict(),
+            "annual_training_signature": annual_training_signature,
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state_all": torch.cuda.get_rng_state_all() if device.type == 'cuda' else [],
             "task_family_observations": dict(task_family_observations),
+            "task_observations": dict(task_observations),
+            "task_loss_sums": dict(task_loss_sums),
+            "encoder_gradient_sums": dict(encoder_gradient_sums),
             "metrics": {
                 "epoch": epoch,
                 "batch": batch_index,
@@ -1907,7 +1943,7 @@ def main() -> None:
         processed = batch_index - (resume_batch if epoch == resume_epoch else 0)
         rate = processed / max(elapsed, 1e-6)
         remaining = (total_batches - batch_index) / max(rate, 1e-6)
-        samples_done = min(len(train_samples), batch_index * args.batch_size)
+        samples_done = annual_state.processed if args.sequence_mode == 'annual_memory' else min(len(train_samples), batch_index * args.batch_size)
         memory = ""
         if device.type == "cuda":
             memory = f" cuda_gb={torch.cuda.memory_allocated(device) / 1024**3:.2f}"
@@ -1954,6 +1990,8 @@ def main() -> None:
         model.load_state_dict(best_state)
 
     evaluation_samples = sorted(evaluation_samples, key=lambda item: (item["symbol"], item["date"]))
+    if args.sequence_mode == 'annual_memory':
+        evaluation_samples = [item for batch in AnnualCorpus(evaluation_samples,min(args.batch_size,64)).batches() for item in batch]
     model.eval(); predictions: dict[str, list[torch.Tensor]] = {name: [] for name in enabled_document_tasks[1:]}; states: list[torch.Tensor] = []; family_states: list[torch.Tensor] = []; family_valid_rows: list[torch.Tensor] = []
     prediction_rows: list[dict[str, object]] = []
     prediction_count = 0
@@ -1968,19 +2006,23 @@ def main() -> None:
         end_ns=_epoch_ns(_as_datetime(args.prediction_end_date)) if args.prediction_end_date else None)
     family_correct = 0
     family_total = 0
+    inference_memory = AnnualMemory()
     with torch.inference_mode():
         # Evaluation materializes all prototype states and is more memory-sensitive
         # than the training step. Keep the scalable training batch size, but use a
         # bounded evaluation batch to avoid accelerator kernel failures on large
         # corpora.
-        eval_batch_size = min(args.batch_size, 128 if args.inference_only and args.sequence_mode != 'documents' else 64)
+        eval_batch_size = min(args.batch_size, 128 if args.inference_only and args.sequence_mode not in ('documents', 'annual_memory') else 64)
         evaluation_started = perf_counter()
-        for start in range(0, len(evaluation_samples), eval_batch_size):
-            batch = evaluation_samples[start:start + eval_batch_size]
+        eval_batches = AnnualCorpus(evaluation_samples,eval_batch_size).batches() if args.sequence_mode == 'annual_memory' else (evaluation_samples[i:i+eval_batch_size] for i in range(0,len(evaluation_samples),eval_batch_size))
+        evaluated_documents = 0
+        for batch_index, batch in enumerate(eval_batches):
+            start = evaluated_documents
+            evaluated_documents += len(batch)
             if args.inference_only:
                 batch_symbols = ",".join(dict.fromkeys(str(item.get("symbol", "?")) for item in batch))
                 print(
-                    f"[multirate-inference] scoring {'documents' if args.sequence_mode == 'documents' else 'symbols'} {start + 1}-{start + len(batch)}/{len(evaluation_samples)}: {batch_symbols} "
+                    f"[multirate-inference] scoring {'documents' if args.sequence_mode in ('documents', 'annual_memory') else 'symbols'} {start + 1}-{start + len(batch)}/{len(evaluation_samples)}: {batch_symbols} "
                     f"elapsed_s={perf_counter() - evaluation_started:.1f} "
                     f"observations_per_s={start / max(perf_counter() - evaluation_started, 1e-9):.2f} "
                     f"score_rows={prediction_count} score_rows_per_s={prediction_count / max(perf_counter() - evaluation_started, 1e-9):.2f}",
@@ -2006,9 +2048,14 @@ def main() -> None:
                 unique = {key: index for index, key in enumerate(dict.fromkeys(keys))}
                 if len(unique) < len(batch):
                     inference_context_ids[rate] = torch.tensor([unique[key] for key in keys], device=device)
-            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, compute_document_outputs=not args.skip_embeddings or not args.disable_document_tasks, rate_context_ids=inference_context_ids,
+            memory_input = inference_memory.inputs(batch,model) if args.sequence_mode == 'annual_memory' else None
+            if memory_input is not None:
+                inference_context_ids = {}
+            output = model(daily_batch, annual_batch, quarterly_batch, sparse_batch, compute_document_outputs=not args.skip_embeddings or not args.disable_document_tasks, rate_context_ids=inference_context_ids, annual_memory=memory_input,
                 **({f"{rate}_family_presence": family_channels(torch.isfinite(stack(rate)) & ~stack(f"{rate}_padding").bool().unsqueeze(-1), widths).any(-1)
-                    for rate, widths in reconstruction_widths.items()} if args.sequence_mode == 'documents' else {}), issuer_streams=issuer_inputs(batch, stack), daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"), quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"), daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, daily_batch.shape[1]))
+                    for rate, widths in reconstruction_widths.items()} if args.sequence_mode in ('documents', 'annual_memory') else {}), issuer_streams=issuer_inputs(batch, stack), daily_padding_mask=daily_mask, annual_padding_mask=annual_mask, quarterly_padding_mask=quarterly_mask, sparse_padding_mask=sparse_padding_mask, daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"), quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"), daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, daily_batch.shape[1]))
+            if memory_input is not None:
+                inference_memory.update(batch,output)
             for rate, widths in reconstruction_widths.items():
                 ntp_audit.update([str(item["symbol"]) for item in batch], rate,
                     sparse_input_families if rate == "sparse" else list(feature_family_dimensions), widths,
@@ -2141,7 +2188,7 @@ def main() -> None:
     torch.save({"state_dict": model.state_dict(), "metrics": metrics, "labels": label_names,
                 "normalization": norms, "asset_classes": asset_classes,
                 "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}}, output_dir / "multirate_mtl_model.pt")
-    if args.inference_only and args.sequence_mode == 'documents' and not args.max_samples and args.prediction_start_date:
+    if args.inference_only and args.sequence_mode in ('documents', 'annual_memory') and not args.max_samples and args.prediction_start_date:
         expected = expected_document_dates.filter(pl.col('date') >= _as_datetime(args.prediction_start_date))
         if args.prediction_end_date:
             expected = expected.filter(pl.col('date') <= _as_datetime(args.prediction_end_date))

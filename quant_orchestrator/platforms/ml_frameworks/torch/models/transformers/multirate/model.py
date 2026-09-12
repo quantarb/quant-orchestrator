@@ -390,6 +390,7 @@ class MultiRateTransformer(nn.Module):
         dates: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         return_subtoken_states: bool = False,
+        annual_memory=None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         self._validate_stream(values, rate)
         projected = self.coverage_inputs[rate](
@@ -399,6 +400,12 @@ class MultiRateTransformer(nn.Module):
             return_family_states=True,
         )
         combined, family_states, presence = projected
+        if annual_memory is not None:
+            # Position zero is a dedicated causal memory token, not a market row.
+            combined = combined.clone(); family_states = family_states.clone(); presence = presence.clone()
+            combined[:, 0] = annual_memory['states'].to(combined)
+            family_states[:, 0] = annual_memory['subtokens'].to(family_states)
+            presence[:, 0] = annual_memory['presence']
         engineered = self.auto_feature_engineer(
             combined,
             mode=attention_mode,
@@ -743,6 +750,7 @@ class MultiRateTransformer(nn.Module):
         rate_context_ids: Mapping[str, torch.Tensor] | None = None,
         compute_document_outputs: bool = True,
         issuer_streams: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
+        annual_memory: Mapping | None = None,
     ) -> dict[str, object]:
         """Encode a multi-rate window and return states plus task outputs.
 
@@ -757,6 +765,9 @@ class MultiRateTransformer(nn.Module):
             "daily": daily_values, "annual": annual_values, "quarterly": quarterly_values,
             "sparse": sparse_values,
         }
+        if annual_memory is not None:
+            if rate_cache or issuer_context_cache or rate_context_ids:
+                raise ValueError('Recurrent memory cannot reuse encoded contexts across instruments')
         for rate, values in streams.items():
             if rate not in self.config.rates:
                 continue
@@ -786,7 +797,7 @@ class MultiRateTransformer(nn.Module):
         # prototypes; retain subtoken states whenever either class of task is
         # present, not only when next/masked prediction is used.
         need_subtokens = bool(
-            self.prediction_task_specs
+            annual_memory is not None or self.prediction_task_specs
             or any(task.level == "token" for task in self.task_specs)
             or any(task.level == "document" for task in self.task_specs)
             or self.family_classification_head is not None
@@ -887,7 +898,8 @@ class MultiRateTransformer(nn.Module):
                 if isinstance(projected, tuple):
                     return tuple(value.index_select(0, inverse) for value in projected)
                 return projected.index_select(0, inverse)
-            return self._project(rate, values, family_presence, modality_ids, attention_mode, dates, padding, need_subtokens)
+            return self._project(rate, values, family_presence, modality_ids, attention_mode, dates, padding, need_subtokens,
+                                 annual_memory=annual_memory.get(rate) if annual_memory is not None else None)
 
         daily_projected = cached_or_project(
             "daily", daily_values, daily_family_presence, daily_modality_ids,
@@ -1037,9 +1049,16 @@ class MultiRateTransformer(nn.Module):
         # Issuer daily/irregular observations are distinct from the instrument's
         # own daily/irregular observations; both use the native rate encoder.
         issuer_reuse = {}
+        memory_outputs = {}
+        if annual_memory is not None:
+            from .recurrent import ending_memory
+            for rate, subtokens in {'daily':daily_subtokens, 'annual':annual_subtokens,
+                                   'quarterly':quarterly_subtokens, 'sparse':sparse_subtokens}.items():
+                memory_outputs[rate] = ending_memory(encoded_rates[rate], subtokens, family_presence[rate],
+                                                     rate_padding[rate], annual_memory.get(rate))
         for rate, payload in (issuer_streams or {}).items():
             values, dates, padding = payload["values"], payload["dates"], payload["padding"]
-            ids = payload.get("context_ids")
+            ids = payload.get("context_ids") if annual_memory is None else None
             if ids is None:
                 first = inverse = torch.arange(values.shape[0], device=values.device)
             else:
@@ -1051,9 +1070,16 @@ class MultiRateTransformer(nn.Module):
                 for field in (dates, padding):
                     if not torch.equal(field, field.index_select(0, first).index_select(0, inverse)):
                         raise ValueError("Issuer context IDs group different dates or padding")
-            projected = self._project(rate, values.index_select(0, first), dates=dates.index_select(0, first), padding_mask=padding.index_select(0, first))
+            projected = self._project(rate, values.index_select(0, first), dates=dates.index_select(0, first), padding_mask=padding.index_select(0, first),
+                return_subtoken_states=annual_memory is not None,
+                annual_memory=annual_memory.get('issuer_'+rate) if annual_memory is not None else None)
+            if annual_memory is not None:
+                projected, issuer_subtokens = projected
             states = self._cached_state(rate, {}, projected, self.encoders[rate],
                 attention_mask(dates.index_select(0, first)), padding.index_select(0, first)).index_select(0, inverse)
+            if annual_memory is not None:
+                presence = torch.stack([torch.isfinite(values[...,sl]).any(-1) for sl in self.coverage_inputs[rate].slices.values()],-1)
+                memory_outputs['issuer_'+rate] = ending_memory(states,issuer_subtokens,presence,padding,annual_memory.get('issuer_'+rate))
             visible = (dates[:, None, :] <= query_dates[:, :, None]) & ~padding[:, None, :]
             weights = visible.to(states.dtype)
             context = torch.bmm(weights, states) / weights.sum(-1, keepdim=True).clamp_min(1)
@@ -1094,6 +1120,7 @@ class MultiRateTransformer(nn.Module):
             if self.family_classification_head is not None and fused_document_prototypes is not None else None
         )
         return {
+            'annual_memory': memory_outputs,
             "issuer_reuse": issuer_reuse,
             "token_states": token_states["daily"],
             "instrument_states": torch.nan_to_num(instrument_fused, nan=0.0, posinf=0.0, neginf=0.0),

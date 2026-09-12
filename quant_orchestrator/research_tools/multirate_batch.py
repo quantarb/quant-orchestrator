@@ -15,7 +15,7 @@ class BatchTensors:
             rows = [torch.as_tensor(item[name]) for item in self.batch]
             if len({row.shape for row in rows}) > 1:
                 length=max(row.shape[0] for row in rows)
-                right_pad = all(item.get('sequence_mode') == 'documents' for item in self.batch)
+                right_pad = all(item.get('sequence_mode') in ('documents', 'annual_memory') for item in self.batch)
                 fill = (True if name.endswith('_padding') else
                         (torch.iinfo(torch.long).max if right_pad else torch.iinfo(torch.long).min) if name.endswith('_timestamps') else
                         False if rows[0].dtype == torch.bool else 0 if name == 'supervised_targets' else float('nan'))
