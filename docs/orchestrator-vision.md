@@ -206,6 +206,15 @@ Still missing:
 - Do not make the platform dependent on one ML framework or one backtesting engine.
 - Do not require every strategy to be implemented in every engine.
 
+New multi-rate runs use `train_multirate_mtl.py --min-market-cap` to assemble
+annual equity and first-session frozen-option documents directly from warehouse
+sources as training requests them. New training rejects prebuilt corpora.
+The field-name schema and fixed numeric transform avoid a global normalization
+pass. Completed epochs run separate equity and executable frozen-option
+backtests. See [warehouse streaming](multirate-warehouse-streaming.md) for the
+current command, coverage checks, and return-simulation assumptions. The corpus
+benchmarks and recorded runs below describe earlier workflows.
+
 The multi-rate issuer/instrument trainer uses bounded Polars windows and shared
 within-step issuer encoding. Oracle/HITS are supervised labels only and never
 historical model inputs. Causal elapsed-time and information-age embeddings

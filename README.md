@@ -2,6 +2,12 @@
 
 Composable Dagster and MLflow research orchestration around data, features, and labels stored in `quant-warehouse`.
 
+New multi-rate training runs use `scripts/train_multirate_mtl.py --min-market-cap`
+to stream annual equity and first-session frozen-option documents directly from
+the warehouse, followed by equity and option backtests. No prebuilt corpus is
+accepted for new training. See [warehouse streaming](docs/multirate-warehouse-streaming.md)
+for the command, coverage gates, normalization, and execution assumptions.
+
 `quant-orchestrator` coordinates research workflows without assuming a single shape. A run can be ML training only, backtesting only, training followed by backtesting, cross-framework validation, Monte Carlo analysis, portfolio construction, or an external-engine strategy run that uses warehouse data and stores the native outputs.
 
 ## Motivation

@@ -25,6 +25,9 @@
 
 ## Experiment Universe And Artifact Layout
 
+- Build each new training run's corpus on demand from `quant-warehouse` for that run's requested universe and dates. Never reuse a prebuilt experiment corpus, roster, feature export, or event export just because it exists. Run-local materialization is allowed for bounded loading and evaluation of the same run.
+- Options coverage must be discovered for every selected equity symbol, including separate share classes. Do not hardcode an options underlying or historical start year. Before training, compare actual pre-cutoff option observations against the warehouse coverage for the selected universe; report missing data and fail on accidentally omitted eligible symbols.
+
 - Do not duplicate experiment code or create separate top-level experiment names for different market-cap universes.
 - A single experiment should accept the universe through its configuration, especially `min_market_cap` (or the equivalent universe parameter).
 - Store outputs under one experiment root with universe-specific subdirectories, using canonical names such as:
