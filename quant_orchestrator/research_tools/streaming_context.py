@@ -29,7 +29,10 @@ class StreamingContext:
         self.index_directory = index_directory
         self._issuer_indexes = OrderedDict()
         self._oversized_issuers = set()
-        self.index_build_limit = 128 * 1024**2
+        # The expanded 10B corpus reaches about 136 MiB per daily issuer.
+        # Keep those histories on the read-only disk-index path while retaining
+        # a bounded fallback for larger individual sources.
+        self.index_build_limit = 256 * 1024**2
         if index_directory is not None:
             index_directory.mkdir(parents=True, exist_ok=True)
         self._versions = OrderedDict()
