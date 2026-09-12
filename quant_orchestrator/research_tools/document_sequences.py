@@ -5,6 +5,24 @@ import torch
 
 
 DOCUMENT_CONTRACT = 'calendar_quarter_prefix_v1'
+TRAINING_DOCUMENT_CONTRACT = 'issuer_observation_quarters_v1'
+
+
+def issuer_observation_dates(scan):
+    """Select native issuer observations without removing shared context history.
+
+    Macro, peer aggregates and calendar features cannot create a company
+    document on their own. Both scalar and expanded family columns are handled.
+    Sparse disclosures qualify through their observed signal/text channels.
+    """
+    context = {'economic_indicators', 'treasury_rates', 'time_calendar',
+               'sector_pe', 'sector_performance', 'industry_pe', 'industry_performance'}
+    fields = [name for name, dtype in scan.collect_schema().items()
+              if dtype.is_numeric() and (
+                  (name.startswith('value__') and name[7:].split('.')[0].split('__')[0] not in context)
+                  or name == 'signal_value' or name.startswith('text_'))]
+    observed = pl.any_horizontal([pl.col(name).is_finite().fill_null(False) for name in fields]) if fields else pl.lit(False)
+    return scan.filter(observed).select('symbol', 'date')
 
 
 def document_anchors(scans, *, start=None, end=None, cutoff=None):

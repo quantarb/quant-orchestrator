@@ -4,6 +4,7 @@ import polars as pl
 import pytest
 import torch
 from quant_orchestrator.research_tools.document_sequences import document_anchors, document_window, prediction_positions
+from quant_orchestrator.research_tools.document_sequences import issuer_observation_dates
 from quant_orchestrator.research_tools.streaming_context import StreamingContext
 from quant_orchestrator.research_tools.multirate_batch import BatchTensors
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate import MultiRateTransformer, MultiRateTransformerConfig, MultiRateTaskSpec
@@ -25,6 +26,42 @@ def test_calendar_ownership_covers_every_date_once_and_is_prefix_stable():
     assert owners == [str(d.date()) for d in dates[1:]]
     train=document_anchors([scan],cutoff='2024-01-01')
     assert train['date'].max() < datetime(2024,1,1)
+
+
+def test_issuer_quarters_exclude_context_only_history_but_retain_event_only_quarters():
+    dates = [datetime(1919,1,1), datetime(2023,1,2), datetime(2023,4,3), datetime(2024,1,2)]
+    daily = pl.DataFrame({'symbol':['X']*4, 'date':dates,
+        'value__economic_indicators.CPI':[1.,2.,3.,4.],
+        'value__sector_pe':[1.,2.,3.,4.],
+        'value__time_calendar.year':[1919.,2023.,2023.,2024.],
+        'value__price.close':[None,10.,float('nan'),12.]}).lazy()
+    annual = pl.DataFrame({'symbol':['Y'], 'date':[datetime(2023,7,1)],
+                          'value__fmp.income.revenue':[100.]}).lazy()
+    sparse = pl.DataFrame({'symbol':['X','X'], 'date':[datetime(2023,10,2),datetime(2023,4,4)],
+                          'signal_value':[1.,float('inf')]}).lazy()
+    anchors = document_anchors([issuer_observation_dates(s) for s in (daily,annual,sparse)],cutoff='2024-01-01')
+    assert anchors.select('symbol','document_start').rows() == [
+        ('X',datetime(2023,1,1)),('X',datetime(2023,10,1)),('Y',datetime(2023,7,1))]
+    # Selection never mutates the context stream used to materialize documents.
+    index=StreamingContext(daily,['value__economic_indicators.CPI','value__price.close'])
+    values,padding,*_=document_window(index,'X',datetime(2023,1,1),dates[1],2)
+    assert values[~padding][:,0].tolist()==[1.,2.]
+    # Inference keeps its full calendar, independent of training selection.
+    assert document_anchors([daily],start='2023-01-01')['document_start'].to_list()==[
+        datetime(2023,1,1),datetime(2023,4,1),datetime(2024,1,1)]
+
+
+def test_context_only_schema_cannot_create_issuer_documents():
+    scan=pl.DataFrame({'symbol':['X'],'date':[datetime(1919,1,1)],
+        'value__treasury_rates':[1.],'value__industry_performance.return':[2.]}).lazy()
+    assert issuer_observation_dates(scan).collect().is_empty()
+
+
+def test_actual_event_dates_retain_quarters_before_disclosure():
+    disclosure=pl.DataFrame({'symbol':['X'],'date':[datetime(2023,4,5)],'signal_value':[1.]}).lazy()
+    targets=pl.DataFrame({'symbol':['X','X'],'date':[datetime(2023,3,31),datetime(2023,4,20)]}).lazy()
+    anchors=document_anchors([issuer_observation_dates(disclosure),targets],cutoff='2024-01-01')
+    assert anchors['date'].to_list()==[datetime(2023,3,31),datetime(2023,4,20)]
 
 
 def test_document_window_keeps_history_and_all_updates_without_moving_prefix():

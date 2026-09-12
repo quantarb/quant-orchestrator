@@ -28,6 +28,7 @@ from quant_warehouse import Warehouse
 from quant_orchestrator.research_tools.streaming_context import StreamingContext, StreamingFamilyContext, context_ordered_anchors
 from quant_orchestrator.research_tools.sequence_training import sequence_anchors, window_supervision
 from quant_orchestrator.research_tools.document_sequences import DOCUMENT_CONTRACT, document_anchors, document_window, prediction_positions, validate_document_predictions
+from quant_orchestrator.research_tools.document_sequences import TRAINING_DOCUMENT_CONTRACT, issuer_observation_dates
 from quant_orchestrator.research_tools.epoch_evaluation import wait_for_epoch_backtest
 from quant_orchestrator.research_tools.multirate_supervision import StreamingSupervision, instrument_asset_groups, input_event_families
 from quant_orchestrator.research_tools.multirate_objectives import (
@@ -778,6 +779,9 @@ def main() -> None:
         raise ValueError('Sequence mode differs from checkpoint; document scoring requires a document-trained checkpoint')
     args.sequence_mode = saved_sequence if checkpoint_payload else (args.sequence_mode or 'documents')
     args.document_contract = DOCUMENT_CONTRACT if args.sequence_mode == 'documents' else None
+    args.training_document_contract = TRAINING_DOCUMENT_CONTRACT if args.sequence_mode == 'documents' else None
+    if args.resume_training and args.sequence_mode == 'documents' and checkpoint_payload['configuration'].get('training_document_contract') != TRAINING_DOCUMENT_CONTRACT:
+        raise ValueError('Training document selection changed; start a fresh run instead of restoring an incompatible batch cursor')
     if checkpoint_payload and args.sequence_mode == 'documents' and checkpoint_payload['configuration'].get('document_contract') != DOCUMENT_CONTRACT:
         raise ValueError('Document layout differs from checkpoint; retrain with the current document contract')
     if args.sequence_mode == 'documents' and args.legacy_rate_fusion:
@@ -954,6 +958,12 @@ def main() -> None:
         (output_dir / "supervision_coverage.json").write_text(json.dumps(coverage, indent=2))
         print(f"[supervision] {coverage}", flush=True)
 
+    training_document_dates = None
+    if args.sequence_mode == 'documents' and not args.inference_only:
+        training_document_dates = [issuer_observation_dates(table) for table in (daily, annual, quarterly, sparse)]
+        # Actual target dates can precede disclosure dates in the sparse inputs.
+        training_document_dates.append(supervised_target_map.scan.select('symbol', 'date'))
+
     sparse, sparse_input_families = input_event_families(sparse, sparse_input_families)
 
     daily_value_columns = [f"value__{family}" for family in feature_families]
@@ -1113,12 +1123,13 @@ def main() -> None:
         if args.prediction_end_date:
             anchors = anchors.filter(pl.col("date") <= _as_datetime(args.prediction_end_date))
     if args.sequence_mode == 'documents':
-        anchors = document_anchors((daily, annual, quarterly, sparse),
+        anchors = document_anchors(training_document_dates if training_document_dates is not None else (daily, annual, quarterly, sparse),
             start=args.prediction_start_date if args.inference_only else None,
             end=args.prediction_end_date if args.inference_only else None,
             cutoff=args.train_end_date if not args.inference_only else None)
         (output_dir/'document_coverage.json').write_text(json.dumps(dict(
-            contract=DOCUMENT_CONTRACT, documents=anchors.height,
+            contract=DOCUMENT_CONTRACT, training_document_contract=args.training_document_contract,
+            documents=anchors.height,
             symbols=anchors['symbol'].n_unique(), daily_history=DAILY_WINDOW,
             training_cutoff=args.train_end_date, prediction_start=args.prediction_start_date,
             prediction_end=args.prediction_end_date), indent=2))
