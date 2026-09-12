@@ -81,6 +81,8 @@ def test_document_labels_use_each_event_date_and_exclude_context():
     from quant_orchestrator.research_tools.sequence_training import window_supervision
     dates=pl.Series([datetime(2023,12,29),datetime(2024,1,2),datetime(2024,1,3)]).dt.epoch('ns').to_torch()
     store=SimpleNamespace(scan=pl.DataFrame({'symbol':['X']*3,'date':[datetime(2023,12,29),datetime(2024,1,2),datetime(2024,1,3)],'buy':[1.,1.,None],'sell':[None,None,1.]}).lazy())
+    from quant_orchestrator.research_tools.supervision_index import SupervisionIndex
+    store.window_index=SupervisionIndex(store.scan)
     targets,valid=window_supervision(store,'X',dates,length=4,tasks=('buy','sell'),start=datetime(2024,1,1),end=datetime(2024,1,3),positions=slice(1,4))
     assert not valid[:2].any()
     assert valid[2].tolist()==[True,False]

@@ -41,3 +41,17 @@ def test_trade_targets_use_transaction_date_and_only_actual_buy_sell_events():
     assert store.get(('A',datetime(2023,1,4)))=={}
     assert store.get(('A',datetime(2023,2,1)))=={}
     assert events['date'].min()==datetime(2023,2,1)
+
+
+def test_materialized_event_labels_preserve_cutoff_and_disabled_tasks(tmp_path):
+    from polars.testing import assert_frame_equal
+    rows = [dict(symbol='A',date=datetime(year,1,day),event_date=datetime(year,1,day),
+                 target_family=family,signal_value=100.,**{f'text_{i}':None for i in range(7)})
+            for year,day,family in [(2023,1,'holder_activity.buy'),(2023,2,'holder_activity.reduce'),
+                                    (2025,1,'fund_activity.etf_buy')]]
+    store=StreamingSupervision(pl.DataFrame(rows).lazy(),cutoff=datetime(2024,1,1))
+    before=store.scan.sort('symbol','date').collect()
+    store.materialize(tmp_path/'labels.parquet')
+    assert_frame_equal(before,store.scan.collect())
+    assert store.get(('A',datetime(2025,1,1))) == {}
+    assert 'fund_activity_etf_buy' in store.disabled_activity_tasks

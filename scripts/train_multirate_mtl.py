@@ -946,6 +946,7 @@ def main() -> None:
         sparse, cutoff=_as_datetime(args.train_end_date) if args.train_end_date else None,
     )
     if not args.inference_only:
+        supervised_target_map.materialize(output_dir / 'supervised_labels.parquet')
         coverage = supervised_target_map.coverage(
             symbols_by_asset=instrument_asset_groups(taxonomy),
             required_tasks=(*ORACLE_SUPERVISED_TASK_NAMES, *HITS_SUPERVISED_TASK_NAMES),

@@ -1,5 +1,6 @@
 from datetime import datetime,timedelta
 from types import SimpleNamespace
+from quant_orchestrator.research_tools.supervision_index import SupervisionIndex
 import polars as pl
 import torch
 from quant_orchestrator.research_tools.sequence_training import sequence_anchors,window_supervision
@@ -13,7 +14,7 @@ def test_sequences_own_every_event_once_without_synthetic_labels():
     assert report['matched_event_dates']==5
     assert report['unmatched_event_dates']==1
     labels=events.with_columns(pl.lit(1.).alias('buy')).lazy()
-    store=SimpleNamespace(scan=labels)
+    store=SimpleNamespace(scan=labels, window_index=SupervisionIndex(labels))
     observed=[]
     for row in owners.iter_rows(named=True):
         history=[d for d in dates if d<=row['date']][-8:]
@@ -41,6 +42,7 @@ def test_sequence_labels_match_exact_dates_and_keep_missing_tasks_masked():
     store=SimpleNamespace(scan=pl.DataFrame({'symbol':['A','A','A'],
         'date':[datetime(1970,1,1),datetime(1970,1,2),datetime(1970,1,4)],
         'buy':[1.,0.,1.],'rank':[None,.2,.8]}).lazy())
+    store.window_index=SupervisionIndex(store.scan)
     targets,valid=window_supervision(store,'A',dates,length=4,tasks=('buy','rank'),
         start=datetime(1970,1,2),end=datetime(1970,1,3))
     assert valid.tolist()==[[False,False],[False,False],[True,True],[False,False]]
@@ -69,3 +71,43 @@ def test_variable_sequence_context_padding_preserves_values_dates_and_missingnes
     assert torch.isnan(tensors('annual')[0,0]).all()
     assert tensors('annual_padding').tolist()==[[True,False,False],[False]*3]
     assert tensors('annual_timestamps')[0].tolist()==[torch.iinfo(torch.long).min,1,2]
+
+
+def test_indexed_supervision_matches_join_with_task_order_and_ownership():
+    import numpy as np
+    rng = np.random.default_rng(3)
+    all_dates = [datetime(2021, 1, 1) + timedelta(days=i) for i in range(30)]
+    rows = []
+    for symbol in ['A', 'B']:
+        for i in [1, 3, 4, 10, 20, 29]:
+            rows.append({'symbol': symbol, 'date': all_dates[i], 'x': float(rng.normal()),
+                         'y': None if i % 2 else float(rng.normal())})
+    scan = pl.DataFrame(rows).lazy()
+    store = SimpleNamespace(scan=scan, window_index=SupervisionIndex(scan))
+    for symbol in ['A', 'B', 'missing', 'A']:
+        query = all_dates[2:25]
+        dates = pl.Series(query).dt.epoch('ns').to_torch()
+        for tasks in [('x', 'y'), ('y', 'x')]:
+            actual, valid = window_supervision(store, symbol, dates, length=26, tasks=tasks,
+                start=all_dates[4], end=all_dates[20], positions=slice(1,24))
+            reference = pl.DataFrame({'date': query}).lazy().join(scan.filter(
+                (pl.col('symbol') == symbol) & pl.col('date').is_between(all_dates[4],all_dates[20])),
+                on='date', how='left', maintain_order='left').select(*tasks).collect()
+            block = reference.cast(pl.Float32).fill_null(float('nan')).to_torch()
+            torch.testing.assert_close(actual[1:24], block.nan_to_num(), rtol=0, atol=0)
+            assert torch.equal(valid[1:24], torch.isfinite(block))
+            assert not valid[0].any() and not valid[24:].any()
+
+
+def test_supervision_cache_is_bounded_and_oversized_windows_still_work():
+    scan = pl.DataFrame({'symbol': ['A','B','B'],
+        'date': [datetime(2020,1,1),datetime(2020,1,1),datetime(2020,1,2)], 'x': [1.,2.,3.]}).lazy()
+    index = SupervisionIndex(scan, max_bytes=24)
+    index.get('A', ('x',)); index.get('B', ('x',))
+    assert index.cache_bytes <= 24 and ('A', ('x',)) not in index.cache
+    small = SupervisionIndex(scan, max_bytes=12)
+    assert small.get('B', ('x',)) is None
+    store = SimpleNamespace(scan=scan, window_index=small)
+    dates = pl.Series([datetime(2020,1,2)]).dt.epoch('ns').to_torch()
+    target, valid = window_supervision(store,'B',dates,length=1,tasks=('x',),start=datetime(2020,1,1),end=datetime(2020,1,2))
+    assert valid.item() and target.item() == 3.

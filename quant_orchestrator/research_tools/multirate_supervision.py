@@ -2,6 +2,7 @@
 from datetime import datetime
 
 import polars as pl
+from .supervision_index import SupervisionIndex
 
 from quant_orchestrator.platforms.ml_frameworks.torch.models.transformers.multirate.temporal_tasks import (
     HITS_SUPERVISED_TASK_NAMES, ORACLE_SUPERVISED_TASK_NAMES,
@@ -71,6 +72,15 @@ class StreamingSupervision:
         if self.disabled_activity_tasks:
             self.scan=self.scan.with_columns(pl.lit(None,dtype=pl.Float64).alias(t) for t in self.disabled_activity_tasks)
 
+        self.window_index = SupervisionIndex(self.scan)
+
+    def materialize(self, path):
+        """Write a sorted event-only snapshot once; never cache learned outputs."""
+        temporary = path.with_suffix('.tmp.parquet')
+        self.scan.sort('symbol', 'date').sink_parquet(temporary, row_group_size=8192)
+        temporary.replace(path)
+        self.scan = pl.scan_parquet(path)
+        self.window_index = SupervisionIndex(self.scan)
 
     def anchors(self):
         return self.scan.select('symbol', 'date').collect(engine='streaming')
