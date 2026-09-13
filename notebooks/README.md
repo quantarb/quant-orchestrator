@@ -1,6 +1,10 @@
 # Quant Orchestrator Notebook Examples
 
-For current multi-rate training, use the [on-demand warehouse workflow](../docs/multirate-warehouse-streaming.md).
+For current multi-rate training, open [multirate_warehouse_training.ipynb](multirate_warehouse_training.ipynb).
+It explains each stage, launches $1T/$100B/$10B runs from one configuration,
+and reviews coverage, failures, and all four equity/option backtest books.
+It opens in review mode; select train mode to launch fresh runs sequentially.
+See also the [on-demand warehouse workflow](../docs/multirate-warehouse-streaming.md).
 It streams annual equity and frozen-option documents and runs both backtests.
 Older multi-rate corpus-building notebooks record historical experiments and
 are not the launch path for new training runs.

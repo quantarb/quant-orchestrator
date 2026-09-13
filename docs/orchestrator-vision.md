@@ -212,7 +212,10 @@ sources as training requests them. New training rejects prebuilt corpora.
 The field-name schema and fixed numeric transform avoid a global normalization
 pass. Completed epochs run separate equity and executable frozen-option
 backtests. See [warehouse streaming](multirate-warehouse-streaming.md) for the
-current command, coverage checks, and return-simulation assumptions. The corpus
+current command, coverage checks, and return-simulation assumptions. The
+[training notebook](../notebooks/multirate_warehouse_training.ipynb) explains
+each stage and selects $1T/$100B/$10B with one shared launcher and report view.
+The corpus
 benchmarks and recorded runs below describe earlier workflows.
 
 The multi-rate issuer/instrument trainer uses bounded Polars windows and shared

@@ -1,5 +1,10 @@
 # On-demand equity and frozen-option training
 
+The [step-by-step notebook](../notebooks/multirate_warehouse_training.ipynb)
+explains documents, subtokens, annual memory, objectives, coverage, and backtests.
+Select $1T, $100B, or $10B in its configuration. Review mode reads existing
+outputs; train mode runs the same workflow sequentially for selected universes.
+
 New multi-rate runs use `scripts/train_multirate_mtl.py --min-market-cap`.
 The trainer queries the warehouse universe and assembles annual documents as
 the optimizer requests them. It never reads a previous run's corpus, roster,
