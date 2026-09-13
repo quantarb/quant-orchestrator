@@ -159,7 +159,7 @@ def run_warehouse_training(args):
     args._warehouse_run_started=True
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     config.update(dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
-        options='five first-session DTE cohorts per right; all strikes, fixed equal weights, no rolling')
+        options='up to five first-session DTE cohorts per right; all strikes, fixed equal weights, no rolling')
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))
     stream=WarehouseAnnualStream(min_market_cap=args.min_market_cap,start=args.warehouse_start_date,
         end=args.prediction_end_date,cutoff=args.train_end_date,output=args.output_dir)

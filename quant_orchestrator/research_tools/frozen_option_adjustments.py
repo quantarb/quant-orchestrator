@@ -10,9 +10,9 @@ def first_session_baskets(chain, first_session):
     for right in ('call','put'):
         rows=first.filter(pl.col('option_type')==right)
         expiries=sorted(rows['dte'].unique().to_list())
-        if len(expiries)<5:
-            raise ValueError(f'First-session {right} cohort has {len(expiries)} DTEs; five required')
-        chosen=[expiries[round(i*(len(expiries)-1)/4)] for i in range(5)]
+        if not expiries:
+            raise ValueError(f'First-session {right} cohort has no positive DTEs')
+        chosen=expiries if len(expiries)<=5 else [expiries[round(i*(len(expiries)-1)/4)] for i in range(5)]
         selected.append(rows.filter(pl.col('dte').is_in(chosen)))
     return (pl.concat(selected).with_columns(pl.concat_str([pl.lit('OPT_'),pl.col('underlying_symbol'),
         pl.lit(f'_{first_session.year}_'),pl.col('option_type').str.to_uppercase(),pl.lit('_DTE_'),pl.col('dte')]).alias('document_symbol'))

@@ -153,3 +153,14 @@ def test_streamed_inference_scores_only_observed_prices_without_warmup():
     loss.backward()
     assert model.task_heads['oracle_is_buy'].weight.grad.abs().sum()>0
     assert observations['option:oracle_is_buy']==1
+
+
+@pytest.mark.parametrize('expiry_count', [1, 4])
+def test_first_session_uses_all_available_expirations_when_fewer_than_five(expiry_count):
+    q = chain()
+    expiries = sorted(q['expiration'].unique().to_list())[:expiry_count]
+    q = q.filter(pl.col('expiration').is_in(expiries))
+    members = first_session_baskets(q, q['snapshot_date'][0])
+    assert members['document_symbol'].n_unique() == 2 * expiry_count
+    assert set(members['contract_symbol']) == set(q['contract_symbol'])
+    assert set(members['weight']) == {.5}

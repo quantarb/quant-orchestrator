@@ -44,8 +44,9 @@ price observations, and documents containing multiple price observations.
 An epoch fails if an expected option underlying was omitted or only contributed
 isolated snapshots.
 
-Five observed expiry/DTE cohorts for calls and five for puts are selected across
-the available DTE range on the actual first NYSE session of each year. Every
+Up to five observed expiry/DTE cohorts per right are selected across
+the available DTE range on the actual first NYSE session of each year. When fewer
+than five expirations exist, all available expirations are used. Every
 strike in each selected cohort receives a fixed equal weight. Later contracts
 are never added. A missing constituent invalidates that day's basket quote;
 remaining members are never renormalized. Older history can be sparse. Missing
