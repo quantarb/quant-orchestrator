@@ -25,7 +25,7 @@ python scripts/train_multirate_mtl.py \
   --sequence-mode annual_memory --self-supervision both \
   --train-end-date 2024-01-01 \
   --prediction-start-date 2024-01-01 --prediction-end-date 2026-09-09 \
-  --checkpoint-every-batches 10 --progress-every-batches 1 \
+  --checkpoint-every-batches 10 --progress-updates-per-epoch 10 \
   --skip-embeddings --skip-t-sne
 ```
 
@@ -156,3 +156,5 @@ Oracle exits are implemented and their next-quote execution is exercised by
 regression tests. The executed notebook is saved as `executed_validation.ipynb`
 in that run. This validates the workflow, not the predictive quality or runtime
 of the notebook's default $100B, 64-dimensional full-history configuration.
+
+Training progress is capped by `--progress-updates-per-epoch` (1–10, default 10), exposed as `PROGRESS_UPDATES_PER_EPOCH` in the notebook’s top cell. It reserves one update for completion and spaces earlier updates using a document-count upper bound from already loaded metadata. No corpus counting pass is needed; epochs with fewer surviving options can produce fewer updates.

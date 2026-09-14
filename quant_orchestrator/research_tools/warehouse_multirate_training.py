@@ -51,6 +51,29 @@ def prefetch_batches(batches):
             yield batch
 
 
+class EpochProgress:
+    """Bound streaming progress output without counting/materializing the corpus."""
+    def __init__(self, upper_bound, limit):
+        if not 1 <= limit <= 10:
+            raise ValueError('--progress-updates-per-epoch must be between 1 and 10')
+        self.upper_bound = max(1, upper_bound)
+        self.limit = limit
+        self.bucket = 0
+        self.finished = False
+
+    def due(self, processed, *, complete=False):
+        if self.finished:
+            return False
+        if complete:
+            self.finished = True
+            return True
+        bucket = min(self.limit-1, processed*self.limit//self.upper_bound)
+        if bucket > self.bucket:
+            self.bucket = bucket
+            return True
+        return False
+
+
 def predict_batch(model, batch, memory, layout):
     device = next(model.parameters()).device
     stack = BatchTensors(batch, device)
@@ -160,6 +183,7 @@ def evaluate_epoch(model, stream, args, epoch):
 
 def run_warehouse_training(args):
     started=perf_counter()
+    EpochProgress(1,args.progress_updates_per_epoch)  # Validate before opening the warehouse.
     if not args.min_market_cap>0 or args.epochs<1 or args.batch_size<1:
         raise ValueError('Positive market cap, epochs and batch size are required')
     if not args.train_end_date or not args.prediction_start_date or not args.prediction_end_date:
@@ -216,6 +240,13 @@ def run_warehouse_training(args):
         family_names=family_names,asset_class_ids={'equity':0,'option':1},enabled_document_tasks=(),prediction_names=prediction_names,
         expected_task_names=SUPERVISED_TARGET_TASK_NAMES+PREDICTION_TASK_NAMES,mrl_dimensions=(),task_observations=observations,
         task_family_observations=family_observations,task_loss_sums=loss_sums,epoch_clocks={},alignment_loss=None)
+    # Only metadata already loaded for the selected universe is needed. Options
+    # may have fewer survivors; this is explicitly an upper bound, not a prepass.
+    document_upper_bound = sum(
+        frame.filter(pl.col('date') < stream.cutoff)['date'].dt.year().n_unique()
+        for frame in stream.prices.values()) + sum(
+        sum(year < stream.cutoff.year for year in years) * 2 * SELECTION_POLICY['contracts_per_side']
+        for years in stream.option_years.values())
     first_update=None
     def checkpoint(epoch,batch,complete,loss):
         payload=dict(state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),configuration=config,
@@ -228,6 +259,7 @@ def run_warehouse_training(args):
             torch.save(payload,args.output_dir/f'epoch_{epoch:04d}.pt')
     for epoch in range(1,args.epochs+1):
         clock.current_epoch=epoch;model.train();total=0.;counts=Counter();seen_options=set();began=perf_counter()
+        progress=EpochProgress(document_upper_bound,args.progress_updates_per_epoch)
         for batch_index,batch in enumerate(prefetch_batches(document_batches(stream.documents(seed=args.seed+epoch),args.batch_size)),1):
             clock.current_step=batch_index;optimizer.zero_grad(set_to_none=True)
             losses=training_step(model,batch,tasks)
@@ -249,7 +281,9 @@ def run_warehouse_training(args):
             status=dict(stage='training',epoch=epoch,batch=batch_index,loss=total/batch_index,documents=dict(counts),
                 option_underlyings_seen=len(seen_options),first_optimizer_update_seconds=first_update,elapsed_seconds=perf_counter()-began)
             (args.output_dir/'status.json').write_text(json.dumps(status,indent=2))
-            print('[warehouse-training] '+json.dumps(status),flush=True)
+            status.update(document_upper_bound=document_upper_bound,epoch_training_complete=False)
+            if progress.due(sum(counts.values())):
+                print('[warehouse-training] '+json.dumps(status),flush=True)
             if args.checkpoint_every_batches and batch_index%args.checkpoint_every_batches==0:
                 checkpoint(epoch,batch_index,False,total/batch_index);stream.write_coverage()
         eligible=set()
@@ -263,6 +297,9 @@ def run_warehouse_training(args):
         if snapshots_only:raise ValueError(f'Options lack historical price-series documents: {sorted(snapshots_only)}')
         if not counts['equity'] or not counts['option']:raise ValueError('Both equity and option price documents must train')
         checkpoint(epoch,batch_index,True,total/batch_index);stream.write_coverage()
+        if progress.due(sum(counts.values()),complete=True):
+            status.update(epoch_training_complete=True,elapsed_seconds=perf_counter()-began)
+            print('[warehouse-training] '+json.dumps(status),flush=True)
         if device.type=='cuda':torch.cuda.empty_cache()
         reports=evaluate_epoch(model,stream,args,epoch)
         (args.output_dir/'status.json').write_text(json.dumps(dict(stage='epoch_complete',epoch=epoch,loss=total/batch_index,documents=dict(counts),backtest_reports=len(reports)),indent=2))

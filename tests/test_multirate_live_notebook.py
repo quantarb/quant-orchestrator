@@ -28,6 +28,8 @@ def test_command_and_reports_use_only_selected_universe(universe):
     exec(notebook.cells[29].source,s)
     command=s['training_command'](universe,Path('/tmp/fresh-output'))
     assert command[command.index('--min-market-cap')+1]==str(s['MARKET_CAPS'][universe])
+    assert command[command.index('--progress-updates-per-epoch')+1]=='10'
+    assert '--progress-every-batches' not in command
     assert command[command.index('--warehouse-start-date')+1]=='1900-01-01'
     assert command[command.index('--warehouse-option-start-date')+1]=='2021-01-01'
     report=dict(epoch=1,year=2024,asset_class='option',side='long_calls',capital_return=.12)

@@ -614,6 +614,10 @@ def main() -> None:
         help="Weight of each auxiliary reconstruction loss relative to supervised tasks; default 0.1")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument(
+        "--progress-updates-per-epoch", type=int, default=10,
+        help="Warehouse training: maximum progress updates per epoch, including completion (1-10; default 10).",
+    )
+    parser.add_argument(
         "--progress-every-batches", type=int, default=100,
         help="Print training progress every N batches; 0 disables batch progress logging.",
     )
