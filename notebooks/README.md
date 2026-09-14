@@ -3,6 +3,8 @@
 For current multi-rate training, open [multirate_warehouse_training.ipynb](multirate_warehouse_training.ipynb).
 It explains each stage, launches $1T/$100B/$10B runs from one configuration,
 and reviews coverage, failures, and all four equity/option backtest books.
+Its option EDA cell counts full-chain contracts per symbol on a chosen year's
+first trading day and reports the average separately from missing-chain coverage.
 It opens in review mode; select train mode to launch fresh runs sequentially.
 See also the [on-demand warehouse workflow](../docs/multirate-warehouse-streaming.md).
 It streams annual equity and frozen-option documents and runs both backtests.
