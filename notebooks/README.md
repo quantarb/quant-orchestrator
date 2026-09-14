@@ -5,6 +5,8 @@ It explains each stage, launches $1T/$100B/$10B runs from one configuration,
 and reviews coverage, failures, and all four equity/option backtest books.
 Its option EDA cell counts full-chain contracts per symbol on a chosen year's
 first trading day and reports the average separately from missing-chain coverage.
+A following EDA cell keeps contracts expiring in that basket-origination year
+and compares before/after counts without changing the training configuration.
 The opening dependency cell detects older warehouse installations and reinstalls
 the package with the active kernel's Python; restart the kernel after a repair.
 It opens in review mode; select train mode to launch fresh runs sequentially.
