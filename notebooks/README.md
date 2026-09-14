@@ -25,6 +25,9 @@ The history filter then requires 20 distinct valid quote days and 80% coverage
 of entry-through-expiration trading sessions, using counts from the same quote
 scan. Valid days require finite, strictly positive bid and ask with ask >= bid.
 Thresholds are configurable EDA settings, not training defaults.
+The final Plotly cell charts only surviving contracts for a selected symbol,
+with call/put panels, bid/ask/mid selection, split adjustments, and visible gaps
+on missing quote days. `survivor_plot_data` holds the plotted series.
 The opening dependency cell detects older warehouse installations and reinstalls
 the package with the active kernel's Python; restart the kernel after a repair.
 The configuration cell adds the discovered checkout root to Python's import path,
