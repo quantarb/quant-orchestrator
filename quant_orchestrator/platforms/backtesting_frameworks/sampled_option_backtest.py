@@ -7,11 +7,13 @@ import numpy as np
 import pandas as pd
 import polars as pl
 from .shared_book import build_shared_book_weights, run_shared_book_backtest
+from quant_orchestrator.research_tools.sampled_options import sample_options_per_side
 
 
 def run_sampled_option_backtest(predictions, prices, output, *, equity_predictions, initial_cash=100000.):
     """Long calls and long puts in separate books; executable quotes gate orders.
 
+    Select one fixed call and one fixed put per underlying from the training sample.
     Equity signals decide direction. Known contract expirations force settlement.
     Missing contract quotes defer execution; they never change contract membership.
     The shared planner preserves capacity while a position awaits an exit quote.
@@ -35,9 +37,14 @@ def run_sampled_option_backtest(predictions, prices, output, *, equity_predictio
     next_date=dict(zip(dates[:-1],dates[1:]))
     equity_scores['date']=equity_scores['date'].map(next_date)
     equity_scores=equity_scores.dropna(subset=['date']).rename(columns={'symbol':'underlying_symbol'})
-    metadata=predictions.select('symbol','underlying_symbol','option_type','expiration','settlement').unique().to_pandas()
+    metadata=predictions.select('symbol','underlying_symbol','option_type','expiration','settlement').unique()
+    # One real contract per underlying/right/year. Selection is deterministic,
+    # independent of row order, and never replaced after expiry or missing quotes.
+    metadata=sample_options_per_side(metadata.rename({'symbol':'contract_symbol'}),count=1,seed=0).rename({'contract_symbol':'symbol'})
+    metadata.write_parquet(output/'backtest_contracts.parquet')
+    metadata=metadata.to_pandas()
     quotes=prices.to_pandas();quotes['date']=pd.to_datetime(quotes['date'])
-    quotes=quotes.merge(metadata,on='symbol',validate='many_to_one')
+    quotes=quotes.merge(metadata,on='symbol',how='inner',validate='many_to_one')
     quotes['settlement']=pd.to_datetime(quotes['settlement'])
     for symbol,group in quotes.groupby('symbol'):
         settlement=group.settlement.iloc[0]
@@ -77,7 +84,7 @@ def run_sampled_option_backtest(predictions, prices, output, *, equity_predictio
         peak=equity.cummax().clip(lower=initial_cash)
         stale=int(((weights>0)&mid.isna()).sum().sum())
         outstanding=int((weights.iloc[-1]>0).sum())
-        result=dict(hindsight_selection=True, fixed_universe=True, side='long_calls' if right=='CALL' else 'long_puts',capital_return=float(equity.iloc[-1]/initial_cash-1),
+        result=dict(hindsight_selection=True, fixed_universe=True, contracts_per_underlying_per_book=1, selection_seed=0, side='long_calls' if right=='CALL' else 'long_puts',capital_return=float(equity.iloc[-1]/initial_cash-1),
             sharpe=float(net.mean()/net.std()*np.sqrt(252)) if net.std()>0 else 0.,max_drawdown=float((equity/peak-1).min()),
             entries=int(actions.action.eq('enter_long').sum()),exits=int(actions.action.eq('exit_long').sum()),
             initial_cash=initial_cash,final_equity=float(equity.iloc[-1]),contract_count=len(symbols),capacity=capacity,

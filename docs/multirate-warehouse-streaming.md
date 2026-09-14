@@ -88,8 +88,10 @@ replaying training history as an inference warmup. Coverage checks compare
 predictions to actual priced dates.
 
 Equity reports use the existing HITS policy and shared-book return engine with
-separate long-only and short-only books. Sampled-option reports use equity
-signals to decide direction: long calls for bullish signals and long puts for
+separate long-only and short-only books. Sampled-option reports select one fixed contract per underlying/right/year
+from the training sample with seed 0, recorded in `backtest_contracts.parquet`.
+Missing quotes or expiry do not trigger replacement with another contract.
+The separate call and put books use equity signals to decide direction: long calls for bullish signals and long puts for
 bearish signals. Option decisions execute no earlier than the next equity
 trading session and only with valid contract quotes. The existing capacity
 planner retains positions awaiting an executable exit. Expirations force

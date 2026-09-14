@@ -30,7 +30,9 @@ survivors with the original first-day columns for further filtering.
 The final sampling cell randomly selects up to 5 calls and 5 puts per symbol
 without replacement, with a reproducible seed per symbol and option type. Each
 side with fewer survivors keeps all of them; spare slots are not transferred
-between calls and puts. The plot uses these sampled options.
+between calls and puts. The plot uses these sampled options. Each annual option
+backtest book then selects one fixed contract per underlying (one call and one
+put across the separate books), using seed 0 without rolling or replacements.
 The ask-to-bid return cell describes premium returns for those survivors, using
 the first-day ask and last stored bid through expiration, with split adjustments,
 quote-date gaps, and unpriced contracts reported explicitly.
