@@ -27,6 +27,8 @@ def test_command_and_reports_use_only_selected_universe(universe):
     exec(notebook.cells[28].source,s)
     command=s['training_command'](universe,Path('/tmp/fresh-output'))
     assert command[command.index('--min-market-cap')+1]==str(s['MARKET_CAPS'][universe])
+    assert command[command.index('--warehouse-start-date')+1]=='1900-01-01'
+    assert command[command.index('--warehouse-option-start-date')+1]=='2021-01-01'
     report=dict(epoch=1,year=2024,asset_class='option',side='long_calls',capital_return=.12)
     assert s['consume_live_line']('[warehouse-backtest-book] '+json.dumps(report))
     frame=s['result_frame']()

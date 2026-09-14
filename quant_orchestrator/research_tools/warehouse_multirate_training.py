@@ -145,6 +145,10 @@ def run_warehouse_training(args):
     first,cutoff,start,end=map(datetime.fromisoformat,(args.warehouse_start_date,args.train_end_date,args.prediction_start_date,args.prediction_end_date))
     if not first<cutoff<=start<=end or (cutoff.month,cutoff.day)!=(1,1):
         raise ValueError('Require warehouse start < January 1 training cutoff <= prediction start <= prediction end')
+    if args.warehouse_option_start_date:
+        option_start = datetime.fromisoformat(args.warehouse_option_start_date)
+        if (option_start.month, option_start.day) != (1, 1) or max(first, option_start) >= cutoff:
+            raise ValueError('--warehouse-option-start-date must be January 1 before the training cutoff')
     if args.checkpoint or args.resume_training or args.inference_only:
         raise ValueError('Warehouse streaming starts a fresh run; checkpoint continuation is not implemented for this loader')
     if args.sequence_mode not in (None,'annual_memory'):
@@ -168,7 +172,7 @@ def run_warehouse_training(args):
         option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))
     stream=WarehouseAnnualStream(min_market_cap=args.min_market_cap,start=args.warehouse_start_date,
-        end=args.prediction_end_date,cutoff=args.train_end_date,output=args.output_dir)
+        end=args.prediction_end_date,cutoff=args.train_end_date,output=args.output_dir,option_start=args.warehouse_option_start_date)
     print(f'[warehouse-stream] metadata_ready_seconds={perf_counter()-started:.2f} equities={len(stream.prices)} option_underlyings={len(stream.expected_option_symbols)} corpus_built=false',flush=True)
     device=torch.device(args.device);torch.manual_seed(args.seed)
     widths={**{r:tuple(stream.layout.values()) for r in ('annual','quarterly','daily')},'sparse':(8,)*len(SPARSE_FAMILIES)}

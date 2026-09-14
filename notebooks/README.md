@@ -2,9 +2,10 @@
 
 For current multi-rate training, open [multirate_warehouse_training.ipynb](multirate_warehouse_training.ipynb).
 It explains each stage and runs one selected universe (`1T`, `100B`, or `10B`).
-EDA and training share the same `UNIVERSE` setting. The notebook defaults to
-history from January 1, 2022 for better options coverage, training on 2022–2023
-with backtests beginning in 2024. Training logs and all four
+EDA and training share the same `UNIVERSE` setting. The notebook starts
+ThetaData option history on January 1, 2021 (`OPTION_START`), independently of
+FMP history (`WAREHOUSE_START`, default all available). Option training uses
+2021–2023 with backtests beginning in 2024. Training logs and all four
 equity/option backtest books stream live from that execution; no old run is
 discovered and no results are read from JSON files. Saved outputs are cleared
 to prevent stale results from another universe appearing on open.

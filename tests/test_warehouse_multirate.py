@@ -193,3 +193,25 @@ def test_option_target_builder_receives_contract_prices_not_issuer_prices(monkey
     stream.sample('AAPL',2023)
     assert seen==[('AAPL230217C00150000',[2.,4.]),('AAPL230217C00150000',[2.,4.]),('AAPL',[900.,800.])]
     assert call['option_type']=='call' and call['expiration']==datetime(2023,2,17)
+
+
+def test_option_start_keeps_earlier_fmp_history(monkeypatch,tmp_path):
+    from types import SimpleNamespace
+    from quant_orchestrator.research_tools import warehouse_multirate as module
+    price_reads=[];option_reads=[]
+    def prices(symbol,**kwargs):
+        price_reads.append(kwargs)
+        return pl.DataFrame({'date':[datetime(2019,1,2),datetime(2023,1,3)],'close':[1.,2.]})
+    def options(symbol,**kwargs):
+        option_reads.append(kwargs)
+        return pl.DataFrame({'snapshot_date':[datetime(y,1,4) for y in (2020,2021,2022,2023)]})
+    monkeypatch.setattr(module,'read_option_chain_arctic',options)
+    warehouse=SimpleNamespace(catalog=SimpleNamespace(query_symbol_profiles=lambda **k:[SimpleNamespace(symbol='AAPL')]),
+        read_prices=prices,backend=SimpleNamespace(list_symbols=lambda library:['AAPL']))
+    stream=module.WarehouseAnnualStream(min_market_cap=1e11,start='1900-01-01',option_start='2021-01-01',
+        end='2024-12-31',cutoff='2024-01-01',output=tmp_path,warehouse=warehouse)
+    assert price_reads[0]['start']=='1900-01-01'
+    assert stream.prices['AAPL']['date'].min()==datetime(2019,1,2)
+    assert option_reads[0]['start_date']=='2021-01-01'
+    assert stream.option_years['AAPL']==[2021,2022,2023]
+    assert stream.start==datetime(1900,1,1) and stream.option_start==datetime(2021,1,1)

@@ -34,6 +34,12 @@ recorded checkpoint evaluation and exact continuation of older runs, not as
 an input to new training. Streaming checkpoints have a distinct normalization
 contract and cannot be loaded by the older corpus inference path.
 
+The notebook sets `--warehouse-option-start-date 2021-01-01` independently of
+`--warehouse-start-date 1900-01-01`. This preserves earlier FMP equity and
+financial history while excluding sparse pre-2021 option history. The option
+start must be January 1 before the training cutoff. Omitting the option flag
+uses the warehouse start date.
+
 ## Inputs and annual documents
 
 `research_tools/warehouse_multirate.py` reads adjusted equity prices, warehouse

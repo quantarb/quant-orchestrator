@@ -67,9 +67,15 @@ def merge_observations(frames, columns):
 
 
 class WarehouseAnnualStream:
-    def __init__(self, *, min_market_cap, start, end, cutoff, output, warehouse=None):
+    def __init__(self, *, min_market_cap, start, end, cutoff, output, warehouse=None, option_start=None):
         self.warehouse = warehouse or Warehouse()
         self.start, self.end, self.cutoff = map(datetime.fromisoformat, (start, end, cutoff))
+        requested_option_start = datetime.fromisoformat(option_start) if option_start else self.start
+        if option_start and (requested_option_start.month, requested_option_start.day) != (1, 1):
+            raise ValueError('Option start must be January 1 for annual first-session selection')
+        self.option_start = max(self.start, requested_option_start)
+        if self.option_start >= self.cutoff:
+            raise ValueError('Option start must precede the training cutoff')
         self.output = Path(output)
         schema = json.loads(Path(__file__).with_name('multirate_feature_schema.json').read_text())
         self.features = schema['features']
@@ -94,8 +100,10 @@ class WarehouseAnnualStream:
         stored = set(self.warehouse.backend.list_symbols(provider_library(OPTIONS_THETADATA_EOD_LIBRARY, OPTIONS_THETADATA_PROVIDER)))
         self.option_years = {}
         for symbol in sorted(self.prices):
-            dates = read_option_chain_arctic(symbol, start_date=start, end_date=end,
+            dates = read_option_chain_arctic(symbol, start_date=self.option_start.date().isoformat(), end_date=end,
                 columns=['snapshot_date'], backend=self.warehouse.backend) if symbol in stored else pl.DataFrame()
+            if dates.height:
+                dates = dates.filter(pl.col('snapshot_date') >= self.option_start)
             counts = (dates.group_by(pl.col('snapshot_date').dt.year().alias('year'))
                 .agg(pl.col('snapshot_date').n_unique().alias('dates')).sort('year').to_dicts()) if dates.height else []
             self.option_years[symbol] = [r['year'] for r in counts]
@@ -110,7 +118,7 @@ class WarehouseAnnualStream:
 
     def write_coverage(self):
         (self.output/'option_coverage.json').write_text(json.dumps(dict(source='warehouse',
-            construction='on_demand', selection_policy=SELECTION_POLICY, coverage=self.coverage, trained=self.observed), indent=2, default=str))
+            construction='on_demand', option_start=self.option_start.date().isoformat(), selection_policy=SELECTION_POLICY, coverage=self.coverage, trained=self.observed), indent=2, default=str))
 
     def issuer(self, symbol):
         return {'GOOG': 'GOOGL', 'BRK-A': 'BRK-B'}.get(symbol, symbol)
