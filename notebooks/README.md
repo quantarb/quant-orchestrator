@@ -19,9 +19,10 @@ positive; the final filter keeps returns at or above the 50th percentile
 separately for calls and puts among history-filter survivors, across the selected
 universe. `filtered_options` exposes the current
 survivors with the original first-day columns for further filtering.
-The final sampling cell randomly selects up to 10 contracts total per symbol
-without replacement, with a reproducible per-symbol seed; symbols with fewer
-survivors retain all candidates. The plot uses these sampled options.
+The final sampling cell randomly selects up to 5 calls and 5 puts per symbol
+without replacement, with a reproducible seed per symbol and option type. Each
+side with fewer survivors keeps all of them; spare slots are not transferred
+between calls and puts. The plot uses these sampled options.
 The ask-to-bid return cell describes premium returns for those survivors, using
 the first-day ask and last stored bid through expiration, with split adjustments,
 quote-date gaps, and unpriced contracts reported explicitly.
