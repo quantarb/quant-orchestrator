@@ -1,4 +1,4 @@
-# On-demand equity and frozen-option training
+# On-demand equity and sampled-option training
 
 The [step-by-step notebook](../notebooks/multirate_warehouse_training.ipynb)
 explains documents, subtokens, annual memory, objectives, coverage, and backtests.
@@ -39,31 +39,38 @@ events. Source tables use a bounded issuer cache; one CPU batch is prefetched
 while the GPU runs. The shared token/subtoken objectives live in
 `multirate_training_step.py`. Native observations retain their dates; no daily
 filler labels are added. Equity documents preserve chronological annual memory.
-Each year's newly formed option basket has a distinct instrument identity.
+Each sampled option contract has a distinct instrument identity.
 
 Options are discovered separately for every equity symbol, including separate
 share classes. `universe.json` records equities, stored options availability, and
 excluded equities without enough pre-cutoff price history. `option_coverage.json`
-records source dates by year, first-session failures, created baskets, training
+records source dates by year, first-session failures, selected contracts, training
 price observations, and documents containing multiple price observations.
-An epoch fails if an expected option underlying was omitted or only contributed
-isolated snapshots.
+An epoch fails if a filter-eligible option underlying was omitted. Zero-survivor
+underlying/years are recorded separately from missing source history.
 
-Up to five observed expiry/DTE cohorts per right are selected across
-the available DTE range on the actual first NYSE session of each year. When fewer
-than five expirations exist, all available expirations are used. Every
-strike in each selected cohort receives a fixed equal weight. Later contracts
-are never added. A missing constituent invalidates that day's basket quote;
-remaining members are never renormalized. Older history can be sparse. Missing
-first-session chains are reported without using a later fallback.
+`sampled_options.py` applies same-year expiration, positive terminal moneyness,
+positive first-ask/last-bid profit, at least 20 valid quote days and 80% coverage,
+and the universe-wide median profit separately for calls and puts. Valid quotes
+have finite bid > 0, ask > 0, and ask >= bid. Up to five calls and five puts per
+underlying are sampled independently with seed 0. Fewer survivors stay fewer.
+Each real contract has its own identity and historical series; strikes are never
+averaged. Both training and backtests intentionally use this hindsight-selected
+fixed annual universe. Uncompleted expirations cannot pass outcome filters.
 
-`frozen_option_adjustments.py` conserves economic exposure through forward stock
-splits by increasing contract counts and reducing strikes. Actual post-split
-quote identifiers are matched within strike-rounding precision. Expiration
-values use unadjusted underlying prices from option quotes and split-consistent
-intrinsic payoffs. Reverse-split deliverables require an explicit mapping.
-Cohort-member Parquet files are audit outputs produced on demand, never inputs
-reused by another training run.
+Selection is computed once per year within a fresh run. A universe-wide profit
+percentile needs a candidate-history scan before that year's option documents
+stream; only the sample is scored. `sampled_contracts/<year>/` stores run-local
+audits, selections, and selected price paths. No prior run's selection is reused.
+Forward splits conserve exposure per original contract unit. Expiration settlement
+uses exact-session underlying marks and intrinsic value. Unsupported splits and
+unavailable outcomes are explicitly excluded in coverage records.
+
+Oracle trades and return/speed HITS graphs are computed independently from each
+instrument's own prices, including each call and put. Issuer information is context,
+not a substitute target price series. The final supervised fusion order is annual,
+quarterly, issuer daily, sparse, instrument. Its changed dimensions require fresh
+training; old checkpoints cannot be loaded into this architecture.
 
 ## Backtests and artifacts
 
@@ -72,14 +79,14 @@ replaying training history as an inference warmup. Coverage checks compare
 predictions to actual priced dates.
 
 Equity reports use the existing HITS policy and shared-book return engine with
-separate long-only and short-only books. Frozen-option reports use equity
+separate long-only and short-only books. Sampled-option reports use equity
 signals to decide direction: long calls for bullish signals and long puts for
 bearish signals. Option decisions execute no earlier than the next equity
-trading session and only with complete basket quotes. The existing capacity
+trading session and only with valid contract quotes. The existing capacity
 planner retains positions awaiting an executable exit. Expirations force
 settlement; missing settlement values fail the backtest.
 
-Option calculations use the shared fixed-weight engine, basket bid/ask spread
+Option calculations use the shared fixed-weight engine, contract bid/ask spread
 costs, and 5.5 basis points per unit of turnover. Missing marks use the last
 observed midpoint for valuation only. Reports count stale valuation
 position-days and open positions at period end. These are fixed-weight return
@@ -103,3 +110,19 @@ for 371 equity and 790 option documents, including 51,218 option price
 observations. Scoring took 144.43 seconds and the 12 backtest reports took
 1.74 seconds. Results and coverage are stored under
 `artifacts/multirate_recovery/1T/warehouse_stream_20260912T201813Z/`.
+
+## Sampled-contract correctness run
+
+`artifacts/multirate_recovery/1T/sampled_contract_smoke_20260914` completed one
+2023 training epoch and all four 2024 backtest books with a small 8-dimensional,
+one-layer model. It trained 13 equity and 60 individual-option documents. The
+checkpoint records 213 observations for each option Oracle channel and 2,660
+for each option return/speed HITS channel. Inference covered 9,944 priced dates
+across the equities and the fixed selection of 50 calls and 10 puts.
+
+The first optimizer update took 23.25 seconds; total elapsed time was 78.10
+seconds, including 31.86 seconds for inference/year selection and 0.55 seconds
+for portfolio backtests. These timings validate the small configuration, not
+the notebook's full-size default model. Its executed return tables and actual
+configuration are saved in the notebook. The option results explicitly use
+hindsight selection and are not an unbiased out-of-sample performance estimate.

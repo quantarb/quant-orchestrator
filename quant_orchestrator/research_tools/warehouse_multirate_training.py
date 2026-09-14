@@ -11,6 +11,7 @@ import polars as pl
 import torch
 
 from .warehouse_multirate import WarehouseAnnualStream, SPARSE_FAMILIES
+from .sampled_options import SELECTION_POLICY
 from .annual_memory import AnnualMemory, ANNUAL_CONTRACT
 from .multirate_batch import BatchTensors
 from .multirate_training_step import make_training_step
@@ -81,7 +82,8 @@ def predict_batch(model, batch, memory, layout):
         for j,(date,valid) in enumerate(zip(item['daily_dates'],item['daily_score_valid']),1):
             if valid:
                 rows.append(dict(symbol=item['symbol'],underlying_symbol=item['underlying_symbol'],asset_class=item['asset_class'],date=date,
-                    **{name:float(value[i,j]) for name,value in predictions.items()}))
+                    **{name:float(value[i,j]) for name,value in predictions.items()},
+                    **({k:item[k] for k in ('option_type','expiration','settlement')} if item['asset_class']=='option' else {})))
     return rows
 
 
@@ -98,7 +100,7 @@ def evaluate_epoch(model, stream, args, epoch):
                 prices.append(item['prices'].select('date','open','high','low','close','volume').with_columns(
                     pl.lit(item['symbol']).alias('symbol'),pl.lit(item['asset_class']).alias('asset_class')))
             print(f'[warehouse-inference] epoch={epoch} batch={step} scores={len(rows)} seconds={perf_counter()-began:.1f}',flush=True)
-    scores=pl.DataFrame(rows).with_columns(pl.col('date').cast(pl.Datetime('ns')))
+    scores=pl.DataFrame(rows, infer_schema_length=None).with_columns(pl.col('date').cast(pl.Datetime('ns')))
     quotes=pl.concat(prices,how='diagonal_relaxed').with_columns(pl.col('date').cast(pl.Datetime('ns')))
     if scores.select(pl.struct('symbol','date').is_duplicated().any()).item():
         raise ValueError('Duplicate streamed predictions')
@@ -110,22 +112,22 @@ def evaluate_epoch(model, stream, args, epoch):
     scores.write_parquet(output/'predictions.parquet');quotes.write_parquet(output/'prices.parquet')
     inference_seconds=perf_counter()-began
     from quant_orchestrator.platforms.backtesting_frameworks.existing_multirate_backtest import run_existing_multirate_backtest
-    from quant_orchestrator.platforms.backtesting_frameworks.frozen_option_backtest import run_frozen_option_backtest
+    from quant_orchestrator.platforms.backtesting_frameworks.sampled_option_backtest import run_sampled_option_backtest
     reports=[];began=perf_counter()
     for year in range(start.year,end.year+1):
         for asset in ('equity','option'):
             s=scores.filter((pl.col('date').dt.year()==year)&(pl.col('asset_class')==asset))
             p=quotes.filter((pl.col('date').dt.year()==year)&(pl.col('asset_class')==asset))
-            if s.is_empty() or p.is_empty():
+            if (s.is_empty() or p.is_empty()) and (asset=='equity' or s.is_empty()!=p.is_empty()):
                 raise ValueError(f'Missing {asset} backtest coverage for {year}')
             path=output/str(year)/asset
             result=(run_existing_multirate_backtest(s.lazy(),p.select('symbol','date','close').lazy(),path)
-                if asset=='equity' else run_frozen_option_backtest(s,p,path,
+                if asset=='equity' else run_sampled_option_backtest(s,p,path,
                     equity_predictions=scores.filter((pl.col('date').dt.year()==year)&(pl.col('asset_class')=='equity'))))
             reports.extend(dict(year=year,asset_class=asset,**r) for r in result)
     (output/'results.json').write_text(json.dumps(reports,indent=2))
     timing=dict(inference_seconds=inference_seconds,backtest_seconds=perf_counter()-began,predictions=scores.height,
-                inference_initialization='empty_memory_no_warmup')
+                inference_initialization='empty_memory_no_warmup', option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (output/'timing.json').write_text(json.dumps(timing,indent=2))
     print('[warehouse-backtest] '+json.dumps(dict(epoch=epoch,reports=reports,**timing)),flush=True)
     return reports
@@ -159,7 +161,8 @@ def run_warehouse_training(args):
     args._warehouse_run_started=True
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     config.update(dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
-        options='up to five first-session DTE cohorts per right; all strikes, fixed equal weights, no rolling')
+        options='individual sampled contracts; fixed hindsight-filtered universe; no synthetic baskets',
+        option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))
     stream=WarehouseAnnualStream(min_market_cap=args.min_market_cap,start=args.warehouse_start_date,
         end=args.prediction_end_date,cutoff=args.train_end_date,output=args.output_dir)
@@ -220,7 +223,12 @@ def run_warehouse_training(args):
             print('[warehouse-training] '+json.dumps(status),flush=True)
             if args.checkpoint_every_batches and batch_index%args.checkpoint_every_batches==0:
                 checkpoint(epoch,batch_index,False,total/batch_index);stream.write_coverage()
-        missing=stream.expected_option_symbols-seen_options
+        eligible=set()
+        for symbol, coverage in stream.coverage.items():
+            for record in coverage['cohorts']:
+                if record['year'] < stream.cutoff.year and record.get('selected_contracts',0)>0:
+                    eligible.add(symbol)
+        missing=eligible-seen_options
         if missing:raise ValueError(f'Warehouse option underlyings omitted from training: {sorted(missing)}')
         snapshots_only={s for s in seen_options if not stream.observed[s]['temporal_documents']}
         if snapshots_only:raise ValueError(f'Options lack historical price-series documents: {sorted(snapshots_only)}')

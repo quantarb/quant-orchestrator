@@ -123,3 +123,26 @@ def test_model_checkpoint_round_trip(tmp_path):
     restored.load_state_dict(torch.load(path, weights_only=True))
     with torch.no_grad():
         torch.testing.assert_close(net(**data)['token_outputs']['return'], restored(**data)['token_outputs']['return'])
+
+
+def test_final_context_order_is_annual_quarterly_issuer_daily_sparse_instrument():
+    net=model().eval()
+    with torch.no_grad():
+        for parameter in net.information_age.parameters():
+            parameter.zero_()
+    captured=[];instrument=[]
+    fusion_hook=net.instrument_fusion.register_forward_pre_hook(lambda _,args:captured.append(args[0]))
+    price_hook=net.encoders['daily'].register_forward_hook(lambda _,args,value:instrument.append(value))
+    data=inputs()
+    dates=torch.tensor([[1,2,3],[1,2,3]])
+    data.update({f'{r}_dates':dates for r in ('annual','quarterly','daily','sparse')})
+    with torch.no_grad():
+        out=net(**data)
+    fusion_hook.remove();price_hook.remove()
+    parts=captured[0].chunk(5,dim=-1)
+    for index,rate in [(0,'annual'),(1,'quarterly'),(3,'sparse')]:
+        states=out['rate_states'][rate]
+        expected=states.cumsum(1)/torch.arange(1,4)[None,:,None]
+        torch.testing.assert_close(parts[index],expected)
+    assert torch.count_nonzero(parts[2])==0  # No issuer-daily payload in this test.
+    torch.testing.assert_close(parts[4],instrument[0])

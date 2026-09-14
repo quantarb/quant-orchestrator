@@ -596,7 +596,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--corpus", type=Path, help="Recorded data for checkpoint evaluation or exact resume only")
-    source_group.add_argument("--min-market-cap", type=float, help="Train directly from warehouse annual equity and frozen-option documents; no prebuilt corpus")
+    source_group.add_argument("--min-market-cap", type=float, help="Train directly from warehouse annual equity and sampled-option documents; no prebuilt corpus")
     parser.add_argument("--warehouse-start-date", default="1900-01-01", help="Earliest warehouse observations (default all available history)")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, help="Load an existing multirate_mtl_model.pt for inference without optimizer steps.")

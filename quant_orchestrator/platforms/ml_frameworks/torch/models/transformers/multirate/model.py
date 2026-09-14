@@ -325,7 +325,7 @@ class MultiRateTransformer(nn.Module):
         self.instrument_encoder = _encoder(self.config)
         self.daily_decoder = _decoder(self.config)
         self.instrument_fusion = nn.Sequential(
-            nn.Linear(self.config.d_model * len(self.config.rates), self.config.d_model),
+            nn.Linear(self.config.d_model * (len(self.config.rates) + 1), self.config.d_model),
             nn.LayerNorm(self.config.d_model), nn.GELU(),
         )
         self.fusion = nn.Sequential(
@@ -1033,9 +1033,11 @@ class MultiRateTransformer(nn.Module):
             clock = family_clock(dates, presence.bool(), query_dates).to(values.dtype)
             return self.information_age[rate](clock.flatten(-2)) * clock[..., 1].any(-1, keepdim=True)
         context_parts = []
-        for rate in self.config.rates:
+        context_order = [r for r in ("annual", "quarterly", "daily", "sparse") if r in self.config.rates]
+        for rate in context_order:
             if rate == "daily":
-                context_parts.append(instrument_states)
+                # Issuer daily context is separate from the final instrument stream.
+                context_parts.append(torch.zeros_like(instrument_states))
                 continue
             dates = rate_dates[rate]
             dates = dates.expand(daily_values.shape[0], -1) if dates.ndim == 1 else dates
@@ -1045,7 +1047,6 @@ class MultiRateTransformer(nn.Module):
             weights = visible.to(encoded_rates[rate].dtype)
             context_parts.append(torch.bmm(weights, encoded_rates[rate]) / weights.sum(-1, keepdim=True).clamp_min(1)
                 + age_state(rate, input_contracts[rate][0], dates, rate_padding[rate], input_contracts[rate][1]))
-        instrument_fused = self.instrument_fusion(torch.cat(context_parts, dim=-1))
         # Issuer daily/irregular observations are distinct from the instrument's
         # own daily/irregular observations; both use the native rate encoder.
         issuer_reuse = {}
@@ -1083,8 +1084,11 @@ class MultiRateTransformer(nn.Module):
             visible = (dates[:, None, :] <= query_dates[:, :, None]) & ~padding[:, None, :]
             weights = visible.to(states.dtype)
             context = torch.bmm(weights, states) / weights.sum(-1, keepdim=True).clamp_min(1)
-            instrument_fused = instrument_fused + self.issuer_context_fusion(context + age_state(rate, values, dates, padding))
+            context_parts[context_order.index(rate)] = self.issuer_context_fusion(context + age_state(rate, values, dates, padding))
             issuer_reuse[rate] = {"requested": values.shape[0], "encoded": len(first)}
+        # Ordered issuer context followed by this instrument's own price states.
+        context_parts.append(instrument_states)
+        instrument_fused = self.instrument_fusion(torch.cat(context_parts, dim=-1))
         supervised_states = {**token_states, "daily": instrument_fused}
         (
             token_outputs, document_outputs, fused_document_state, family_document_state,

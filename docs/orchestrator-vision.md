@@ -207,10 +207,10 @@ Still missing:
 - Do not require every strategy to be implemented in every engine.
 
 New multi-rate runs use `train_multirate_mtl.py --min-market-cap` to assemble
-annual equity and first-session frozen-option documents directly from warehouse
+annual equity and first-session sampled-option documents directly from warehouse
 sources as training requests them. New training rejects prebuilt corpora.
 The field-name schema and fixed numeric transform avoid a global normalization
-pass. Completed epochs run separate equity and executable frozen-option
+pass. Completed epochs run separate equity and executable sampled-option
 backtests. See [warehouse streaming](multirate-warehouse-streaming.md) for the
 current command, coverage checks, and return-simulation assumptions. The
 [training notebook](../notebooks/multirate_warehouse_training.ipynb) explains

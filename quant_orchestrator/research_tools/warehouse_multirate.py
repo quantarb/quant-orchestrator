@@ -4,7 +4,7 @@ The on-disk schema contains field names only. No corpus, fitted normalization,
 old roster, or feature/event export is an input to this loader.
 """
 from collections import OrderedDict, deque
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 from pathlib import Path
 import random
@@ -23,7 +23,7 @@ from quant_warehouse.platforms.data_providers.thetadata.options import (
 )
 from quant_warehouse.warehouse.storage import provider_library
 from quant_warehouse.warehouse.sections import DEFAULT_ECONOMIC_SERIES
-from .frozen_option_adjustments import first_session_baskets, basket_quotes, split_adjusted_members
+from .sampled_options import contract_candidates, select_contracts, SELECTION_POLICY
 from .multirate_corpus import statement_fields
 from .multirate_targets import materialize_instrument_targets, VALUE_COLUMNS
 from .multirate_supervision import StreamingSupervision
@@ -77,7 +77,7 @@ class WarehouseAnnualStream:
         self.columns = ['value__' + f for f in self.features]
         self.feature_set = set(self.features)
         self.sources = OrderedDict()
-        self.option_cache = OrderedDict()
+        self.selected_years = set()
         self.coverage, self.observed = {}, {}
         profiles = self.warehouse.catalog.query_symbol_profiles(provider='fmp', min_market_cap=min_market_cap,
             country='US', exchanges=['NASDAQ', 'NYSE'], exclude_etf=True, exclude_fund=True)
@@ -110,7 +110,7 @@ class WarehouseAnnualStream:
 
     def write_coverage(self):
         (self.output/'option_coverage.json').write_text(json.dumps(dict(source='warehouse',
-            construction='on_demand', coverage=self.coverage, trained=self.observed), indent=2, default=str))
+            construction='on_demand', selection_policy=SELECTION_POLICY, coverage=self.coverage, trained=self.observed), indent=2, default=str))
 
     def issuer(self, symbol):
         return {'GOOG': 'GOOGL', 'BRK-A': 'BRK-B'}.get(symbol, symbol)
@@ -196,90 +196,59 @@ class WarehouseAnnualStream:
             result.append(local.rename({c:'value__'+family+'.'+c for c in numeric(local)}))
         return result
 
-    def cohorts(self, symbol, year):
-        key = symbol, year
-        if key in self.option_cache:
-            self.option_cache.move_to_end(key)
-            return self.option_cache[key]
+    def prepare_option_year(self, year):
+        """Build this run's fixed selection once, lazily when its year is requested."""
+        if year in self.selected_years:
+            return
         import exchange_calendars as xcals
         calendar = xcals.get_calendar('XNYS', start='1990-01-01', end='2030-12-31')
-        first = calendar.sessions_in_range(f'{year}-01-01', f'{year}-01-10')[0].to_pydatetime().replace(tzinfo=None)
-        read = lambda a,b: read_thetadata_eod_option_chain(symbol, start_date=a, end_date=b, backend=self.warehouse.backend)
-        chain = read(first,first)
-        record = dict(year=year, first_session=str(first), status='loading')
-        self.coverage[symbol]['cohorts'].append(record)
-        if chain.is_empty():
-            record['status'] = 'missing_first_session_chain'
-            self.write_coverage()
-            return None
-        members = first_session_baskets(chain, first)
-        audit=self.output/'cohort_members'
-        audit.mkdir(exist_ok=True)
-        members.write_parquet(audit/f'{symbol}_{year}.parquet')
-        splits=self.warehouse.read_fundamentals(symbol,section='historical_splits',
-            start=first.date().isoformat(),end=min(datetime(year,12,31),self.end).date().isoformat())
-        split_rows=splits.sort('date').to_dicts() if splits.height else []
-        if any(r['numerator']/r['denominator']<1 for r in split_rows):
-            raise ValueError(f'{symbol}/{year}: reverse-split deliverables require an explicit option adjustment mapping')
-        record['splits']=[dict(date=str(r['date']),ratio=r['numerator']/r['denominator']) for r in split_rows]
-        parts, spots = [], []
-        day, end = first, min(datetime(year,12,31),self.end)
-        while day <= end:
-            stop = min(day+timedelta(days=90),end)
-            quotes = read(day,stop)
-            if quotes.height:
-                boundaries=[day,*[r['date'] for r in split_rows if day<r['date']<=stop],stop+timedelta(days=1)]
-                for left,right in zip(boundaries,boundaries[1:]):
-                    segment=quotes.filter(pl.col('snapshot_date').is_between(left,right,closed='left'))
-                    factor=1.
-                    for split in split_rows:
-                        if split['date']<=left:factor*=split['numerator']/split['denominator']
-                    if segment.height:
-                        adjusted=split_adjusted_members(members,segment,factor)
-                        parts.append(basket_quotes(segment,adjusted))
-                spots.append(quotes.filter(pl.col('underlying_price').is_finite() & (pl.col('underlying_price')>0))
-                    .group_by('snapshot_date').agg(pl.col('underlying_price').median().alias('spot')))
-            day = stop+timedelta(days=1)
-        paths = pl.concat(parts,how='diagonal_relaxed') if parts else pl.DataFrame()
-        spot=pl.concat(spots).unique('snapshot_date') if spots else pl.DataFrame()
-        terminal=[]
-        for (identity,), group in members.group_by('document_symbol'):
-            expiration=group['expiration'][0]
-            settlement=calendar.date_to_session(expiration.date().isoformat(),direction='previous').to_pydatetime().replace(tzinfo=None)
-            if settlement>end:continue
-            price=spot.filter(pl.col('snapshot_date')==settlement)
-            if price.is_empty():
-                # Old source history may have only monthly quotes. Preserve
-                # the missing settlement rather than inventing a payoff.
-                record.setdefault('missing_settlement',[]).append(identity)
+        directory = self.output/'sampled_contracts'/str(year)
+        directory.mkdir(parents=True, exist_ok=True)
+        audits = []
+        for symbol in sorted(self.prices):
+            if year not in self.option_years[symbol]:
                 continue
-            underlying=float(price['spot'][0])
-            factor=1.
-            for split in split_rows:
-                if split['date']<=settlement:factor*=split['numerator']/split['denominator']
-            # Express payoff per original basket constituent, conserving
-            # economic exposure through splits and avoiding adjusted equities
-            # mixed with unadjusted option strikes.
-            intrinsic=((pl.lit(underlying*factor)-pl.col('strike')) if group['option_type'][0]=='call' else
-                       (pl.col('strike')-pl.lit(underlying*factor))).clip(lower_bound=0)
-            value=float(group.select((intrinsic*pl.col('weight')).sum()).item())
-            terminal.append(dict(symbol=identity,date=settlement,open=value,high=value,low=value,close=value,volume=0.,
-                observed=group.height,expected=group.height))
-        if terminal:
-            terminal=pl.DataFrame(terminal).with_columns(pl.col('date').cast(paths.schema['date']))
-            paths=pl.concat([paths,terminal],how='diagonal_relaxed').unique(['symbol','date'],keep='last').sort('symbol','date')
-        actual = set(paths['symbol']) if paths.height else set()
-        expected = set(members['document_symbol'])
-        if actual != expected:
-            raise ValueError(f'{symbol}/{year}: frozen baskets without any complete quote: {sorted(expected-actual)}')
-        record.update(status='loaded', baskets=len(expected), rows=paths.height,
-            temporal_baskets=paths.group_by('symbol').len().filter(pl.col('len')>1).height)
-        result = members, paths
-        self.option_cache[key] = result
-        while len(self.option_cache) > 3:
-            self.option_cache.popitem(last=False)
+            read = lambda a,b: read_thetadata_eod_option_chain(symbol, start_date=a, end_date=b, backend=self.warehouse.backend)
+            audit, paths, status = contract_candidates(self.warehouse, symbol, year,
+                min(datetime(year,12,31), self.end), read, calendar)
+            self.coverage[symbol]['cohorts'].append(dict(year=year, status=status, candidates=audit.height))
+            if status == 'audited':
+                audits.append(audit)
+                paths.write_parquet(directory/f'{symbol}.parquet')
+            print(f'[option-selection] year={year} symbol={symbol} status={status} candidates={audit.height}', flush=True)
+        audit = pl.concat(audits, how='diagonal_relaxed') if audits else pl.DataFrame()
+        selected = select_contracts(audit)
+        audit.write_parquet(directory/'audit.parquet')
+        selected.write_parquet(directory/'selection.parquet')
+        (directory/'policy.json').write_text(json.dumps(SELECTION_POLICY, indent=2))
+        for symbol in sorted(self.prices):
+            path = directory/f'{symbol}.parquet'
+            kept = selected.filter(pl.col('underlying_symbol')==symbol) if selected.height else selected
+            if path.exists():
+                paths = pl.read_parquet(path)
+                paths = paths.filter(pl.col('symbol').is_in(kept['contract_symbol'].implode())) if kept.height else paths.head(0)
+                paths.write_parquet(path)
+            for record in self.coverage[symbol]['cohorts']:
+                if record['year'] == year:
+                    record['selected_contracts'] = kept.height
+                    if record['status'] == 'audited' and kept.is_empty():
+                        record['status'] = 'no_filter_survivors'
+        self.selected_years.add(year)
         self.write_coverage()
-        return result
+
+    def cohorts(self, symbol, year):
+        self.prepare_option_year(year)
+        directory = self.output/'sampled_contracts'/str(year)
+        members = pl.read_parquet(directory/'selection.parquet')
+        if members.is_empty():
+            return None
+        members = members.filter(pl.col('underlying_symbol')==symbol)
+        if members.is_empty():
+            return None
+        paths = pl.read_parquet(directory/f'{symbol}.parquet')
+        if set(paths['symbol']) != set(members['contract_symbol']):
+            raise ValueError(f'{symbol}/{year}: sampled contract histories are missing')
+        return members, paths
 
     def sample(self, symbol, year, *, option_symbol=None, members=None, prices=None, training=True, start=None, end=None):
         first = max(datetime(year,1,1),start or self.start)
@@ -298,7 +267,7 @@ class WarehouseAnnualStream:
         streams['daily'] = [prices.select('date',*[pl.col(c).alias('value__price.'+c) for c in ('open','high','low','close','volume')])] if option_symbol else equity_daily
         if option_symbol:
             subset = members.filter(pl.col('document_symbol')==option_symbol)
-            terms = {'instrument.strike':float((subset['strike']*subset['weight']).sum()),
+            terms = {'instrument.strike':float(subset['strike'][0]),
                 'instrument.entry_dte':float(subset['dte'][0]),'instrument.contract_size':100.,
                 'instrument.option_type':float(subset['option_type'][0]=='call'),
                 'instrument.expiration':float((subset['expiration'][0]-datetime(1970,1,1)).days)}
@@ -341,6 +310,10 @@ class WarehouseAnnualStream:
         sample['daily_dates']=daily_frame['date'].to_list()
         sample['daily_score_valid']=daily_frame['value__price.close'].is_finite().fill_null(False).to_list()
         sample['prices']=prices
+        if option_symbol:
+            sample['option_type']=subset['option_type'][0]
+            sample['expiration']=subset['expiration'][0]
+            sample['settlement']=subset['settlement'][0]
         return sample
 
     def documents(self, *, training=True, seed=0, start=None, end=None):

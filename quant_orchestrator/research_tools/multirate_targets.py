@@ -21,7 +21,7 @@ VALUE_COLUMNS = ("signal_value", *(f"text_{i}" for i in range(7)))
 def materialize_instrument_targets(symbol: str, prices: pl.DataFrame) -> pl.DataFrame:
     """Keep event-only labels and mark whole-year graph labels available at year end.
 
-    Prices for options must be their own basket paths, with high=ask/low=bid.
+    Prices for options must be their own individual contract paths, with high=ask/low=bid.
     Task-family names are storage identifiers shared by all asset classes.
     """
     from quant_warehouse.platforms.data_providers.fmp.target_engineering import (

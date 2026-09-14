@@ -36,15 +36,18 @@ on missing quote days. `survivor_plot_data` holds the plotted series.
 A following issuer inventory lists the equity series and final sampled calls and
 puts, including contract identifiers, strikes, expirations, and history counts.
 Bonds and other traded instrument types are not integrated into this workflow.
-This EDA selection is not passed to the trainer, which still constructs synthetic
-frozen option baskets.
+New training runs recompute the same default filters and sampling from warehouse
+history for their requested universe. Both training and backtests use fixed,
+hindsight-selected individual contracts, with no synthetic baskets. Oracle and
+HITS targets use each instrument's own prices. The final context order is annual,
+quarterly, issuer daily, sparse, then instrument.
 The opening dependency cell detects older warehouse installations and reinstalls
 the package with the active kernel's Python; restart the kernel after a repair.
 The configuration cell adds the discovered checkout root to Python's import path,
 so repository helpers also load when the kernel starts in `notebooks/`.
 It opens in review mode; select train mode to launch fresh runs sequentially.
 See also the [on-demand warehouse workflow](../docs/multirate-warehouse-streaming.md).
-It streams annual equity and frozen-option documents and runs both backtests.
+It streams annual equity and sampled-option documents and runs both backtests.
 Older multi-rate corpus-building notebooks record historical experiments and
 are not the launch path for new training runs.
 

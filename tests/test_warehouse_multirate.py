@@ -164,3 +164,32 @@ def test_first_session_uses_all_available_expirations_when_fewer_than_five(expir
     assert members['document_symbol'].n_unique() == 2 * expiry_count
     assert set(members['contract_symbol']) == set(q['contract_symbol'])
     assert set(members['weight']) == {.5}
+
+
+def test_option_target_builder_receives_contract_prices_not_issuer_prices(monkeypatch):
+    from quant_orchestrator.research_tools import warehouse_multirate as module
+    from quant_orchestrator.research_tools.multirate_targets import VALUE_COLUMNS
+    stream=object.__new__(module.WarehouseAnnualStream)
+    stream.start=datetime(2023,1,1);stream.end=datetime(2023,12,31);stream.cutoff=datetime(2024,1,1)
+    stream.columns=['value__price.close'];stream.features=['price.close']
+    dates=[datetime(2023,1,3),datetime(2023,1,4)]
+    def prices(values):
+        return pl.DataFrame({'date':dates,**{k:values for k in ('open','high','low','close','volume')}})
+    stream.prices={'AAPL':prices([150.,160.])}
+    empty=pl.DataFrame(schema={'symbol':pl.String,'date':pl.Datetime('ns'),'event_date':pl.Datetime('ns'),
+        'target_family':pl.String,**dict.fromkeys(VALUE_COLUMNS,pl.Float32)})
+    stream.source=lambda s: ({r:[] for r in ('annual','quarterly','daily')},empty)
+    stream.common=lambda:[];stream.peer_context=lambda s:[]
+    seen=[]
+    def targets(symbol,p):
+        seen.append((symbol,p['close'].to_list()))
+        return empty
+    monkeypatch.setattr(module,'materialize_instrument_targets',targets)
+    members=pl.DataFrame([dict(document_symbol='AAPL230217C00150000',strike=150.,dte=45,option_type='call',
+        expiration=datetime(2023,2,17),settlement=datetime(2023,2,17))])
+    call=stream.sample('AAPL',2023,option_symbol='AAPL230217C00150000',members=members,prices=prices([2.,4.]))
+    stream.prices['AAPL']=prices([900.,800.])
+    stream.sample('AAPL',2023,option_symbol='AAPL230217C00150000',members=members,prices=prices([2.,4.]))
+    stream.sample('AAPL',2023)
+    assert seen==[('AAPL230217C00150000',[2.,4.]),('AAPL230217C00150000',[2.,4.]),('AAPL',[900.,800.])]
+    assert call['option_type']=='call' and call['expiration']==datetime(2023,2,17)
