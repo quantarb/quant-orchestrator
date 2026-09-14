@@ -12,6 +12,9 @@ The next filter keeps options in the money at expiration using exact-day
 underlying marks, accounts for forward splits, and reports missing data separately.
 Every option filtering stage uses the same summary and per-symbol comparison
 table, fixed symbol order, and retention percentage relative to the original chain.
+Filters consume the preceding stage's survivors: `all_options` →
+`same_year_options` → `itm_options`. `filtered_options` exposes the current
+survivors with the original first-day columns for further filtering.
 The opening dependency cell detects older warehouse installations and reinstalls
 the package with the active kernel's Python; restart the kernel after a repair.
 It opens in review mode; select train mode to launch fresh runs sequentially.
