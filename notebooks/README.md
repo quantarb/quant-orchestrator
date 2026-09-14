@@ -6,7 +6,9 @@ EDA and training share the same `UNIVERSE` setting. The notebook starts
 ThetaData option history on January 1, 2021 (`OPTION_START`), independently of
 FMP history (`WAREHOUSE_START`, default all available). Option training uses
 2021–2023 with backtests beginning in 2024. Training logs and all four
-equity/option backtest books stream live from that execution; no old run is
+equity/option backtest books stream live from that execution. The table shows
+2024, 2025, and 2026 immediately, with four books per year and pending entries
+until each finishes (2026 ends at the configured September 9 endpoint); no old run is
 discovered and no results are read from JSON files. Saved outputs are cleared
 to prevent stale results from another universe appearing on open.
 Its option EDA cell counts full-chain contracts per symbol on a chosen year's

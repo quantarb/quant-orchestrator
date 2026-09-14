@@ -53,3 +53,20 @@ def test_new_configuration_resets_results_and_saved_notebook_has_no_stale_output
     source='\n'.join(c.source for c in notebook.cells if c.cell_type=='code')
     assert 'REVIEW_RUNS' not in source and 'read_json' not in source
     assert '.glob(' not in source and '.read_text(' not in source
+
+
+def test_three_years_four_books_are_visible_before_and_during_backtesting():
+    notebook,s=state()
+    table=s['live_return_table']()
+    assert table.index.get_level_values('year').tolist()==[2024,2025,2026]
+    assert table.shape==(3,4) and table.isna().all().all()
+    for year in (2024,2025,2026):
+        for asset,sides in [('equity',('long','short')),('option',('long_calls','long_puts'))]:
+            for side in sides:
+                event=dict(epoch=1,year=year,asset_class=asset,side=side,capital_return=.1)
+                s['consume_live_line']('[warehouse-backtest-book] '+json.dumps(event))
+                assert s['live_return_table']().shape==(3,4)
+    assert len(s['live_reports'])==12
+    assert s['live_return_table']().notna().all().all()
+    s['run_complete']=True
+    exec(notebook.cells[37].source,s)
