@@ -13,9 +13,10 @@ underlying marks, accounts for forward splits, and reports missing data separate
 Every option filtering stage uses the same summary and per-symbol comparison
 table, fixed symbol order, and retention percentage relative to the original chain.
 Filters consume the preceding stage's survivors: `all_options` →
-`same_year_options` → `moneyness_options` (ITM) → `profitable_options` → `history_options`.
-There is no percentile threshold: moneyness and ask-to-bid profit must each be
-strictly positive. `filtered_options` exposes the current
+`same_year_options` → `moneyness_options` (ITM) → `profitable_options` → `history_options`
+→ `top_profit_options`. Moneyness and ask-to-bid profit must each be strictly
+positive; the final filter keeps returns at or above the pooled 75th percentile
+among history-filter survivors. `filtered_options` exposes the current
 survivors with the original first-day columns for further filtering.
 The ask-to-bid return cell describes premium returns for those survivors, using
 the first-day ask and last stored bid through expiration, with split adjustments,
