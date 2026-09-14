@@ -12,8 +12,9 @@ NOTEBOOK = Path(__file__).resolve().parents[1]/'notebooks/multirate_warehouse_tr
 def state():
     notebook=nbformat.read(NOTEBOOK,4)
     namespace={}
-    exec(notebook.cells[4].source,namespace)
-    functions=[node for node in ast.parse(notebook.cells[30].source).body if isinstance(node,ast.FunctionDef)]
+    exec(notebook.cells[1].source,namespace)
+    exec(notebook.cells[5].source,namespace)
+    functions=[node for node in ast.parse(notebook.cells[31].source).body if isinstance(node,ast.FunctionDef)]
     exec(compile(ast.Module(body=functions,type_ignores=[]),'<live-results>','exec'),namespace)
     namespace['run_settings']=namespace['current_run_settings']().copy()
     return notebook,namespace
@@ -24,7 +25,7 @@ def test_command_and_reports_use_only_selected_universe(universe):
     notebook,s=state()
     s['UNIVERSE']=universe
     s['run_settings']=s['current_run_settings']().copy()
-    exec(notebook.cells[28].source,s)
+    exec(notebook.cells[29].source,s)
     command=s['training_command'](universe,Path('/tmp/fresh-output'))
     assert command[command.index('--min-market-cap')+1]==str(s['MARKET_CAPS'][universe])
     assert command[command.index('--warehouse-start-date')+1]=='1900-01-01'
@@ -47,7 +48,7 @@ def test_new_configuration_resets_results_and_saved_notebook_has_no_stale_output
     notebook,s=state()
     s['live_reports']={'old':{'universe':'100B'}}
     s['run_complete']=True
-    exec(notebook.cells[4].source,s)
+    exec(notebook.cells[5].source,s)
     assert s['live_reports']=={} and not s['run_complete'] and s['run_settings'] is None
     assert all(not c.get('outputs') for c in notebook.cells)
     source='\n'.join(c.source for c in notebook.cells if c.cell_type=='code')
@@ -69,4 +70,4 @@ def test_three_years_four_books_are_visible_before_and_during_backtesting():
     assert len(s['live_reports'])==12
     assert s['live_return_table']().notna().all().all()
     s['run_complete']=True
-    exec(notebook.cells[37].source,s)
+    exec(notebook.cells[38].source,s)
