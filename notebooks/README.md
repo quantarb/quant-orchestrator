@@ -33,6 +33,11 @@ Thresholds are configurable EDA settings, not training defaults.
 The final Plotly cell charts only surviving contracts for a selected symbol,
 with call/put panels, bid/ask/mid selection, split adjustments, and visible gaps
 on missing quote days. `survivor_plot_data` holds the plotted series.
+A following issuer inventory lists the equity series and final sampled calls and
+puts, including contract identifiers, strikes, expirations, and history counts.
+Bonds and other traded instrument types are not integrated into this workflow.
+This EDA selection is not passed to the trainer, which still constructs synthetic
+frozen option baskets.
 The opening dependency cell detects older warehouse installations and reinstalls
 the package with the active kernel's Python; restart the kernel after a repair.
 The configuration cell adds the discovered checkout root to Python's import path,
