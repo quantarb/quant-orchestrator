@@ -2,8 +2,11 @@
 
 The [step-by-step notebook](../notebooks/multirate_warehouse_training.ipynb)
 explains documents, subtokens, annual memory, objectives, coverage, and backtests.
-Select $1T, $100B, or $10B in its configuration. Review mode reads existing
-outputs; train mode runs the same workflow sequentially for selected universes.
+Select one `UNIVERSE`: `1T`, `100B`, or `10B`, then Run All. EDA and training
+share this setting. The notebook launches a fresh run and updates result tables
+from live process events as each backtest book completes. It does not discover
+old runs or read JSON artifacts for display. Saved historical outputs are cleared;
+changing settings blocks reuse of in-memory results from a previous run.
 
 New multi-rate runs use `scripts/train_multirate_mtl.py --min-market-cap`.
 The trainer queries the warehouse universe and assembles annual documents as
@@ -123,6 +126,6 @@ across the equities and the fixed selection of 50 calls and 10 puts.
 The first optimizer update took 23.25 seconds; total elapsed time was 78.10
 seconds, including 31.86 seconds for inference/year selection and 0.55 seconds
 for portfolio backtests. These timings validate the small configuration, not
-the notebook's full-size default model. Its executed return tables and actual
-configuration are saved in the notebook. The option results explicitly use
+the notebook's full-size default model. Its reports and actual configuration remain in that run's artifact directory;
+the notebook now displays only results produced by its current execution. The option results explicitly use
 hindsight selection and are not an unbiased out-of-sample performance estimate.

@@ -1,8 +1,11 @@
 # Quant Orchestrator Notebook Examples
 
 For current multi-rate training, open [multirate_warehouse_training.ipynb](multirate_warehouse_training.ipynb).
-It explains each stage, launches $1T/$100B/$10B runs from one configuration,
-and reviews coverage, failures, and all four equity/option backtest books.
+It explains each stage and runs one selected universe (`1T`, `100B`, or `10B`).
+EDA and training share the same `UNIVERSE` setting. Training logs and all four
+equity/option backtest books stream live from that execution; no old run is
+discovered and no results are read from JSON files. Saved outputs are cleared
+to prevent stale results from another universe appearing on open.
 Its option EDA cell counts full-chain contracts per symbol on a chosen year's
 first trading day and reports the average separately from missing-chain coverage.
 A following EDA cell keeps contracts expiring in the selected year, regardless
@@ -45,7 +48,8 @@ The opening dependency cell detects older warehouse installations and reinstalls
 the package with the active kernel's Python; restart the kernel after a repair.
 The configuration cell adds the discovered checkout root to Python's import path,
 so repository helpers also load when the kernel starts in `notebooks/`.
-It opens in review mode; select train mode to launch fresh runs sequentially.
+Set `UNIVERSE` and Run All to launch a fresh run. Changing settings invalidates
+the previous in-memory results; rerunning configuration resets run state.
 See also the [on-demand warehouse workflow](../docs/multirate-warehouse-streaming.md).
 It streams annual equity and sampled-option documents and runs both backtests.
 Older multi-rate corpus-building notebooks record historical experiments and

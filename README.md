@@ -7,7 +7,8 @@ to stream annual equity and first-session sampled-option documents directly from
 the warehouse, followed by equity and option backtests. No prebuilt corpus is
 accepted for new training. See [warehouse streaming](docs/multirate-warehouse-streaming.md)
 for the command, coverage gates, normalization, and execution assumptions.
-Use the [step-by-step training notebook](notebooks/multirate_warehouse_training.ipynb)
+Select one universe and stream fresh training/backtest results in the
+[step-by-step training notebook](notebooks/multirate_warehouse_training.ipynb)
 to launch $1T, $100B, or $10B runs and inspect coverage and backtest results.
 
 `quant-orchestrator` coordinates research workflows without assuming a single shape. A run can be ML training only, backtesting only, training followed by backtesting, cross-framework validation, Monte Carlo analysis, portfolio construction, or an external-engine strategy run that uses warehouse data and stores the native outputs.

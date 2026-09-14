@@ -124,7 +124,10 @@ def evaluate_epoch(model, stream, args, epoch):
             result=(run_existing_multirate_backtest(s.lazy(),p.select('symbol','date','close').lazy(),path)
                 if asset=='equity' else run_sampled_option_backtest(s,p,path,
                     equity_predictions=scores.filter((pl.col('date').dt.year()==year)&(pl.col('asset_class')=='equity'))))
-            reports.extend(dict(year=year,asset_class=asset,**r) for r in result)
+            for report in result:
+                report = dict(year=year, asset_class=asset, **report)
+                reports.append(report)
+                print('[warehouse-backtest-book] '+json.dumps(dict(epoch=epoch, **report)), flush=True)
     (output/'results.json').write_text(json.dumps(reports,indent=2))
     timing=dict(inference_seconds=inference_seconds,backtest_seconds=perf_counter()-began,predictions=scores.height,
                 inference_initialization='empty_memory_no_warmup', option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
