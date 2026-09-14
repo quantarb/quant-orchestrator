@@ -215,3 +215,26 @@ def test_option_start_keeps_earlier_fmp_history(monkeypatch,tmp_path):
     assert option_reads[0]['start_date']=='2021-01-01'
     assert stream.option_years['AAPL']==[2021,2022,2023]
     assert stream.start==datetime(1900,1,1) and stream.option_start==datetime(2021,1,1)
+
+
+def test_cached_raw_document_day_matches_fresh_query_and_excludes_other_dates():
+    from quant_orchestrator.research_tools.warehouse_multirate import inference_day
+    days=[datetime(2024,1,n) for n in (2,3,4)]
+    day=days[1]
+    frame=pl.DataFrame({'date':days,'x':[1.,2.,99999.]})
+    document=dict(underlying_symbol='X',daily_dates=days,daily_score_valid=[True]*3,
+                  prices=frame,supervised_targets=torch.zeros(4,2),supervised_valid=torch.zeros(4,2,dtype=torch.bool))
+    for rate in ('annual','quarterly','daily','sparse','issuer_daily','issuer_sparse'):
+        source=frame.filter(pl.col('date')!=day) if rate=='quarterly' else frame
+        values,mask,timestamps=annual_tensor(source,['x'],days[0])
+        document.update({rate:values,rate+'_padding':mask,rate+'_timestamps':timestamps})
+    query=inference_day(document,day)
+    for rate in ('annual','quarterly','daily','sparse','issuer_daily','issuer_sparse'):
+        source=frame.head(0) if rate=='quarterly' else frame.filter(pl.col('date')==day)
+        expected=annual_tensor(source,['x'],day)
+        for suffix,value in zip(('','_padding','_timestamps'),expected):
+            torch.testing.assert_close(query[rate+suffix],value,equal_nan=True)
+    assert query['daily_dates']==[day]
+    assert query['prices']['x'].to_list()==[2.]
+    assert not query['supervised_valid'].any()
+    assert document['prices'].height==3  # Shared raw document is unchanged.

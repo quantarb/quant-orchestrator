@@ -1040,6 +1040,9 @@ def replay_option_portfolio_from_selected_paths(
     *,
     date_index: pd.Index,
     initial_balance: float,
+    whole_contracts: bool = False,
+    allow_borrowing: bool = True,
+    fee_bps: float = 0.,
 ) -> OptionPortfolioReplay:
     dates = pd.DatetimeIndex(pd.to_datetime(date_index, errors="coerce")).normalize()
     dates = pd.DatetimeIndex(sorted(dates[~dates.isna()].unique()))
@@ -1069,7 +1072,7 @@ def replay_option_portfolio_from_selected_paths(
     trades["trade_id"] = trades["trade_id"].astype(str)
     trades["entry_date"] = pd.to_datetime(trades["entry_date"], errors="coerce").dt.normalize()
     trades["option_exit_date"] = pd.to_datetime(trades["option_exit_date"], errors="coerce").dt.normalize()
-    for _, trade in trades.iterrows():
+    for _, trade in trades.sort_values(["entry_date", "trade_id"]).iterrows():
         trade_id = str(trade.get("trade_id"))
         budget = _nan_float(trade.get("equity_entry_notional"))
         entry_price = _nan_float(trade.get("entry_price"))
@@ -1090,10 +1093,22 @@ def replay_option_portfolio_from_selected_paths(
         exit_dt = _align_to_calendar(exit_date, dates, direction="backward")
         if entry_dt is None or exit_dt is None or exit_dt < entry_dt:
             continue
-        units = float(budget) / float(entry_price)
-        cash_flows.loc[entry_dt] -= float(budget)
+        fee_rate = fee_bps / 10000
+        if not allow_borrowing:
+            available_cash = float(initial_balance + cash_flows.loc[:entry_dt].sum())
+            budget = min(float(budget), max(0., available_cash))
+        units = float(budget) / (float(entry_price) * (1 + fee_rate))
+        if whole_contracts:
+            units = np.floor(units / 100) * 100
+        if units <= 0:
+            continue
+        premium = float(units) * float(entry_price)
+        entry_fee = premium * fee_rate
+        budget = premium + entry_fee
+        cash_flows.loc[entry_dt] -= budget
         exit_value = float(units) * float(exit_price)
-        cash_flows.loc[exit_dt] += exit_value
+        exit_fee = exit_value * fee_rate
+        cash_flows.loc[exit_dt] += exit_value - exit_fee
         trade_path = paths.loc[paths["trade_id"].eq(trade_id)].copy() if not paths.empty else pd.DataFrame()
         if trade_path.empty:
             mark_dates = pd.DatetimeIndex([entry_dt])
@@ -1126,9 +1141,10 @@ def replay_option_portfolio_from_selected_paths(
                 "entry_price": float(entry_price),
                 "exit_price": float(exit_price),
                 "option_units": float(units),
+                "entry_fee": float(entry_fee), "exit_fee": float(exit_fee),
                 "exit_value": float(exit_value),
-                "option_pnl_dollars": float(exit_value - budget),
-                "option_return": float(exit_value / budget - 1.0),
+                "option_pnl_dollars": float(exit_value - exit_fee - budget),
+                "option_return": float((exit_value - exit_fee) / budget - 1.0),
                 "expired_before_equity_exit": bool(trade.get("expired_before_equity_exit", False)),
             }
         )

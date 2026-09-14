@@ -66,6 +66,33 @@ def merge_observations(frames, columns):
     return frame.with_columns(*[pl.lit(None, dtype=pl.Float32).alias(c) for c in columns if c not in frame.columns]).select('date', *columns)
 
 
+def inference_day(document, day):
+    """Extract exactly the single-day query from run-local raw annual tensors."""
+    timestamp = int((day - datetime(1970, 1, 1)).total_seconds()) * 10**9
+    result = dict(document, date=day.date().isoformat(), document_start=day.date().isoformat())
+    for rate in ('annual','quarterly','daily','sparse','issuer_daily','issuer_sparse'):
+        source = document[rate]
+        selected = (document[rate+'_timestamps'] == timestamp) & ~document[rate+'_padding']
+        count = int(selected.sum())
+        values = torch.full((max(2,count+1),source.shape[1]), float('nan'), dtype=source.dtype)
+        padding = torch.ones(len(values), dtype=torch.bool)
+        dates = torch.full((len(values),), torch.iinfo(torch.long).max, dtype=torch.long)
+        dates[0] = timestamp-1
+        values[1:count+1] = source[selected]
+        padding[1:count+1] = False
+        dates[1:count+1] = timestamp
+        result.update({rate:values,rate+'_padding':padding,rate+'_timestamps':dates})
+    indices = [i for i,d in enumerate(document['daily_dates']) if d == day]
+    result['daily_dates'] = [document['daily_dates'][i] for i in indices]
+    result['daily_score_valid'] = [document['daily_score_valid'][i] for i in indices]
+    for key in ('supervised_targets','supervised_valid'):
+        result[key] = torch.zeros((len(result['daily']), document[key].shape[1]),dtype=document[key].dtype)
+    result['prices'] = document['prices'].filter(pl.col('date') == day)
+    for key in ('issuer_context_key','annual_context_key','quarterly_context_key'):
+        result[key] = (document['underlying_symbol'], day)
+    return result
+
+
 class WarehouseAnnualStream:
     def __init__(self, *, min_market_cap, start, end, cutoff, output, warehouse=None, option_start=None):
         self.warehouse = warehouse or Warehouse()
@@ -324,7 +351,7 @@ class WarehouseAnnualStream:
             sample['settlement']=subset['settlement'][0]
         return sample
 
-    def documents(self, *, training=True, seed=0, start=None, end=None):
+    def documents(self, *, training=True, seed=0, start=None, end=None, include_options=True):
         groups=[]
         for symbol in sorted(self.prices):
             years=sorted(self.prices[symbol]['date'].dt.year().unique().to_list())
@@ -341,7 +368,9 @@ class WarehouseAnnualStream:
                     for identity in sorted(set(members['document_symbol'])):
                         yield self.sample(s,y,option_symbol=identity,members=members,
                             prices=paths.filter(pl.col('symbol')==identity),training=training,start=start,end=end)
-            groups.extend([equity_stream(),option_stream()])
+            groups.append(equity_stream())
+            if include_options:
+                groups.append(option_stream())
         random.Random(seed).shuffle(groups)
         pending=deque(groups)
         # A few independent streams keep source memory bounded and start the

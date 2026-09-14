@@ -483,3 +483,16 @@ Annual backtests now run without historical warmup. The first document is clippe
 
 
 The full $10B epoch-one no-warmup evaluation completed: 2,385 documents, 511,815 price-date scores, no missing/duplicate/unexpected/nonfinite predictions, and all 2024/2025/2026-through-September-9 long/short books. Scoring took 200.42 seconds versus 1,234.02 seconds with historical replay; the portfolio backtests took 13.75 seconds. The previous replay attempt failed on a macro-only ABMD trading calendar; observed-price scoring removes that invalid calendar. Evidence: `artifacts/multirate_recovery/10B/no_warmup_backtest_verification.json`.
+
+The warehouse training notebook uses
+`platforms/backtesting_frameworks/equity_option_trade_backtest.py` for its option
+strategy: equity entries trigger ranking within the annual hindsight-filtered
+sample (up to five calls and five puts per symbol), then the held option's own
+Oracle predictions control exit. HITS ranks long option returns for both rights.
+Only entry candidates and held contracts require option inference. Signals use
+next-observation execution; expiration forces settlement, with no roll. The replay
+uses whole contracts, available cash and bid/ask prices plus fees. Four separate
+books are reported live for each of 2024, 2025 and 2026 through the configured end.
+This is a model-driven option strategy, distinct from the generic equity-window
+option-equivalent replay. Fresh notebook launches rebuild the selected data and
+train new weights.

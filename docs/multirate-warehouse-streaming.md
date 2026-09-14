@@ -88,20 +88,24 @@ replaying training history as an inference warmup. Coverage checks compare
 predictions to actual priced dates.
 
 Equity reports use the existing HITS policy and shared-book return engine with
-separate long-only and short-only books. Sampled-option reports select one fixed contract per underlying/right/year
-from the training sample with seed 0, recorded in `backtest_contracts.parquet`.
-Missing quotes or expiry do not trigger replacement with another contract.
-The separate call and put books use equity signals to decide direction: long calls for bullish signals and long puts for
-bearish signals. Option decisions execute no earlier than the next equity
-trading session and only with valid contract quotes. The existing capacity
-planner retains positions awaiting an executable exit. Expirations force
-settlement; missing settlement values fail the backtest.
+separate long-only and short-only books and next-session signal execution.
+Equity entries trigger option selection from the annual hindsight-filtered pool
+of up to five calls/five puts per symbol. The model ranks eligible contracts by
+mean predicted own-option long-return HITS hub/authority, using the prior observed
+session. Buy one contract identity at ask; no daily full-chain scoring occurs.
 
-Option calculations use the shared fixed-weight engine, contract bid/ask spread
-costs, and 5.5 basis points per unit of turnover. Missing marks use the last
-observed midpoint for valuation only. Reports count stale valuation
-position-days and open positions at period end. These are fixed-weight return
-simulations, not a broker cash/margin ledger.
+The selected option's own Oracle predictions control exit: buy <= short or sell
+>= 0.5 triggers sale at the following observed bid. Both calls and puts are held
+long. Equity exits do not close options. Only held contracts require daily option
+inference, without warmup. A bounded 16-document run-local raw-tensor cache
+avoids rebuilding feature tables each day; day extraction excludes all other
+dates, and no model predictions or learned state are cached. Expiration forces intrinsic settlement; no roll is
+performed. Per-trade audits record ranking scores, exit reasons and skips.
+
+Option replay uses whole contracts, available cash, bid/ask spreads and 5.5 bps
+fees. Missing quotes carry forward only for valuation. Entered contracts without
+an exit observation fail explicitly. Each year produces four independent books;
+the live notebook reports 2024, 2025 and 2026 through its configured endpoint.
 
 Financial series retain the warehouse's recorded observation dates. No reporting
 lag or historical data-vintage reconstruction is applied; these reports use that
@@ -137,3 +141,18 @@ for portfolio backtests. These timings validate the small configuration, not
 the notebook's full-size default model. Its reports and actual configuration remain in that run's artifact directory;
 the notebook now displays only results produced by its current execution. The option results explicitly use
 hindsight selection and are not an unbiased out-of-sample performance estimate.
+
+September 14 option-model selection/exit validation:
+`artifacts/multirate_recovery/1T/warehouse_stream_20260914T194642Z_9ed990f2`
+was launched by the notebook's actual live runner. Its bounded configuration used
+2023 training history, 8 model dimensions, one layer, batch size 2, and one epoch.
+It trained 13 equity and 60 option documents, then completed all 12 reports for
+2024–2026 through September 9. First optimizer update: 19.79 seconds; total:
+304.79 seconds; equity inference: 16.11 seconds; backtests including annual
+selection and option inference: 234.43 seconds. The 55 option trades used 4,195
+option queries and at most five entry candidates, with whole units and
+nonnegative cash. This small model held every option until expiration; daily
+Oracle exits are implemented and their next-quote execution is exercised by
+regression tests. The executed notebook is saved as `executed_validation.ipynb`
+in that run. This validates the workflow, not the predictive quality or runtime
+of the notebook's default $100B, 64-dimensional full-history configuration.

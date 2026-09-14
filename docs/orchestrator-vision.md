@@ -313,3 +313,16 @@ The full $10B epoch-one no-warmup evaluation completed: 2,385 documents, 511,815
 The warehouse training notebook now selects one universe for both EDA and training,
 launches a fresh run, and renders live backtest events from that process. It does
 not discover historical runs or read result JSON files for its displayed tables.
+
+The warehouse training notebook uses
+`platforms/backtesting_frameworks/equity_option_trade_backtest.py` for its option
+strategy: equity entries trigger ranking within the annual hindsight-filtered
+sample (up to five calls and five puts per symbol), then the held option's own
+Oracle predictions control exit. HITS ranks long option returns for both rights.
+Only entry candidates and held contracts require option inference. Signals use
+next-observation execution; expiration forces settlement, with no roll. The replay
+uses whole contracts, available cash and bid/ask prices plus fees. Four separate
+books are reported live for each of 2024, 2025 and 2026 through the configured end.
+This is a model-driven option strategy, distinct from the generic equity-window
+option-equivalent replay. Fresh notebook launches rebuild the selected data and
+train new weights.

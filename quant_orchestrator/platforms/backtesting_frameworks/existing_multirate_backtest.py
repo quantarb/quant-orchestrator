@@ -36,7 +36,7 @@ def apply_oracle_gate(scores, *, mode="strict"):
     ).to_pandas()
 
 
-def run_existing_multirate_backtest(predictions, prices, output, *, initial_cash=100000., oracle_gate=False, oracle_gate_mode="strict"):
+def run_existing_multirate_backtest(predictions, prices, output, *, initial_cash=100000., oracle_gate=False, oracle_gate_mode="strict", next_session_execution=False):
     source = Path(__file__).resolve().parents[3].parent/'optimal_trader/scripts/multirate_transformer/trading_policy.py'
     spec = importlib.util.spec_from_file_location('existing_transformer_trading_policy', source)
     module = importlib.util.module_from_spec(spec)
@@ -52,6 +52,10 @@ def run_existing_multirate_backtest(predictions, prices, output, *, initial_cash
     if oracle_gate:
         scores = apply_oracle_gate(scores, mode=oracle_gate_mode)
     close = prices.collect(engine='streaming').to_pandas().pivot(index='date',columns='symbol',values='close').sort_index().ffill()
+    if next_session_execution:
+        next_date = dict(zip(close.index[:-1], close.index[1:]))
+        scores['date'] = scores['date'].map(next_date)
+        scores = scores.dropna(subset=['date'])
     capacity = min(20,len(close.columns))
     next_returns = close.pct_change().shift(-1)
     summary,actions,weights = shared_book.run_shared_book_framework_comparison(
@@ -64,6 +68,22 @@ def run_existing_multirate_backtest(predictions, prices, output, *, initial_cash
         returns,equity,turnover = shared_book.run_shared_book_backtest(frame,next_returns,cost_bps=5.5,capital_base=initial_cash)
         pl.from_pandas(frame.reset_index()).write_parquet(output/f'{variant}_weights.parquet')
         pl.from_pandas(equity.to_frame().assign(net_return=returns,turnover=turnover).reset_index()).write_parquet(output/f'{variant}_equity.parquet')
+    # Reuse the standard action-to-window writer; option replay consumes exactly
+    # the equity strategy's entry opportunities; option-model exits are independent.
+    from .optimal_trader.artifact_replay import action_tape_to_trade_windows
+    windows=[]
+    for variant, side in [('long_only','long'), ('short_only','short')]:
+        tape=actions.loc[actions.variant.eq(variant)].copy()
+        tape['action']=tape['action'].map({f'enter_{side}':'buy',f'exit_{side}':'sell'})
+        tape['price']=[close.at[d,symbol] for d,symbol in zip(tape['date'],tape['symbol'])]
+        frame=action_tape_to_trade_windows(tape,prices=close)
+        if not frame.empty:
+            frame['side']=side
+            frame['trade_id']=side+'_'+frame['trade_id'].astype(str)
+            windows.append(frame)
+    import pandas as pd
+    trade_windows=pd.concat(windows,ignore_index=True) if windows else pd.DataFrame(columns=['trade_id','symbol','side','entry_date','exit_date'])
+    trade_windows.to_parquet(output/'trade_windows.parquet',index=False)
     reports = []
     for row in summary.to_dict('records'):
         events = actions.loc[actions.variant.eq(row['variant']),'action']
@@ -76,7 +96,7 @@ def run_existing_multirate_backtest(predictions, prices, output, *, initial_cash
         score_policy=str(source),engine=str(Path(shared_book.__file__).resolve()),
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         engine_sha256=hashlib.sha256(Path(shared_book.__file__).read_bytes()).hexdigest(),
-        timing='original signal-date weights times next close-to-close returns',
+        timing='prior-session signals executed at next-session close' if next_session_execution else 'original signal-date weights times next close-to-close returns',
         total_return='original metric excludes the first recorded daily return; capital_return uses initial_cash',
         price_adjustment='splits_and_dividends',capacity=capacity,oracle_gate=oracle_gate,oracle_gate_mode=oracle_gate_mode if oracle_gate else None,
         oracle_gate_rules=('Additional to HITS: enter and hold longs only while buy > short; shorts only while short > buy; ties permit neither side; no absolute Oracle threshold or sell/cover veto' if oracle_gate_mode=='directional' else 'Additional to HITS: enter with side probability >= .5 and above opposite; hold only while above opposite and exit-action probability < .5; no entry during exit veto') if oracle_gate else None),indent=2))

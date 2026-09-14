@@ -94,7 +94,7 @@ def evaluate_epoch(model, stream, args, epoch):
     memory=AnnualMemory();memory.begin_epoch(epoch)
     model.eval();rows=[];prices=[];began=perf_counter()
     with torch.inference_mode():
-        for step,batch in enumerate(prefetch_batches(document_batches(stream.documents(training=False,start=start,end=end),args.batch_size)),1):
+        for step,batch in enumerate(prefetch_batches(document_batches(stream.documents(training=False,start=start,end=end,include_options=False),args.batch_size)),1):
             rows.extend(predict_batch(model,batch,memory,stream.layout))
             for item in batch:
                 prices.append(item['prices'].select('date','open','high','low','close','volume').with_columns(
@@ -112,25 +112,47 @@ def evaluate_epoch(model, stream, args, epoch):
     scores.write_parquet(output/'predictions.parquet');quotes.write_parquet(output/'prices.parquet')
     inference_seconds=perf_counter()-began
     from quant_orchestrator.platforms.backtesting_frameworks.existing_multirate_backtest import run_existing_multirate_backtest
-    from quant_orchestrator.platforms.backtesting_frameworks.sampled_option_backtest import run_sampled_option_backtest
+    from quant_orchestrator.platforms.backtesting_frameworks.equity_option_trade_backtest import run_equity_option_trade_backtest
     reports=[];began=perf_counter()
+    from collections import OrderedDict
+    from .warehouse_multirate import inference_day
+    query_documents=OrderedDict()
+    def rank_candidates(symbol, year, entry, members, paths):
+        batch=[]
+        for identity in members['document_symbol']:
+            key=(identity,year)
+            if key not in query_documents:
+                query_documents[key]=stream.sample(symbol,year,option_symbol=identity,members=members,
+                    prices=paths.filter(pl.col('symbol')==identity),training=False,
+                    start=datetime(year,1,1),end=min(end,datetime(year,12,31)))
+                while len(query_documents)>16:
+                    query_documents.popitem(last=False)
+            query_documents.move_to_end(key)
+            batch.append(inference_day(query_documents[key],entry))
+        # Cache raw features only. Every queried day gets fresh option predictions
+        # with empty memory; no preceding/future rows enter the model query.
+        with torch.inference_mode():
+            return predict_batch(model,batch,AnnualMemory(),stream.layout)
     for year in range(start.year,end.year+1):
-        for asset in ('equity','option'):
-            s=scores.filter((pl.col('date').dt.year()==year)&(pl.col('asset_class')==asset))
-            p=quotes.filter((pl.col('date').dt.year()==year)&(pl.col('asset_class')==asset))
-            if (s.is_empty() or p.is_empty()) and (asset=='equity' or s.is_empty()!=p.is_empty()):
-                raise ValueError(f'Missing {asset} backtest coverage for {year}')
-            path=output/str(year)/asset
-            result=(run_existing_multirate_backtest(s.lazy(),p.select('symbol','date','close').lazy(),path)
-                if asset=='equity' else run_sampled_option_backtest(s,p,path,
-                    equity_predictions=scores.filter((pl.col('date').dt.year()==year)&(pl.col('asset_class')=='equity'))))
-            for report in result:
-                report = dict(year=year, asset_class=asset, **report)
-                reports.append(report)
-                print('[warehouse-backtest-book] '+json.dumps(dict(epoch=epoch, **report)), flush=True)
+        s=scores.filter(pl.col('date').dt.year()==year)
+        p=quotes.filter(pl.col('date').dt.year()==year)
+        if s.is_empty() or p.is_empty():
+            raise ValueError(f'Missing equity backtest coverage for {year}')
+        equity_path=output/str(year)/'equity'
+        result=run_existing_multirate_backtest(s.lazy(),p.select('symbol','date','close').lazy(),equity_path,
+            next_session_execution=True)
+        for report in result:
+            report=dict(year=year,asset_class='equity',**report);reports.append(report)
+            print('[warehouse-backtest-book] '+json.dumps(dict(epoch=epoch,**report)),flush=True)
+        trades=pl.read_parquet(equity_path/'trade_windows.parquet').to_pandas()
+        result=run_equity_option_trade_backtest(trades,stream,rank_candidates,output/str(year)/'option',year=year,
+            dates=sorted(p['date'].unique().to_list()),capacity=min(20,p['symbol'].n_unique()))
+        for report in result:
+            report=dict(year=year,asset_class='option',**report);reports.append(report)
+            print('[warehouse-backtest-book] '+json.dumps(dict(epoch=epoch,**report)),flush=True)
     (output/'results.json').write_text(json.dumps(reports,indent=2))
     timing=dict(inference_seconds=inference_seconds,backtest_seconds=perf_counter()-began,predictions=scores.height,
-                inference_initialization='empty_memory_no_warmup', option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
+                inference_initialization='empty_memory_no_warmup', inference_assets=['equity'], training_option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (output/'timing.json').write_text(json.dumps(timing,indent=2))
     print('[warehouse-backtest] '+json.dumps(dict(epoch=epoch,reports=reports,**timing)),flush=True)
     return reports
@@ -168,7 +190,7 @@ def run_warehouse_training(args):
     args._warehouse_run_started=True
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     config.update(dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
-        options='individual sampled contracts; fixed hindsight-filtered universe; no synthetic baskets',
+        options='annual hindsight-filtered sample; score equities first, then model-rank surviving options for triggered equity trades and use held-option Oracle exits',
         option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))
     stream=WarehouseAnnualStream(min_market_cap=args.min_market_cap,start=args.warehouse_start_date,
