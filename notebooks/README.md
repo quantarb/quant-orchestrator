@@ -22,6 +22,8 @@ the first-day ask and last stored bid through expiration, with split adjustments
 quote-date gaps, and unpriced contracts reported explicitly.
 The opening dependency cell detects older warehouse installations and reinstalls
 the package with the active kernel's Python; restart the kernel after a repair.
+The configuration cell adds the discovered checkout root to Python's import path,
+so repository helpers also load when the kernel starts in `notebooks/`.
 It opens in review mode; select train mode to launch fresh runs sequentially.
 See also the [on-demand warehouse workflow](../docs/multirate-warehouse-streaming.md).
 It streams annual equity and frozen-option documents and runs both backtests.
