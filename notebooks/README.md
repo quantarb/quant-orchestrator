@@ -13,13 +13,16 @@ underlying marks, accounts for forward splits, and reports missing data separate
 Every option filtering stage uses the same summary and per-symbol comparison
 table, fixed symbol order, and retention percentage relative to the original chain.
 Filters consume the preceding stage's survivors: `all_options` →
-`same_year_options` → `moneyness_options` (ITM) → `profitable_options`.
+`same_year_options` → `moneyness_options` (ITM) → `profitable_options` → `history_options`.
 There is no percentile threshold: moneyness and ask-to-bid profit must each be
 strictly positive. `filtered_options` exposes the current
 survivors with the original first-day columns for further filtering.
 The ask-to-bid return cell describes premium returns for those survivors, using
 the first-day ask and last stored bid through expiration, with split adjustments,
 quote-date gaps, and unpriced contracts reported explicitly.
+The history filter then requires 20 distinct valid quote days and 80% coverage
+of entry-through-expiration trading sessions, using counts from the same quote
+scan. Thresholds are configurable EDA settings, not training defaults.
 The opening dependency cell detects older warehouse installations and reinstalls
 the package with the active kernel's Python; restart the kernel after a repair.
 The configuration cell adds the discovered checkout root to Python's import path,
