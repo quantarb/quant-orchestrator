@@ -110,7 +110,6 @@ class WarehouseAnnualStream:
         self.columns = ['value__' + f for f in self.features]
         self.feature_set = set(self.features)
         self.sources = OrderedDict()
-        self.source_cache_limit = 16
         self.selected_years = set()
         self.coverage, self.observed = {}, {}
         profiles = self.warehouse.catalog.query_symbol_profiles(provider='fmp', min_market_cap=min_market_cap,
@@ -191,7 +190,7 @@ class WarehouseAnnualStream:
         result = rates, sparse.with_columns(pl.col('date','event_date').cast(pl.Datetime('ns')))
         self.sources[issuer] = result
         # Bounded source cache, independent of the number of annual documents.
-        while len(self.sources) > self.source_cache_limit:
+        while len(self.sources) > 16:
             self.sources.popitem(last=False)
         return result
 
@@ -352,12 +351,7 @@ class WarehouseAnnualStream:
             sample['settlement']=subset['settlement'][0]
         return sample
 
-    def documents(self, *, batch_size, training=True, seed=0, start=None, end=None, include_options=True):
-        if batch_size < 1:
-            raise ValueError("batch_size must be positive")
-        # Keep active issuers cached so larger batches do not repeatedly reload
-        # their raw warehouse features on the following annual round.
-        self.source_cache_limit = batch_size
+    def documents(self, *, training=True, seed=0, start=None, end=None, include_options=True):
         groups=[]
         for symbol in sorted(self.prices):
             years=sorted(self.prices[symbol]['date'].dt.year().unique().to_list())
@@ -379,11 +373,11 @@ class WarehouseAnnualStream:
                 groups.append(option_stream())
         random.Random(seed).shuffle(groups)
         pending=deque(groups)
-        # Open enough independent streams for the requested batch, without
-        # assembling the remaining documents or mixing years of an instrument.
+        # A few independent streams keep source memory bounded and start the
+        # optimizer without constructing documents for the remaining universe.
         active=[]
         while pending or active:
-            while pending and len(active)<batch_size:active.append(pending.popleft())
+            while pending and len(active)<16:active.append(pending.popleft())
             for stream in list(active):
                 try:yield next(stream)
                 except StopIteration:active.remove(stream)

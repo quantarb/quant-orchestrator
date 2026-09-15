@@ -158,9 +158,3 @@ in that run. This validates the workflow, not the predictive quality or runtime
 of the notebook's default $100B, 64-dimensional full-history configuration.
 
 Training progress is capped by `--progress-updates-per-epoch` (1–10, default 10), exposed as `PROGRESS_UPDATES_PER_EPOCH` in the notebook’s top cell. It reserves one update for completion and spaces earlier updates using a document-count upper bound from already loaded metadata. No corpus counting pass is needed; epochs with fewer surviving options can produce fewer updates.
-
-The active document-stream limit and bounded issuer-source cache follow the
-requested batch size in both training and equity inference. A batch size of 64
-can therefore draw from 64 independent streams rather than being capped at 16.
-Per-instrument annual ordering and the one-year-per-instrument batch constraint
-remain enforced; batches can be smaller when streams exhaust.
