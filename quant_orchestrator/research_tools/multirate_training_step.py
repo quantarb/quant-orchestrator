@@ -113,7 +113,7 @@ def make_training_step(*, args, trainer, device, annual_state, reconstruction_wi
             "quarterly": quarterly_context_ids if torch.unique(quarterly_context_ids).numel() < len(batch) else None,
             "sparse": sparse_context_ids if torch.unique(sparse_context_ids).numel() < len(batch) else None,
         }
-        if memory_input is not None:
+        if memory_input is not None and not module.config.share_recurrent_issuer_context:
             rate_context_ids = {}
         output = module(
             daily_batch, annual_batch, quarterly_batch, sparse_batch,

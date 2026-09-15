@@ -151,6 +151,7 @@ class MultiRateTransformerConfig:
     rates: tuple[str, ...] = ("annual", "quarterly", "daily", "sparse")
     learned_aggregation_gate: bool = False
     cacheable_rate_states: bool = True
+    share_recurrent_issuer_context: bool = False
     attention_backend: AttentionBackend = "pytorch"
 
     def __post_init__(self) -> None:
@@ -766,7 +767,7 @@ class MultiRateTransformer(nn.Module):
             "sparse": sparse_values,
         }
         if annual_memory is not None:
-            if rate_cache or issuer_context_cache or rate_context_ids:
+            if rate_cache or issuer_context_cache or (rate_context_ids and not self.config.share_recurrent_issuer_context):
                 raise ValueError('Recurrent memory cannot reuse encoded contexts across instruments')
         for rate, values in streams.items():
             if rate not in self.config.rates:
@@ -808,21 +809,29 @@ class MultiRateTransformer(nn.Module):
         rate_cache = dict(rate_cache or {})
         if any(payload.get("parameter_version") != parameter_version for payload in rate_cache.values()):
             raise ValueError("Encoded-state cache belongs to different or updated model weights")
-        context_ids = rate_context_ids or {}
-        group_indices = {}
-        for rate, ids in context_ids.items():
-            if ids is None:
-                continue
-            unique, inverse = torch.unique(ids, sorted=True, return_inverse=True)
-            first = torch.stack([(ids == key).nonzero()[0, 0] for key in unique])
-            group_indices[rate] = (first, inverse)
-
         input_contracts = {
             "annual": (annual_values, annual_family_presence, annual_modality_ids, annual_dates, annual_padding_mask),
             "quarterly": (quarterly_values, quarterly_family_presence, quarterly_modality_ids, quarterly_dates, quarterly_padding_mask),
             "daily": (daily_values, daily_family_presence, daily_modality_ids, daily_dates, daily_padding_mask),
             "sparse": (sparse_values, sparse_family_presence, sparse_modality_ids, sparse_dates, sparse_padding_mask),
         }
+        context_ids = dict(rate_context_ids or {})
+        group_indices = {}
+        for rate, ids in context_ids.items():
+            if ids is None:
+                continue
+            if annual_memory is not None:
+                from .recurrent import identical_context_ids
+                values, presence, modalities, dates, padding = input_contracts[rate]
+                payload = dict(values=values, dates=dates.expand(values.shape[0], -1) if dates.ndim == 1 else dates,
+                               padding=padding, context_ids=ids, presence=presence, modalities=modalities)
+                ids = identical_context_ids(payload, annual_memory.get(rate))
+                context_ids[rate] = ids
+            unique, inverse = torch.unique(ids, sorted=True, return_inverse=True)
+            first = torch.stack([(ids == key).nonzero()[0, 0] for key in unique])
+            group_indices[rate] = (first, inverse)
+
+        rate_context_ids = context_ids
         def input_snapshot(rate):
             return tuple(value.detach().clone() if value is not None else None for value in input_contracts[rate])
 
@@ -894,7 +903,9 @@ class MultiRateTransformer(nn.Module):
                 projected = self._project(rate, select(values), select(family_presence),
                     select(modality_ids), attention_mode,
                     select(dates) if dates is not None and dates.ndim == 2 else dates,
-                    select(padding), need_subtokens)
+                    select(padding), need_subtokens,
+                    annual_memory={key: select(value) for key, value in annual_memory[rate].items()}
+                    if annual_memory is not None and rate in annual_memory else None)
                 if isinstance(projected, tuple):
                     return tuple(value.index_select(0, inverse) for value in projected)
                 return projected.index_select(0, inverse)
@@ -1049,7 +1060,8 @@ class MultiRateTransformer(nn.Module):
                 + age_state(rate, input_contracts[rate][0], dates, rate_padding[rate], input_contracts[rate][1]))
         # Issuer daily/irregular observations are distinct from the instrument's
         # own daily/irregular observations; both use the native rate encoder.
-        issuer_reuse = {}
+        issuer_reuse = {rate: {"requested": streams[rate].shape[0], "encoded": len(first)}
+                        for rate, (first, _) in group_indices.items()}
         memory_outputs = {}
         if annual_memory is not None:
             from .recurrent import ending_memory
@@ -1059,7 +1071,11 @@ class MultiRateTransformer(nn.Module):
                                                      rate_padding[rate], annual_memory.get(rate))
         for rate, payload in (issuer_streams or {}).items():
             values, dates, padding = payload["values"], payload["dates"], payload["padding"]
+            incoming = annual_memory.get('issuer_'+rate) if annual_memory is not None else None
             ids = payload.get("context_ids") if annual_memory is None else None
+            if annual_memory is not None and self.config.share_recurrent_issuer_context:
+                from .recurrent import identical_context_ids
+                ids = identical_context_ids(payload, incoming)
             if ids is None:
                 first = inverse = torch.arange(values.shape[0], device=values.device)
             else:
@@ -1073,9 +1089,10 @@ class MultiRateTransformer(nn.Module):
                         raise ValueError("Issuer context IDs group different dates or padding")
             projected = self._project(rate, values.index_select(0, first), dates=dates.index_select(0, first), padding_mask=padding.index_select(0, first),
                 return_subtoken_states=annual_memory is not None,
-                annual_memory=annual_memory.get('issuer_'+rate) if annual_memory is not None else None)
+                annual_memory={key: value.index_select(0, first) for key, value in incoming.items()} if incoming is not None else None)
             if annual_memory is not None:
                 projected, issuer_subtokens = projected
+                issuer_subtokens = issuer_subtokens.index_select(0, inverse)
             states = self._cached_state(rate, {}, projected, self.encoders[rate],
                 attention_mask(dates.index_select(0, first)), padding.index_select(0, first)).index_select(0, inverse)
             if annual_memory is not None:

@@ -501,3 +501,7 @@ Warehouse training now completes one issuer’s documents before preparing anoth
 issuer’s option histories. Option profit percentiles are per underlying/year/right,
 so sampling no longer waits for a universe-wide annual option scan. Common market
 context is still initialized for the universe, and cross-year memory is retained.
+
+The optional recurrent shared-issuer encoder prototype is documented in
+[warehouse streaming](docs/multirate-warehouse-streaming.md). It remains disabled in the notebook; a small real-option
+batch benchmark measured only a modest improvement, not a full-epoch speedup.

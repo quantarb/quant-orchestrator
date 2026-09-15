@@ -146,3 +146,46 @@ def test_final_context_order_is_annual_quarterly_issuer_daily_sparse_instrument(
         torch.testing.assert_close(parts[index],expected)
     assert torch.count_nonzero(parts[2])==0  # No issuer-daily payload in this test.
     torch.testing.assert_close(parts[4],instrument[0])
+
+
+@pytest.mark.parametrize('difference', [None, 'memory', 'dates', 'values', 'padding'])
+def test_recurrent_issuer_sharing_preserves_outputs_gradients_and_memory(difference):
+    from dataclasses import replace
+    from quant_orchestrator.research_tools.annual_memory import AnnualMemory
+    torch.manual_seed(42)
+    reference = model().train()
+    shared = copy.deepcopy(reference)
+    shared.config = replace(shared.config, share_recurrent_issuer_context=True)
+    data = inputs()
+    for rate in ('annual', 'quarterly'):
+        data[rate + '_values'][1] = data[rate + '_values'][0]
+    batch = [dict(symbol=s, date='2023-12-31', document_start='2023-01-01') for s in ['A', 'A_CALL']]
+    memory = AnnualMemory().inputs(batch, reference)
+    for rate in reference.config.rates:
+        data[rate + '_padding_mask'] = torch.zeros(2, 3, dtype=torch.bool)
+    payload = dict(values=torch.randn(1, 3, 2).expand(2, -1, -1).clone(),
+                   dates=torch.tensor([[0, 1, 2], [0, 1, 2]]),
+                   padding=torch.zeros(2, 3, dtype=torch.bool), context_ids=torch.tensor([0, 0]))
+    if difference == 'memory':
+        memory['issuer_daily']['states'][1, 0] = 1.
+        memory['annual']['states'][1, 0] = 1.
+    elif difference == 'dates':
+        payload['dates'][1, -1] += 1
+    elif difference == 'values':
+        payload['values'][1, -1, 0] += 1
+    elif difference == 'padding':
+        payload['padding'][1, -1] = True
+    plain = reference(**data, issuer_streams={'daily': payload}, annual_memory=memory)
+    grouped = shared(**data, issuer_streams={'daily': payload}, annual_memory=memory,
+                     rate_context_ids={rate: torch.tensor([0, 0]) for rate in ('annual', 'quarterly')})
+    assert grouped['issuer_reuse']['annual']['encoded'] == (2 if difference == 'memory' else 1)
+    assert grouped['issuer_reuse']['daily']['encoded'] == (1 if difference is None else 2)
+    torch.testing.assert_close(grouped['token_outputs']['return'], plain['token_outputs']['return'])
+    for rate, values in plain['annual_memory'].items():
+        for key, value in values.items():
+            torch.testing.assert_close(grouped['annual_memory'][rate][key], value)
+    for out in [plain, grouped]:
+        out['token_outputs']['return'].square().sum().backward()
+    for (name, p), (_, q) in zip(shared.named_parameters(), reference.named_parameters()):
+        if p.grad is not None:
+            torch.testing.assert_close(p.grad, q.grad, atol=2e-5, rtol=2e-4, msg=name)

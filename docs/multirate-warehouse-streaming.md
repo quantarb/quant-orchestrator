@@ -175,3 +175,24 @@ updates were interspersed with issuer-specific audits. The scheduling regression
 verifies that another issuer's option preparation cannot start until the current
 issuer's training batches have been consumed. This is a bounded smoke test,
 not a full-history $100B timing estimate.
+
+Experimental shared issuer encoding (September 15):
+`MultiRateTransformerConfig.share_recurrent_issuer_context` defaults to false.
+When enabled, the training step shares matching annual/quarterly projections and
+encodings, plus issuer daily/sparse encodings, within one optimizer step. Input
+values, dates, masks, modalities, family presence, and incoming recurrent memory
+must match; different instrument memories stay separate. Gathered outputs retain
+gradients from every instrument. Dropout is shared by grouped instruments, so
+output/gradient equivalence tests disable dropout. Nothing is cached across updates.
+
+The bounded experiment in `artifacts/multirate_recovery/shared_issuer_benchmark_v2`
+uses freshly read AAPL 2023 equity and five sampled options, model width 64 with
+two layers, and full supervised plus reconstruction training steps. It gives all
+instruments the equity document's issuer daily context, including the equity
+calendar; the production adapter still creates contract-specific calendar values.
+Across eight timed trials per variant after warmup, median step time was 0.480 s
+without sharing and 0.448 s with sharing (1.07x). Another training process was
+using the GPU, so these noisy batch timings are not a full-epoch speed claim.
+Most historical equity-only batches have no cross-instrument reuse. The notebook
+default and existing running jobs remain unchanged. `benchmark.py`,
+`benchmark.log`, and `benchmark.json` preserve the experiment recipe and evidence.

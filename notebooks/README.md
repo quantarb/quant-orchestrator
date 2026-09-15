@@ -158,3 +158,7 @@ Annual backtests now run without historical warmup. The first document is clippe
 The full $10B epoch-one no-warmup evaluation completed: 2,385 documents, 511,815 price-date scores, no missing/duplicate/unexpected/nonfinite predictions, and all 2024/2025/2026-through-September-9 long/short books. Scoring took 200.42 seconds versus 1,234.02 seconds with historical replay; the portfolio backtests took 13.75 seconds. The previous replay attempt failed on a macro-only ABMD trading calendar; observed-price scoring removes that invalid calendar. Evidence: `artifacts/multirate_recovery/10B/no_warmup_backtest_verification.json`.
 
 The warehouse training notebook keeps its editable settings in the first code cell: universe, date ranges, model dimensions, batch size, runtime/output controls, EDA filters, sampling, and plots. Run All after editing. The EDA controls are labeled separately from the trainer’s fixed option-selection policy.
+
+The optional recurrent shared-issuer encoder prototype is documented in
+[warehouse streaming](../docs/multirate-warehouse-streaming.md). It remains disabled in the notebook; a small real-option
+batch benchmark measured only a modest improvement, not a full-epoch speedup.
