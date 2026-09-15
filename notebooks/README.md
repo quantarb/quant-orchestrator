@@ -11,6 +11,8 @@ equity/option backtest books stream live from that execution. The table shows
 until each finishes (2026 ends at the configured September 9 endpoint); no old run is
 discovered and no results are read from JSON files. Saved outputs are cleared
 to prevent stale results from another universe appearing on open.
+If a run fails, the notebook exception includes its last process output and the
+log path for that exact run.
 Its option EDA cell counts full-chain contracts per symbol on a chosen year's
 first trading day and reports the average separately from missing-chain coverage.
 A following EDA cell keeps contracts expiring in the selected year, regardless

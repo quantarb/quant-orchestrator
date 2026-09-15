@@ -9,6 +9,20 @@ import pytest
 NOTEBOOK = Path(__file__).resolve().parents[1]/'notebooks/multirate_warehouse_training.ipynb'
 
 
+@pytest.mark.parametrize('returncode', [0, 1])
+def test_failed_run_exception_includes_current_process_error(returncode):
+    notebook = nbformat.read(NOTEBOOK, 4)
+    failure = next(node for node in ast.parse(notebook.cells[31].source).body
+                   if isinstance(node, ast.If) and ast.unparse(node.test) == 'returncode or not run_complete')
+    namespace = dict(returncode=returncode, run_complete=False, universe_label=lambda: '10B',
+                     log_path=Path('/tmp/current-run.log'),
+                     live_output_tail=['error: ABC/ratios/annual: missing fiscal period'])
+    with pytest.raises(RuntimeError, match='ABC/ratios/annual: missing fiscal period') as error:
+        exec(compile(ast.Module(body=[failure], type_ignores=[]), '<live-failure>', 'exec'), namespace)
+    assert '/tmp/current-run.log' in str(error.value)
+    assert '10B' in str(error.value)
+
+
 def state():
     notebook=nbformat.read(NOTEBOOK,4)
     namespace={}
