@@ -2,7 +2,7 @@
 
 For current multi-rate training, open [multirate_warehouse_training.ipynb](multirate_warehouse_training.ipynb).
 It explains each stage and runs one selected universe (`1T`, `100B`, or `10B`).
-EDA and training share the same `UNIVERSE` setting. The notebook starts
+EDA and training share the same `MIN_MARKET_CAP` setting. The notebook starts
 ThetaData option history on January 1, 2021 (`OPTION_START`), independently of
 FMP history (`WAREHOUSE_START`, default all available). Option training uses
 2021–2023 with backtests beginning in 2024. Training logs and all four
@@ -56,7 +56,7 @@ The opening dependency cell detects older warehouse installations and reinstalls
 the package with the active kernel's Python; restart the kernel after a repair.
 The configuration cell adds the discovered checkout root to Python's import path,
 so repository helpers also load when the kernel starts in `notebooks/`.
-Set `UNIVERSE` and Run All to launch a fresh run. Changing settings invalidates
+Set `MIN_MARKET_CAP` and Run All to launch a fresh run. Changing settings invalidates
 the previous in-memory results; rerunning configuration resets run state.
 See also the [on-demand warehouse workflow](../docs/multirate-warehouse-streaming.md).
 It streams annual equity and sampled-option documents and runs both backtests.

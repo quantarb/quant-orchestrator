@@ -2,7 +2,7 @@
 
 The [step-by-step notebook](../notebooks/multirate_warehouse_training.ipynb)
 explains documents, subtokens, annual memory, objectives, coverage, and backtests.
-Select one `UNIVERSE`: `1T`, `100B`, or `10B`, then Run All. EDA and training
+Set `MIN_MARKET_CAP` in dollars (for example, `100_000_000_000`), then Run All. Output labels such as `100B` are derived automatically. EDA and training
 share this setting. The notebook launches a fresh run and updates result tables
 from live process events as each backtest book completes. It does not discover
 old runs or read JSON artifacts for display. Saved historical outputs are cleared;

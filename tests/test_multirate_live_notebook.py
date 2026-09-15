@@ -20,14 +20,14 @@ def state():
     return notebook,namespace
 
 
-@pytest.mark.parametrize('universe',['1T','100B','10B'])
-def test_command_and_reports_use_only_selected_universe(universe):
+@pytest.mark.parametrize('market_cap,universe',[(1e12,'1T'),(1e11,'100B'),(1e10,'10B'),(5e10,'50B')])
+def test_command_and_reports_use_only_selected_universe(market_cap,universe):
     notebook,s=state()
-    s['UNIVERSE']=universe
+    s['MIN_MARKET_CAP']=market_cap
     s['run_settings']=s['current_run_settings']().copy()
     exec(notebook.cells[29].source,s)
-    command=s['training_command'](universe,Path('/tmp/fresh-output'))
-    assert command[command.index('--min-market-cap')+1]==str(s['MARKET_CAPS'][universe])
+    command=s['training_command'](Path('/tmp/fresh-output'))
+    assert command[command.index('--min-market-cap')+1]==str(market_cap)
     assert command[command.index('--progress-updates-per-epoch')+1]=='10'
     assert '--progress-every-batches' not in command
     assert command[command.index('--warehouse-start-date')+1]=='1900-01-01'
@@ -41,7 +41,7 @@ def test_command_and_reports_use_only_selected_universe(universe):
     epoch=dict(epoch=1,reports=[{k:v for k,v in report.items() if k!='epoch'}],inference_seconds=2.)
     s['consume_live_line']('[warehouse-backtest] '+json.dumps(epoch))
     assert len(s['live_reports'])==1
-    s['UNIVERSE']='10B' if universe!='10B' else '1T'
+    s['MIN_MARKET_CAP']=market_cap*2
     with pytest.raises(RuntimeError,match='Settings changed'):
         s['result_frame']()
 
