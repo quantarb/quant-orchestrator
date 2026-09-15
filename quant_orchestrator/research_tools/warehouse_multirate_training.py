@@ -117,7 +117,7 @@ def evaluate_epoch(model, stream, args, epoch):
     memory=AnnualMemory();memory.begin_epoch(epoch)
     model.eval();rows=[];prices=[];began=perf_counter()
     with torch.inference_mode():
-        for step,batch in enumerate(prefetch_batches(document_batches(stream.documents(training=False,start=start,end=end,include_options=False),args.batch_size)),1):
+        for step,batch in enumerate(prefetch_batches(document_batches(stream.documents(batch_size=args.batch_size,training=False,start=start,end=end,include_options=False),args.batch_size)),1):
             rows.extend(predict_batch(model,batch,memory,stream.layout))
             for item in batch:
                 prices.append(item['prices'].select('date','open','high','low','close','volume').with_columns(
@@ -260,7 +260,7 @@ def run_warehouse_training(args):
     for epoch in range(1,args.epochs+1):
         clock.current_epoch=epoch;model.train();total=0.;counts=Counter();seen_options=set();began=perf_counter()
         progress=EpochProgress(document_upper_bound,args.progress_updates_per_epoch)
-        for batch_index,batch in enumerate(prefetch_batches(document_batches(stream.documents(seed=args.seed+epoch),args.batch_size)),1):
+        for batch_index,batch in enumerate(prefetch_batches(document_batches(stream.documents(batch_size=args.batch_size,seed=args.seed+epoch),args.batch_size)),1):
             clock.current_step=batch_index;optimizer.zero_grad(set_to_none=True)
             losses=training_step(model,batch,tasks)
             loss=sum(t.loss_weight*losses[t.name] for t in tasks)

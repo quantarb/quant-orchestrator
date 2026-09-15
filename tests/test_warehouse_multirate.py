@@ -238,3 +238,27 @@ def test_cached_raw_document_day_matches_fresh_query_and_excludes_other_dates():
     assert query['prices']['x'].to_list()==[2.]
     assert not query['supervised_valid'].any()
     assert document['prices'].height==3  # Shared raw document is unchanged.
+
+
+@pytest.mark.parametrize('batch_size', [4, 16, 64])
+def test_active_streams_fill_requested_batches_and_keep_years_in_order(batch_size):
+    from quant_orchestrator.research_tools.warehouse_multirate import WarehouseAnnualStream
+    stream=WarehouseAnnualStream.__new__(WarehouseAnnualStream)
+    stream.cutoff=datetime(2024,1,1)
+    stream.prices={f'S{i:03}':pl.DataFrame({'date':[datetime(y,1,3) for y in (2021,2022,2023)]})
+                   for i in range(128)}
+    loaded=[]
+    def sample(symbol, year, **kwargs):
+        loaded.append((symbol,year))
+        return dict(symbol=symbol,year=year)
+    stream.sample=sample
+    iterator=document_batches(stream.documents(batch_size=batch_size,include_options=False),batch_size)
+    first=next(iterator)
+    assert len(first)==batch_size
+    assert len(loaded)==batch_size+1  # Only the batch and one lookahead are assembled.
+    batches=[first,*iterator]
+    assert all(len(b)==batch_size for b in batches)
+    assert all(len({r['symbol'] for r in b})==len(b) for b in batches)
+    for symbol in stream.prices:
+        assert [r['year'] for b in batches for r in b if r['symbol']==symbol]==[2021,2022,2023]
+    assert len(loaded)==128*3
