@@ -196,3 +196,35 @@ using the GPU, so these noisy batch timings are not a full-epoch speed claim.
 Most historical equity-only batches have no cross-instrument reuse. The notebook
 default and existing running jobs remain unchanged. `benchmark.py`,
 `benchmark.log`, and `benchmark.json` preserve the experiment recipe and evidence.
+
+The follow-up 50-option prototype adds optional
+`MultiRateTransformerConfig.cross_instrument_attention`. After issuer/instrument
+fusion, `InstrumentAttention` groups observed instrument tokens by issuer and
+exact timestamp and applies a multi-head attention layer with a residual and
+normalization. Attention spans instruments at that timestamp, not the flattened
+year-long collection of tokens. Missing quotes are padded out. Supervised heads
+retain separate per-instrument targets, and tests verify cross-instrument
+gradients, issuer isolation, time causality, and permutation equivariance.
+The training caller supplies explicit issuer IDs. This is still an experimental
+model configuration: the production notebook and equity-first single-contract
+inference path do not enable it. Deployment requires joint instrument batches
+at inference as well as training.
+
+The fresh 2023 AAPL benchmark used one equity and 50 unique surviving calls
+(the configured hindsight filters left no puts). Six measured trials per variant
+followed warmup, alternating variant order while the existing $10B job continued.
+Median full-step times / peak allocated GPU memory were:
+
+| Shared encoder | Instrument attention | Seconds | GiB |
+| --- | --- | ---: | ---: |
+| No | No | 2.500 | 32.13 |
+| Yes | No | 1.843 | 24.15 |
+| No | Yes | 2.468 | 32.15 |
+| Yes | Yes | 2.148 | 24.18 |
+
+With attention enabled on both sides, sharing reduced median step time by 13%
+and peak allocated GPU memory by 25%. Concurrent GPU work makes timing noisy;
+these are batch measurements, not epoch-time or predictive-quality results.
+Evidence and the executable recipe are in
+`artifacts/multirate_recovery/shared_issuer_attention_50/benchmark.json`,
+`benchmark.log`, and `benchmark.py`.

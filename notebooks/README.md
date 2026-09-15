@@ -162,3 +162,7 @@ The warehouse training notebook keeps its editable settings in the first code ce
 The optional recurrent shared-issuer encoder prototype is documented in
 [warehouse streaming](../docs/multirate-warehouse-streaming.md). It remains disabled in the notebook; a small real-option
 batch benchmark measured only a modest improvement, not a full-epoch speedup.
+
+The experimental model also supports same-issuer, same-date cross-instrument
+attention before supervised heads. It is tested with a 50-option batch and remains
+disabled in the production notebook pending a matching joint inference workflow.
