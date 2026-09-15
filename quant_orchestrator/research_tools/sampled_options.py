@@ -8,7 +8,7 @@ from .frozen_option_adjustments import split_adjusted_members
 
 SELECTION_POLICY = dict(same_expiration_year=True, positive_expiration_moneyness=True,
     positive_ask_to_bid_profit=True, minimum_quote_days=20, minimum_quote_coverage=.80,
-    profit_quantile=.50, quantile_scope='year_universe_separately_by_call_put',
+    profit_quantile=.50, quantile_scope='year_underlying_separately_by_call_put',
     contracts_per_side=5, seed=0, hindsight_selection=True, fixed_universe=True)
 
 
@@ -26,14 +26,14 @@ def sample_options_per_side(options, count=5, seed=0):
 
 
 def select_contracts(audit):
-    """Apply stacked filters, then universe-wide per-right medians and sampling."""
+    """Apply stacked filters, then per-underlying/right medians and sampling."""
     if audit.is_empty():
         return audit
     eligible = audit.filter(pl.col('moneyness').is_finite() & (pl.col('moneyness') > 0)
         & pl.col('profit_pct').is_finite() & (pl.col('profit_pct') > 0)
         & (pl.col('valid_quote_days') >= 20) & (pl.col('quote_coverage') >= .80))
-    cutoffs = eligible.group_by('option_type').agg(pl.col('profit_pct').quantile(.50, interpolation='linear').alias('profit_cutoff_pct'))
-    survivors = eligible.join(cutoffs, on='option_type').filter(pl.col('profit_pct') >= pl.col('profit_cutoff_pct'))
+    cutoffs = eligible.group_by('underlying_symbol','option_type').agg(pl.col('profit_pct').quantile(.50, interpolation='linear').alias('profit_cutoff_pct'))
+    survivors = eligible.join(cutoffs, on=['underlying_symbol','option_type']).filter(pl.col('profit_pct') >= pl.col('profit_cutoff_pct'))
     return sample_options_per_side(survivors)
 
 

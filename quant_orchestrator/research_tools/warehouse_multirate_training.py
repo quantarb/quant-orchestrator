@@ -51,6 +51,15 @@ def prefetch_batches(batches):
             yield batch
 
 
+def issuer_training_batches(stream, batch_size, seed):
+    """Finish an issuer's optimizer batches before preparing another issuer."""
+    for symbols in stream.issuer_groups(seed):
+        batches = document_batches(stream.documents(symbols=symbols), batch_size)
+        yield from prefetch_batches(batches)
+        # Only raw source features are released; recurrent model state remains.
+        stream.sources.clear()
+
+
 class EpochProgress:
     """Bound streaming progress output without counting/materializing the corpus."""
     def __init__(self, upper_bound, limit):
@@ -213,7 +222,7 @@ def run_warehouse_training(args):
     args.output_dir.mkdir(parents=True,exist_ok=False)
     args._warehouse_run_started=True
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
-    config.update(dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
+    config.update(training_schedule='issuer_sequential',dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
         options='annual hindsight-filtered sample; score equities first, then model-rank surviving options for triggered equity trades and use held-option Oracle exits',
         option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))
@@ -260,7 +269,7 @@ def run_warehouse_training(args):
     for epoch in range(1,args.epochs+1):
         clock.current_epoch=epoch;model.train();total=0.;counts=Counter();seen_options=set();began=perf_counter()
         progress=EpochProgress(document_upper_bound,args.progress_updates_per_epoch)
-        for batch_index,batch in enumerate(prefetch_batches(document_batches(stream.documents(seed=args.seed+epoch),args.batch_size)),1):
+        for batch_index,batch in enumerate(issuer_training_batches(stream,args.batch_size,args.seed+epoch),1):
             clock.current_step=batch_index;optimizer.zero_grad(set_to_none=True)
             losses=training_step(model,batch,tasks)
             loss=sum(t.loss_weight*losses[t.name] for t in tasks)
@@ -278,7 +287,7 @@ def run_warehouse_training(args):
                     key=item['underlying_symbol'];record=stream.observed.setdefault(key,dict(documents=0,price_observations=0,temporal_documents=0))
                     record['documents']+=1;record['price_observations']+=item['prices'].height
                     record['temporal_documents']+=int(item['prices'].height>1)
-            status=dict(stage='training',epoch=epoch,batch=batch_index,loss=total/batch_index,documents=dict(counts),
+            status=dict(stage='training',epoch=epoch,batch=batch_index,active_issuer=batch[-1]['issuer'],loss=total/batch_index,documents=dict(counts),
                 option_underlyings_seen=len(seen_options),first_optimizer_update_seconds=first_update,elapsed_seconds=perf_counter()-began)
             (args.output_dir/'status.json').write_text(json.dumps(status,indent=2))
             status.update(document_upper_bound=document_upper_bound,epoch_training_complete=False)

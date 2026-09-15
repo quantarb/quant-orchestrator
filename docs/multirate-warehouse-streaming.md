@@ -60,17 +60,19 @@ underlying/years are recorded separately from missing source history.
 
 `sampled_options.py` applies same-year expiration, positive terminal moneyness,
 positive first-ask/last-bid profit, at least 20 valid quote days and 80% coverage,
-and the universe-wide median profit separately for calls and puts. Valid quotes
+and the median profit separately for each underlying’s calls and puts. Valid quotes
 have finite bid > 0, ask > 0, and ask >= bid. Up to five calls and five puts per
 underlying are sampled independently with seed 0. Fewer survivors stay fewer.
 Each real contract has its own identity and historical series; strikes are never
 averaged. Both training and backtests intentionally use this hindsight-selected
 fixed annual universe. Uncompleted expirations cannot pass outcome filters.
 
-Selection is computed once per year within a fresh run. A universe-wide profit
-percentile needs a candidate-history scan before that year's option documents
-stream; only the sample is scored. `sampled_contracts/<year>/` stores run-local
-audits, selections, and selected price paths. No prior run's selection is reused.
+Training finishes one issuer’s chronological documents before preparing the next
+issuer’s option histories. Selection is computed only for the requested
+underlying/year, with per-underlying/right percentiles.
+`sampled_contracts/<year>/<symbol>/` stores run-local audits, selections, and
+selected price paths. No prior run’s selection is reused. Shared equity-price
+and market-context initialization still covers the selected universe.
 Forward splits conserve exposure per original contract unit. Expiration settlement
 uses exact-session underlying marks and intrinsic value. Unsupported splits and
 unavailable outcomes are explicitly excluded in coverage records.
@@ -158,3 +160,18 @@ in that run. This validates the workflow, not the predictive quality or runtime
 of the notebook's default $100B, 64-dimensional full-history configuration.
 
 Training progress is capped by `--progress-updates-per-epoch` (1–10, default 10), exposed as `PROGRESS_UPDATES_PER_EPOCH` in the notebook’s top cell. It reserves one update for completion and spaces earlier updates using a document-count upper bound from already loaded metadata. No corpus counting pass is needed; epochs with fewer surviving options can produce fewer updates.
+
+Issuer-sequential training preserves cross-year learned memory. Batches contain
+only instruments of the current issuer; older equity-only years can form
+single-document batches. Raw source features are released after that issuer.
+The earlier validation timings above precede this scheduling/percentile change.
+
+Issuer-sequential smoke validation:
+`artifacts/multirate_recovery/1T/issuer_sequential_validation_20260914` completed
+one fresh 2023 training epoch (13 equity and 60 option documents) and all four
+2024 backtest books. The small 8-dimensional, one-layer model reached its first
+optimizer update in 12.08 seconds and completed in 138.19 seconds. Training
+updates were interspersed with issuer-specific audits. The scheduling regression
+verifies that another issuer's option preparation cannot start until the current
+issuer's training batches have been consumed. This is a bounded smoke test,
+not a full-history $100B timing estimate.

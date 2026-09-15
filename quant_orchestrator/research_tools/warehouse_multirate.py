@@ -3,7 +3,7 @@
 The on-disk schema contains field names only. No corpus, fitted normalization,
 old roster, or feature/event export is an input to this loader.
 """
-from collections import OrderedDict, deque
+from collections import OrderedDict, defaultdict
 from datetime import datetime
 import json
 from pathlib import Path
@@ -110,7 +110,7 @@ class WarehouseAnnualStream:
         self.columns = ['value__' + f for f in self.features]
         self.feature_set = set(self.features)
         self.sources = OrderedDict()
-        self.selected_years = set()
+        self.selected_cohorts = set()
         self.coverage, self.observed = {}, {}
         profiles = self.warehouse.catalog.query_symbol_profiles(provider='fmp', min_market_cap=min_market_cap,
             country='US', exchanges=['NASDAQ', 'NYSE'], exclude_etf=True, exclude_fund=True)
@@ -231,56 +231,42 @@ class WarehouseAnnualStream:
             result.append(local.rename({c:'value__'+family+'.'+c for c in numeric(local)}))
         return result
 
-    def prepare_option_year(self, year):
-        """Build this run's fixed selection once, lazily when its year is requested."""
-        if year in self.selected_years:
+    def prepare_option_cohort(self, symbol, year):
+        """Audit and select only the requested underlying/year, once per run."""
+        key = (symbol, year)
+        if key in self.selected_cohorts:
             return
         import exchange_calendars as xcals
         calendar = xcals.get_calendar('XNYS', start='1990-01-01', end='2030-12-31')
-        directory = self.output/'sampled_contracts'/str(year)
+        directory = self.output/'sampled_contracts'/str(year)/symbol
         directory.mkdir(parents=True, exist_ok=True)
-        audits = []
-        for symbol in sorted(self.prices):
-            if year not in self.option_years[symbol]:
-                continue
-            read = lambda a,b: read_thetadata_eod_option_chain(symbol, start_date=a, end_date=b, backend=self.warehouse.backend)
-            audit, paths, status = contract_candidates(self.warehouse, symbol, year,
-                min(datetime(year,12,31), self.end), read, calendar)
-            self.coverage[symbol]['cohorts'].append(dict(year=year, status=status, candidates=audit.height))
-            if status == 'audited':
-                audits.append(audit)
-                paths.write_parquet(directory/f'{symbol}.parquet')
-            print(f'[option-selection] year={year} symbol={symbol} status={status} candidates={audit.height}', flush=True)
-        audit = pl.concat(audits, how='diagonal_relaxed') if audits else pl.DataFrame()
-        selected = select_contracts(audit)
+        read = lambda a,b: read_thetadata_eod_option_chain(symbol, start_date=a, end_date=b, backend=self.warehouse.backend)
+        audit, paths, status = contract_candidates(self.warehouse, symbol, year,
+            min(datetime(year,12,31), self.end), read, calendar)
+        selected = select_contracts(audit) if status == 'audited' else audit.head(0)
+        if status == 'audited':
+            paths = paths.filter(pl.col('symbol').is_in(selected['contract_symbol'].to_list()))
+            if selected.is_empty():
+                status = 'no_filter_survivors'
         audit.write_parquet(directory/'audit.parquet')
         selected.write_parquet(directory/'selection.parquet')
+        paths.write_parquet(directory/'prices.parquet')
         (directory/'policy.json').write_text(json.dumps(SELECTION_POLICY, indent=2))
-        for symbol in sorted(self.prices):
-            path = directory/f'{symbol}.parquet'
-            kept = selected.filter(pl.col('underlying_symbol')==symbol) if selected.height else selected
-            if path.exists():
-                paths = pl.read_parquet(path)
-                paths = paths.filter(pl.col('symbol').is_in(kept['contract_symbol'].implode())) if kept.height else paths.head(0)
-                paths.write_parquet(path)
-            for record in self.coverage[symbol]['cohorts']:
-                if record['year'] == year:
-                    record['selected_contracts'] = kept.height
-                    if record['status'] == 'audited' and kept.is_empty():
-                        record['status'] = 'no_filter_survivors'
-        self.selected_years.add(year)
+        self.coverage[symbol]['cohorts'].append(dict(year=year, status=status,
+            candidates=audit.height, selected_contracts=selected.height))
+        self.selected_cohorts.add(key)
         self.write_coverage()
+        print(f'[option-selection] year={year} symbol={symbol} status={status} candidates={audit.height} selected={selected.height}', flush=True)
 
     def cohorts(self, symbol, year):
-        self.prepare_option_year(year)
-        directory = self.output/'sampled_contracts'/str(year)
+        if year not in self.option_years[symbol]:
+            return None
+        self.prepare_option_cohort(symbol, year)
+        directory = self.output/'sampled_contracts'/str(year)/symbol
         members = pl.read_parquet(directory/'selection.parquet')
         if members.is_empty():
             return None
-        members = members.filter(pl.col('underlying_symbol')==symbol)
-        if members.is_empty():
-            return None
-        paths = pl.read_parquet(directory/f'{symbol}.parquet')
+        paths = pl.read_parquet(directory/'prices.parquet')
         if set(paths['symbol']) != set(members['contract_symbol']):
             raise ValueError(f'{symbol}/{year}: sampled contract histories are missing')
         return members, paths
@@ -351,33 +337,33 @@ class WarehouseAnnualStream:
             sample['settlement']=subset['settlement'][0]
         return sample
 
-    def documents(self, *, training=True, seed=0, start=None, end=None, include_options=True):
-        groups=[]
+    def issuer_groups(self, seed=0):
+        groups = defaultdict(list)
         for symbol in sorted(self.prices):
-            years=sorted(self.prices[symbol]['date'].dt.year().unique().to_list())
-            years=[y for y in years if (y < self.cutoff.year if training else (start.year <= y <= end.year))]
-            def equity_stream(s=symbol,ys=years):
-                for y in ys:
-                    yield self.sample(s,y,training=training,start=start,end=end)
-            def option_stream(s=symbol):
-                for y in self.option_years[s]:
-                    if not (y < self.cutoff.year if training else start.year <= y <= end.year):continue
-                    cohort=self.cohorts(s,y)
-                    if cohort is None:continue
-                    members,paths=cohort
+            groups[self.issuer(symbol)].append(symbol)
+        issuers = sorted(groups)
+        random.Random(seed).shuffle(issuers)
+        for issuer in issuers:
+            yield groups[issuer]
+
+    def documents(self, *, symbols=None, training=True, start=None, end=None, include_options=True):
+        """Build requested instruments in chronological years, on demand."""
+        symbols = sorted(self.prices) if symbols is None else symbols
+        equity_years = {s:set(self.prices[s]['date'].dt.year().unique().to_list()) for s in symbols}
+        years = set().union(*equity_years.values())
+        if include_options:
+            years.update(y for s in symbols for y in self.option_years[s])
+        for year in sorted(years):
+            if not (year < self.cutoff.year if training else start.year <= year <= end.year):
+                continue
+            for symbol in symbols:
+                if year in equity_years[symbol]:
+                    yield self.sample(symbol,year,training=training,start=start,end=end)
+                if include_options and year in self.option_years[symbol]:
+                    cohort = self.cohorts(symbol,year)
+                    if cohort is None:
+                        continue
+                    members, paths = cohort
                     for identity in sorted(set(members['document_symbol'])):
-                        yield self.sample(s,y,option_symbol=identity,members=members,
+                        yield self.sample(symbol,year,option_symbol=identity,members=members,
                             prices=paths.filter(pl.col('symbol')==identity),training=training,start=start,end=end)
-            groups.append(equity_stream())
-            if include_options:
-                groups.append(option_stream())
-        random.Random(seed).shuffle(groups)
-        pending=deque(groups)
-        # A few independent streams keep source memory bounded and start the
-        # optimizer without constructing documents for the remaining universe.
-        active=[]
-        while pending or active:
-            while pending and len(active)<16:active.append(pending.popleft())
-            for stream in list(active):
-                try:yield next(stream)
-                except StopIteration:active.remove(stream)

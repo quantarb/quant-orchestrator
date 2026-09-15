@@ -52,3 +52,31 @@ def test_native_paths_settlement_and_last_invalid_bid_not_previous_bid():
     assert paths.filter((pl.col('symbol')=='good')&(pl.col('date')==days[-1]))['close'][0]==20
     assert paths.filter((pl.col('symbol')=='good')&(pl.col('date')==days[1]))['close'][0]==4
     assert select_contracts(audit)['contract_symbol'].to_list()==['good']
+
+
+def test_percentile_for_one_underlying_is_independent_of_other_underlyings():
+    rows=[dict(underlying_symbol=s,contract_symbol=f'{s}{r}{i}',option_type=r,
+               moneyness=1.,profit_pct=float(i+1)*scale,valid_quote_days=30,quote_coverage=1.)
+          for s,scale in [('A',1),('B',10000)] for r in ('call','put') for i in range(20)]
+    audit=pl.DataFrame(rows)
+    together=select_contracts(audit)
+    for symbol in ('A','B'):
+        alone=select_contracts(audit.filter(pl.col('underlying_symbol')==symbol))
+        assert together.filter(pl.col('underlying_symbol')==symbol).equals(alone)
+        assert alone.height==10
+
+
+def test_notebook_percentile_matches_per_underlying_training_policy():
+    import json
+    import pandas as pd
+    from pathlib import Path
+    notebook=json.loads((Path(__file__).resolve().parents[1]/'notebooks/multirate_warehouse_training.ipynb').read_text())
+    rows=[dict(underlying_symbol=s,contract_symbol=f'{s}{r}{i}',option_type=r,return_status='priced',
+        moneyness=1.,profit_pct=float(i+1)*scale,valid_quote_days=30,quote_coverage=1.)
+        for s,scale in [('A',1),('B',1000)] for r in ('call','put') for i in range(4)]
+    audit=pl.DataFrame(rows)
+    namespace=dict(pl=pl,pd=pd,PROFIT_QUANTILE=.5,history_options=audit,option_return_audit=audit,
+        history_comparison=None,display=lambda *args:None,show_option_filter=lambda *args:None)
+    exec(''.join(notebook['cells'][18]['source']),namespace)
+    assert set(namespace['top_profit_options']['contract_symbol'])==set(select_contracts(audit)['contract_symbol'])
+    assert len(namespace['profit_cutoffs'])==4

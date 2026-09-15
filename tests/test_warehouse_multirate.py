@@ -238,3 +238,57 @@ def test_cached_raw_document_day_matches_fresh_query_and_excludes_other_dates():
     assert query['prices']['x'].to_list()==[2.]
     assert not query['supervised_valid'].any()
     assert document['prices'].height==3  # Shared raw document is unchanged.
+
+
+def test_issuer_batches_train_before_preparing_next_issuer_options():
+    from quant_orchestrator.research_tools.warehouse_multirate import WarehouseAnnualStream
+    from quant_orchestrator.research_tools.warehouse_multirate_training import issuer_training_batches
+    stream=WarehouseAnnualStream.__new__(WarehouseAnnualStream)
+    stream.cutoff=datetime(2024,1,1)
+    stream.prices={s:pl.DataFrame({'date':[datetime(y,1,3) for y in (2020,2021,2022)]}) for s in ('A','B')}
+    stream.option_years={s:[2021,2022] for s in stream.prices}
+    stream.sources={'unused_context_source':object()}
+    events=[]
+    def cohort(symbol,year):
+        events.append(('audit',symbol,year))
+        identities=[f'{symbol}_{year}_{right}' for right in ('call','put')]
+        return pl.DataFrame({'document_symbol':identities}),pl.DataFrame({'symbol':identities})
+    def sample(symbol,year,option_symbol=None,**kwargs):
+        events.append(('build',symbol,year))
+        return dict(symbol=option_symbol or symbol,issuer=symbol,year=year)
+    stream.cohorts=cohort;stream.sample=sample
+    batches=[]
+    for batch in issuer_training_batches(stream,64,0):
+        assert len({r['issuer'] for r in batch})==1
+        assert len({r['symbol'] for r in batch})==len(batch)
+        batches.append(batch)
+        events.append(('train',batch[0]['issuer'],None))
+    order=[group[0] for group in stream.issuer_groups(0)]
+    first,second=order
+    assert max(i for i,e in enumerate(events) if e[:2]==('train',first)) < min(i for i,e in enumerate(events) if e[1]==second)
+    for symbol in stream.prices:
+        assert [r['year'] for b in batches for r in b if r['symbol']==symbol]==[2020,2021,2022]
+    assert sum(len(b) for b in batches)==14
+    assert not stream.sources
+
+
+def test_option_preparation_only_reads_requested_symbol_year(monkeypatch,tmp_path):
+    from types import SimpleNamespace
+    from quant_orchestrator.research_tools import warehouse_multirate as module
+    stream=module.WarehouseAnnualStream.__new__(module.WarehouseAnnualStream)
+    stream.output=tmp_path;stream.end=datetime(2023,12,31)
+    stream.selected_cohorts=set();stream.option_years={'A':[2021],'B':[2021]}
+    stream.coverage={s:dict(cohorts=[]) for s in ('A','B')}
+    stream.warehouse=SimpleNamespace(backend=None);stream.write_coverage=lambda:None
+    reads=[]
+    def candidates(warehouse,symbol,year,*args):
+        reads.append((symbol,year))
+        audit=pl.DataFrame([dict(underlying_symbol=symbol,contract_symbol=symbol+'C',document_symbol=symbol+'C',
+            option_type='call',moneyness=1.,profit_pct=20.,valid_quote_days=30,quote_coverage=1.)])
+        return audit,pl.DataFrame({'symbol':[symbol+'C'],'date':[datetime(year,1,4)]}),'audited'
+    monkeypatch.setattr(module,'contract_candidates',candidates)
+    assert stream.cohorts('A',2021)[0].height==1
+    assert stream.cohorts('A',2021)[0].height==1
+    assert reads==[('A',2021)]
+    assert stream.coverage['B']['cohorts']==[]
+    assert not (tmp_path/'sampled_contracts/2021/B').exists()

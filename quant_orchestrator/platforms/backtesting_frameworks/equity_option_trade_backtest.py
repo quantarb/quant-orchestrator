@@ -100,7 +100,6 @@ def run_equity_option_trade_backtest(
     """Only equity trade triggers request option predictions; pool fixed per year."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    stream.prepare_option_year(year)
     cohorts = {}
     reports = []
     for side, right in [("long", "call"), ("short", "put")]:

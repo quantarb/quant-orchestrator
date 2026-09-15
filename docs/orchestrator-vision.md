@@ -326,3 +326,8 @@ books are reported live for each of 2024, 2025 and 2026 through the configured e
 This is a model-driven option strategy, distinct from the generic equity-window
 option-equivalent replay. Fresh notebook launches rebuild the selected data and
 train new weights.
+
+Warehouse training now completes one issuer’s documents before preparing another
+issuer’s option histories. Option profit percentiles are per underlying/year/right,
+so sampling no longer waits for a universe-wide annual option scan. Common market
+context is still initialized for the universe, and cross-year memory is retained.
