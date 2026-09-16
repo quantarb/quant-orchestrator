@@ -1,0 +1,42 @@
+{
+  "stage": "complete",
+  "epoch": 1,
+  "loss": 5.2790595313958955,
+  "documents": {
+    "equity": 411
+  },
+  "backtest_reports": 0,
+  "epochs_completed": 1,
+  "first_optimizer_update_seconds": 12.210434709995752,
+  "total_seconds": 68.66977180899994,
+  "score_date": "2026-09-09",
+  "predictions": 12,
+  "prediction_path": "artifacts/multirate_recovery/1T/latest_migration_smoke_20260916T200023Z/latest_predictions.parquet",
+  "prices_path": "artifacts/multirate_recovery/1T/latest_migration_smoke_20260916T200023Z/latest_prices.parquet",
+  "checkpoint": "artifacts/multirate_recovery/1T/latest_migration_smoke_20260916T200023Z/checkpoint_latest.pt",
+  "inference_seconds": 7.5784455719986,
+  "batch_wait_seconds": 7.454805454995949,
+  "prediction_seconds": 0.11687917199742515,
+  "trained_equities": 14,
+  "missing_latest_prices": [
+    "BRK-A",
+    "BRK-B"
+  ],
+  "evaluation_mode": "latest_date_in_sample",
+  "inference_initialization": "empty_memory_current_year_context",
+  "options_per_side": 0,
+  "validation": {
+    "model_dimensions": 64,
+    "layers": 2,
+    "heads": 4,
+    "training_start": "1900-01-01",
+    "training_cutoff_exclusive": "2026-09-10",
+    "options_per_side": 0,
+    "unit_tests": 57,
+    "app_tests_passed": 43,
+    "app_preexisting_failures": 2,
+    "order_submissions": 0,
+    "source_metadata_repair": "Refreshed missing fiscal period metadata through existing OpenBB route: SPCX and 41 other equities; 888-equity metadata audit.",
+    "frontend_option_selections": 9
+  }
+}

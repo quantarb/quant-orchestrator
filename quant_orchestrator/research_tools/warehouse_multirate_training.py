@@ -69,8 +69,7 @@ def equity_training_batches(stream, batch_size, seed):
     """
     rows = [dict(symbol=symbol, date=datetime(year, 1, 1), year=year)
         for symbol, prices in stream.prices.items()
-        for year in sorted(prices['date'].dt.year().unique().to_list())
-        if year < stream.cutoff.year]
+        for year in sorted(prices.filter(pl.col('date') < stream.cutoff)['date'].dt.year().unique().to_list())]
     def materialize(row):
         return stream.sample(row['symbol'], row['year'], training=True)
     def batches():
@@ -93,9 +92,9 @@ def training_batches(stream, batch_size, seed):
         yield from equity_training_batches(stream, batch_size, seed)
 
 
-def equity_inference_batches(stream, batch_size, start, end):
+def equity_inference_batches(stream, batch_size, start, end, *, symbols=None):
     """Reuse each bounded issuer block across years; preserve per-symbol memory order."""
-    symbols = sorted(stream.prices)
+    symbols = sorted(stream.prices if symbols is None else symbols)
     def batches():
         with ThreadPoolExecutor(max_workers=4) as workers:
             for offset in range(0, len(symbols), batch_size):
@@ -134,7 +133,7 @@ class EpochProgress:
         return False
 
 
-def predict_batch(model, batch, memory, layout):
+def predict_batch(model, batch, memory, layout, *, score_date=None):
     device = next(model.parameters()).device
     stack = BatchTensors(batch, device)
     widths = {**{r:tuple(layout.values()) for r in ('annual','quarterly','daily')}, 'sparse':(8,)*len(SPARSE_FAMILIES)}
@@ -163,7 +162,7 @@ def predict_batch(model, batch, memory, layout):
     rows=[]
     for i,item in enumerate(batch):
         for j,(date,valid) in enumerate(zip(item['daily_dates'],item['daily_score_valid']),1):
-            if valid:
+            if valid and (score_date is None or date == score_date):
                 rows.append(dict(symbol=item['symbol'],underlying_symbol=item['underlying_symbol'],asset_class=item['asset_class'],date=date,
                     **{name:value[i][j] for name,value in predictions.items()},
                     **({k:item[k] for k in ('option_type','expiration','settlement')} if item['asset_class']=='option' else {})))
@@ -319,7 +318,7 @@ def evaluate_warehouse_checkpoint(checkpoint, output_dir, *, device='cuda'):
         raise
 
 
-def run_warehouse_training(args):
+def run_warehouse_training(args, *, latest_only=False, warehouse=None):
     started=perf_counter()
     option_policy = selection_policy(args.options_per_side)
     EpochProgress(1,args.progress_updates_per_epoch)  # Validate before opening the warehouse.
@@ -328,7 +327,11 @@ def run_warehouse_training(args):
     if not args.train_end_date or not args.prediction_start_date or not args.prediction_end_date:
         raise ValueError('Warehouse training requires explicit training cutoff and prediction start/end dates')
     first,cutoff,start,end=map(datetime.fromisoformat,(args.warehouse_start_date,args.train_end_date,args.prediction_start_date,args.prediction_end_date))
-    if not first<cutoff<=start<=end or (cutoff.month,cutoff.day)!=(1,1):
+    if latest_only:
+        from datetime import timedelta
+        if not first <= start == end or cutoff != end + timedelta(days=1) or args.options_per_side:
+            raise ValueError('Latest-date training requires equities only and cutoff one day after the score date')
+    elif not first<cutoff<=start<=end or (cutoff.month,cutoff.day)!=(1,1):
         raise ValueError('Require warehouse start < January 1 training cutoff <= prediction start <= prediction end')
     if args.options_per_side and args.warehouse_option_start_date:
         option_start = datetime.fromisoformat(args.warehouse_option_start_date)
@@ -355,11 +358,12 @@ def run_warehouse_training(args):
     config.update(preparation_workers=1 if args.options_per_side else 4, training_schedule=('issuer_sequential' if args.options_per_side else 'equity_interleaved'),dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
         options=('annual hindsight-filtered sample; score equities first, then model-rank surviving options for triggered equity trades and use held-option Oracle exits' if args.options_per_side else 'disabled; equities only'),
         option_selection=option_policy, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
+    config.update(evaluation_mode='latest_date_in_sample' if latest_only else 'out_of_sample_backtest')
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))
     stream=WarehouseAnnualStream(min_market_cap=args.min_market_cap,start=args.warehouse_start_date,
         end=args.prediction_end_date,cutoff=args.train_end_date,output=args.output_dir,option_start=args.warehouse_option_start_date,
         options_per_side=args.options_per_side,
-        source_cache_limit=16 if args.options_per_side else max(16, args.batch_size))
+        source_cache_limit=16 if args.options_per_side else max(16, args.batch_size), warehouse=warehouse)
     print(f'[warehouse-stream] metadata_ready_seconds={perf_counter()-started:.2f} equities={len(stream.prices)} option_underlyings={len(stream.expected_option_symbols)} corpus_built=false',flush=True)
     asset_classes = ['equity', 'option'] if args.options_per_side else ['equity']
     device=torch.device(args.device);torch.manual_seed(args.seed)
@@ -446,9 +450,15 @@ def run_warehouse_training(args):
             status.update(epoch_training_complete=True,elapsed_seconds=perf_counter()-began)
             print('[warehouse-training] '+json.dumps(status),flush=True)
         if device.type=='cuda':torch.cuda.empty_cache()
-        reports=evaluate_epoch(model,stream,args,epoch)
+        reports=[] if latest_only else evaluate_epoch(model,stream,args,epoch)
         (args.output_dir/'status.json').write_text(json.dumps(dict(stage='epoch_complete',epoch=epoch,loss=total/batch_index,documents=dict(counts),backtest_reports=len(reports)),indent=2))
+    if latest_only:
+        from .warehouse_live import score_latest_equities
+        latest_result = score_latest_equities(model, stream, args)
     status=json.loads((args.output_dir/'status.json').read_text())
     status.update(stage='complete',epochs_completed=args.epochs,first_optimizer_update_seconds=first_update,total_seconds=perf_counter()-started)
+    if latest_only:
+        status.update(latest_result)
     (args.output_dir/'status.json').write_text(json.dumps(status,indent=2))
     print('status: complete\noutput: '+json.dumps(str(args.output_dir)),flush=True)
+    return status

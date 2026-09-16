@@ -390,7 +390,7 @@ class WarehouseAnnualStream:
         if include_options:
             years.update(y for s in symbols for y in self.option_years[s])
         for year in sorted(years):
-            if not (year < self.cutoff.year if training else start.year <= year <= end.year):
+            if not (datetime(year,1,1) < self.cutoff if training else start.year <= year <= end.year):
                 continue
             for symbol in symbols:
                 if year in equity_years[symbol]:

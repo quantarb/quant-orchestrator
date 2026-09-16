@@ -350,3 +350,5 @@ Full equities-only epoch performance can be measured with `scripts/benchmark_war
 Verified on NVIDIA GB10: the full $10B equities-only epoch (840 equities, 24,706 annual documents) completed in **50m 1s including startup and checkpointing**, with backtests excluded. Full settings and evidence are recorded in `docs/multirate-warehouse-streaming.md` and `docs/benchmarks/10b-equity-epoch-20260916.json`.
 
 Completed warehouse epochs can now be evaluated without retraining through `evaluate_warehouse_checkpoint` in `research_tools/warehouse_multirate_training.py`. It validates the saved schema and universe and writes checkpoint provenance plus the normal yearly backtest artifacts. See `docs/multirate-warehouse-streaming.md` for usage.
+
+The `optimal_trader` multirate live notebook delegates all-history training and latest-date equity predictions to `research_tools/warehouse_live.py::train_latest_warehouse_model`. It includes the latest partial year, uses the shared optimized training/inference implementation, and performs no options training or historical backtest. Latest fitted scores are identified as in-sample.

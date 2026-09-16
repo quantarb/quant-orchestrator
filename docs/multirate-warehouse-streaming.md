@@ -374,3 +374,23 @@ modeled costs. These are research results on the selected warehouse universe,
 not a point-in-time universe reconstruction. This run precedes the new inference
 scheduler. Full metrics and checkpoint provenance:
 [`benchmarks/10b-equity-backtest-20260916.json`](benchmarks/10b-equity-backtest-20260916.json).
+
+## All-history latest-date deployment workflow
+
+`research_tools.warehouse_live.train_latest_warehouse_model(output_dir,
+min_market_cap=..., ...)` drives the `optimal_trader` multirate live notebook.
+It discovers the latest finite positive stored equity close in the selected US
+NASDAQ/NYSE stock universe, reads history from 1900-01-01, and sets the exclusive
+training cutoff to the following day. The current partial year is included in
+the annual scheduler and supervised labels. Standard historical backtests still
+require a January 1 cutoff before their evaluation period; this deployment mode
+is explicitly separate and writes `evaluation_mode=latest_date_in_sample`.
+
+The model architecture, objectives, optimizer, source preparation and training
+loop are shared with warehouse research. Options remain disabled. After the last
+epoch, the live path reuses the model and stream and calls the shared optimized
+equity inference scheduler for the current year. Only the latest date is exported;
+symbols missing its prices are reported. There is no training-history inference
+replay or historical backtest. Artifacts include `latest_predictions.parquet`,
+`latest_prices.parquet`, `latest_prediction_summary.json`, and the normal epoch
+checkpoints. The live function never refreshes vendor data or connects to brokers.
