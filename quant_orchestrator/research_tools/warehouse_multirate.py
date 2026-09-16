@@ -98,11 +98,11 @@ class WarehouseAnnualStream:
         self.selection_policy = selection_policy(options_per_side)
         self.warehouse = warehouse or Warehouse()
         self.start, self.end, self.cutoff = map(datetime.fromisoformat, (start, end, cutoff))
-        requested_option_start = datetime.fromisoformat(option_start) if option_start else self.start
-        if option_start and (requested_option_start.month, requested_option_start.day) != (1, 1):
+        requested_option_start = datetime.fromisoformat(option_start) if option_start and options_per_side else self.start
+        if options_per_side and option_start and (requested_option_start.month, requested_option_start.day) != (1, 1):
             raise ValueError('Option start must be January 1 for annual first-session selection')
         self.option_start = max(self.start, requested_option_start)
-        if self.option_start >= self.cutoff:
+        if options_per_side and self.option_start >= self.cutoff:
             raise ValueError('Option start must precede the training cutoff')
         self.output = Path(output)
         schema = json.loads(Path(__file__).with_name('multirate_feature_schema.json').read_text())
@@ -125,7 +125,7 @@ class WarehouseAnnualStream:
             self.profiles[profile.symbol] = profile
         if not self.prices:
             raise ValueError('The requested market-cap universe has no training price history')
-        stored = set(self.warehouse.backend.list_symbols(provider_library(OPTIONS_THETADATA_EOD_LIBRARY, OPTIONS_THETADATA_PROVIDER)))
+        stored = set(self.warehouse.backend.list_symbols(provider_library(OPTIONS_THETADATA_EOD_LIBRARY, OPTIONS_THETADATA_PROVIDER))) if options_per_side else set()
         self.option_years = {}
         for symbol in sorted(self.prices):
             dates = read_option_chain_arctic(symbol, start_date=self.option_start.date().isoformat(), end_date=end,

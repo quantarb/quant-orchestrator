@@ -298,7 +298,50 @@ def test_option_preparation_only_reads_requested_symbol_year(monkeypatch,tmp_pat
 def test_invalid_option_sample_size_fails_before_warehouse_access():
     import pytest
     from quant_orchestrator.research_tools.warehouse_multirate import WarehouseAnnualStream
-    for count in (0, -1, True, 1.5):
+    for count in (-1, True, 1.5):
         with pytest.raises(ValueError, match='options_per_side'):
             WarehouseAnnualStream(min_market_cap=1e10, start='2021-01-01', end='2024-01-01',
                 cutoff='2024-01-01', output='unused', options_per_side=count)
+
+
+def test_equities_only_never_discovers_or_loads_options(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from quant_orchestrator.research_tools import warehouse_multirate as module
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Options must not be accessed')
+    prices = pl.DataFrame({'date': [datetime(2023,1,3), datetime(2023,1,4)], 'close': [1.,2.]})
+    warehouse = SimpleNamespace(
+        catalog=SimpleNamespace(query_symbol_profiles=lambda **k: [SimpleNamespace(symbol='A')]),
+        read_prices=lambda *a, **k: prices, backend=SimpleNamespace(list_symbols=forbidden))
+    monkeypatch.setattr(module, 'read_option_chain_arctic', forbidden)
+    stream = module.WarehouseAnnualStream(min_market_cap=1e10, start='1900-01-01',
+        end='2024-12-31', cutoff='2024-01-01', option_start='unused', options_per_side=0,
+        output=tmp_path, warehouse=warehouse)
+    assert stream.expected_option_symbols == set()
+    assert stream.option_years == {'A': []}
+    stream.cohorts = forbidden
+    stream.sample = lambda symbol, year, **kwargs: (symbol, year)
+    assert list(stream.documents()) == [('A', 2023)]
+
+
+def test_equities_only_evaluation_does_not_run_option_backtests(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from quant_orchestrator.research_tools import warehouse_multirate_training as module
+    from quant_orchestrator.platforms.backtesting_frameworks import existing_multirate_backtest as equity
+    from quant_orchestrator.platforms.backtesting_frameworks import equity_option_trade_backtest as option
+    day = datetime(2024,1,2)
+    prices = pl.DataFrame({'date': [day], **{k: [1.] for k in ('open','high','low','close','volume')}})
+    sample = dict(symbol='A', asset_class='equity', prices=prices)
+    stream = SimpleNamespace(documents=lambda **k: iter([sample]), layout={},
+        selection_policy={'contracts_per_side': 0})
+    monkeypatch.setattr(module, 'predict_batch', lambda *a: [dict(symbol='A', date=day,
+        **{name: .5 for name in module.SUPERVISED_TARGET_TASK_NAMES})])
+    monkeypatch.setattr(equity, 'run_existing_multirate_backtest', lambda *a, **k:
+        [dict(side=side, capital_return=0.) for side in ('long', 'short')])
+    def forbidden(*a, **k):
+        raise AssertionError('Option backtest must not run')
+    monkeypatch.setattr(option, 'run_equity_option_trade_backtest', forbidden)
+    args = SimpleNamespace(output_dir=tmp_path, prediction_start_date='2024-01-01',
+        prediction_end_date='2024-12-31', batch_size=1)
+    reports = module.evaluate_epoch(SimpleNamespace(eval=lambda: None), stream, args, 1)
+    assert [(r['asset_class'], r['side']) for r in reports] == [('equity','long'), ('equity','short')]

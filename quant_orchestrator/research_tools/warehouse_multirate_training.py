@@ -176,6 +176,8 @@ def evaluate_epoch(model, stream, args, epoch):
         for report in result:
             report=dict(year=year,asset_class='equity',**report);reports.append(report)
             print('[warehouse-backtest-book] '+json.dumps(dict(epoch=epoch,**report)),flush=True)
+        if stream.selection_policy['contracts_per_side'] == 0:
+            continue
         trades=pl.read_parquet(equity_path/'trade_windows.parquet').to_pandas()
         result=run_equity_option_trade_backtest(trades,stream,rank_candidates,output/str(year)/'option',year=year,
             dates=sorted(p['date'].unique().to_list()),capacity=min(20,p['symbol'].n_unique()))
@@ -201,7 +203,7 @@ def run_warehouse_training(args):
     first,cutoff,start,end=map(datetime.fromisoformat,(args.warehouse_start_date,args.train_end_date,args.prediction_start_date,args.prediction_end_date))
     if not first<cutoff<=start<=end or (cutoff.month,cutoff.day)!=(1,1):
         raise ValueError('Require warehouse start < January 1 training cutoff <= prediction start <= prediction end')
-    if args.warehouse_option_start_date:
+    if args.options_per_side and args.warehouse_option_start_date:
         option_start = datetime.fromisoformat(args.warehouse_option_start_date)
         if (option_start.month, option_start.day) != (1, 1) or max(first, option_start) >= cutoff:
             raise ValueError('--warehouse-option-start-date must be January 1 before the training cutoff')
@@ -224,13 +226,14 @@ def run_warehouse_training(args):
     args._warehouse_run_started=True
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     config.update(training_schedule='issuer_sequential',dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
-        options='annual hindsight-filtered sample; score equities first, then model-rank surviving options for triggered equity trades and use held-option Oracle exits',
+        options=('annual hindsight-filtered sample; score equities first, then model-rank surviving options for triggered equity trades and use held-option Oracle exits' if args.options_per_side else 'disabled; equities only'),
         option_selection=option_policy, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))
     stream=WarehouseAnnualStream(min_market_cap=args.min_market_cap,start=args.warehouse_start_date,
         end=args.prediction_end_date,cutoff=args.train_end_date,output=args.output_dir,option_start=args.warehouse_option_start_date,
         options_per_side=args.options_per_side)
     print(f'[warehouse-stream] metadata_ready_seconds={perf_counter()-started:.2f} equities={len(stream.prices)} option_underlyings={len(stream.expected_option_symbols)} corpus_built=false',flush=True)
+    asset_classes = ['equity', 'option'] if args.options_per_side else ['equity']
     device=torch.device(args.device);torch.manual_seed(args.seed)
     widths={**{r:tuple(stream.layout.values()) for r in ('annual','quarterly','daily')},'sparse':(8,)*len(SPARSE_FAMILIES)}
     family_names=[*stream.layout,*SPARSE_FAMILIES]
@@ -239,7 +242,7 @@ def run_warehouse_training(args):
         config=MultiRateTransformerConfig(backbone='encoder_decoder',d_model=args.d_model,num_heads=args.num_heads,layers=args.layers,
             document_pool='mean',max_position=512,cacheable_rate_states=True,learned_aggregation_gate=args.learned_aggregation_gate),
         feature_families={**{r:stream.layout for r in ('annual','quarterly','daily')},'sparse':dict.fromkeys(SPARSE_FAMILIES,8)},
-        modalities=['equity','option'],tasks=bundle.supervised_tasks,prediction_tasks=bundle.prediction_tasks).to(device)
+        modalities=asset_classes,tasks=bundle.supervised_tasks,prediction_tasks=bundle.prediction_tasks).to(device)
     optimizer=torch.optim.AdamW(model.parameters(),lr=2e-4,weight_decay=1e-4)
     prediction_names={n for n in PREDICTION_TASK_NAMES if args.self_supervision=='both' or n.startswith(args.self_supervision+'_')}
     tasks=tuple(Task(t.name,t.spec,args.reconstruction_weight if t.name in prediction_names else t.loss_weight)
@@ -261,7 +264,7 @@ def run_warehouse_training(args):
     first_update=None
     def checkpoint(epoch,batch,complete,loss):
         payload=dict(state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),configuration=config,
-            feature_schema=stream.features,normalization='signed_log1p_div10',asset_classes=['equity','option'],
+            feature_schema=stream.features,normalization='signed_log1p_div10',asset_classes=asset_classes,
             annual_memory_state=memory.state_dict(),task_observations=dict(observations),task_family_observations=dict(family_observations),
             task_loss_sums=dict(loss_sums),metrics=dict(epoch=epoch,batch=batch,epoch_complete=complete,loss=loss),
             torch_rng_state=torch.get_rng_state(),cuda_rng_state_all=torch.cuda.get_rng_state_all() if device.type=='cuda' else [])
@@ -306,7 +309,8 @@ def run_warehouse_training(args):
         if missing:raise ValueError(f'Warehouse option underlyings omitted from training: {sorted(missing)}')
         snapshots_only={s for s in seen_options if not stream.observed[s]['temporal_documents']}
         if snapshots_only:raise ValueError(f'Options lack historical price-series documents: {sorted(snapshots_only)}')
-        if not counts['equity'] or not counts['option']:raise ValueError('Both equity and option price documents must train')
+        if not counts['equity']:raise ValueError('Equity price documents must train')
+        if args.options_per_side and not counts['option']:raise ValueError('Option price documents must train when options are enabled')
         checkpoint(epoch,batch_index,True,total/batch_index);stream.write_coverage()
         if progress.due(sum(counts.values()),complete=True):
             status.update(epoch_training_complete=True,elapsed_seconds=perf_counter()-began)

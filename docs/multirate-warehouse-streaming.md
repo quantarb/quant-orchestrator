@@ -245,4 +245,6 @@ The old implementation was not benchmarked at 200 options; before/after
 comparisons above are limited to 50 and 100 options. This is a capacity and
 throughput check, not a completed training epoch or a new backtest result.
 
-The training notebook forwards `OPTIONS_PER_SIDE` as `--options-per-side` (CLI default: 5). This positive integer controls EDA and the per-underlying/year sample used by training and option backtests. Run configuration and selection audits record the chosen limit; fewer surviving contracts remain fewer. Other EDA filter settings do not override the trainer policy.
+The training notebook forwards `OPTIONS_PER_SIDE` as `--options-per-side` (CLI default: 5). This nonnegative integer controls EDA and the per-underlying/year sample used by training and option backtests. Run configuration and selection audits record the chosen limit; fewer surviving contracts remain fewer. Other EDA filter settings do not override the trainer policy.
+
+Set `OPTIONS_PER_SIDE = 0` in the notebook (CLI: `--options-per-side 0`) for equities-only training and evaluation. All option EDA cells, option warehouse discovery, sampling, and option backtests are skipped; completion requires only the long/short equity reports. Negative values are rejected.

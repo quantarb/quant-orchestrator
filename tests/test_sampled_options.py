@@ -79,7 +79,7 @@ def test_notebook_percentile_matches_per_underlying_training_policy():
         moneyness=1.,profit_pct=float(i+1)*scale,valid_quote_days=30,quote_coverage=1.)
         for s,scale in [('A',1),('B',1000)] for r in ('call','put') for i in range(4)]
     audit=pl.DataFrame(rows)
-    namespace=dict(pl=pl,pd=pd,PROFIT_QUANTILE=.5,history_options=audit,option_return_audit=audit,
+    namespace=dict(OPTIONS_PER_SIDE=5,pl=pl,pd=pd,PROFIT_QUANTILE=.5,history_options=audit,option_return_audit=audit,
         history_comparison=None,display=lambda *args:None,show_option_filter=lambda *args:None)
     exec(''.join(notebook['cells'][18]['source']),namespace)
     assert set(namespace['top_profit_options']['contract_symbol'])==set(select_contracts(audit)['contract_symbol'])

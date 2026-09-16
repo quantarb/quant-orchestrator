@@ -100,3 +100,26 @@ def test_options_per_side_reaches_training_and_invalidates_old_results():
     s['OPTIONS_PER_SIDE'] = 23
     with pytest.raises(RuntimeError, match='Settings changed'):
         s['result_frame']()
+
+
+def test_zero_options_skips_all_eda_and_expects_only_equity_reports():
+    notebook, s = state()
+    s['OPTIONS_PER_SIDE'] = 0
+    s['OPTION_START'] = 'unused'
+    exec(notebook.cells[5].source, s)
+    s['run_settings'] = s['current_run_settings']().copy()
+    # No imports, warehouse access, or previous EDA state required.
+    for cell in notebook.cells[7:25]:
+        if cell.cell_type == 'code':
+            exec(cell.source, {'OPTIONS_PER_SIDE': 0})
+    assert s['live_return_table']().columns.tolist() == ['equity_long', 'equity_short']
+    exec(notebook.cells[29].source, s)
+    command = s['training_command'](Path('/tmp/equities-only'))
+    assert command[command.index('--options-per-side') + 1] == '0'
+    for year in (2024, 2025, 2026):
+        for side in ('long', 'short'):
+            s['consume_live_line']('[warehouse-backtest-book] ' + json.dumps(dict(
+                epoch=1, year=year, asset_class='equity', side=side, capital_return=.1)))
+    s['run_complete'] = True
+    exec(notebook.cells[38].source, s)
+    assert len(s['live_reports']) == 6
