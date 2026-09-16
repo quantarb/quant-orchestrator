@@ -162,3 +162,8 @@ The warehouse training notebook keeps its editable settings in the first code ce
 The optional recurrent shared-issuer encoder prototype is documented in
 [warehouse streaming](../docs/multirate-warehouse-streaming.md). It remains disabled in the notebook; a small real-option
 batch benchmark measured only a modest improvement, not a full-epoch speedup.
+
+The family temporal encoder now uses native PyTorch scaled-dot-product attention
+with a compact mask broadcast over heads. This preserves independent instrument
+histories and the existing model weights while reducing attention-mask allocation.
+See the compact instrument benchmark in `docs/multirate-warehouse-streaming.md`.

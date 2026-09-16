@@ -196,3 +196,51 @@ using the GPU, so these noisy batch timings are not a full-epoch speed claim.
 Most historical equity-only batches have no cross-instrument reuse. The notebook
 default and existing running jobs remain unchanged. `benchmark.py`,
 `benchmark.log`, and `benchmark.json` preserve the experiment recipe and evidence.
+
+Compact family attention (September 15):
+`auto_features.family_temporal_attention` projects with the existing
+`MultiheadAttention` parameters and uses native PyTorch SDPA. A boolean
+`[instrument * family, 1, date, date]` mask broadcasts over heads, replacing
+the repeated per-head date mask and its expanded floating-point padding merge.
+Each instrument/family retains its own sequence; there is no attention between
+instruments. Same-date visibility, causal history, padding, task heads,
+recurrent state, and checkpoint parameter names are preserved. This optimization
+is automatic in the existing model and does not require enabling issuer sharing.
+CPU and CUDA tests compare outputs and input/parameter gradients against native
+MultiheadAttention and check future-date and instrument isolation.
+
+A CUDA float32 attention-only forward/backward benchmark on GB10 with 200
+instruments, eight families, 253 positions, width 64 and four heads measured
+0.189 s before versus 0.089 s after, with peak allocated memory 5.92 versus
+1.82 GiB. These are component timings, not full-model or full-epoch timings.
+
+The full-step benchmark in
+`artifacts/multirate_recovery/compact_instrument_benchmark` uses fresh AAPL 2023
+warehouse documents and compares the old and compact attention on identical
+weights, random seeds, batches and objectives. Both variants enable experimental
+issuer sharing and use the underlying equity calendar for issuer daily context.
+Four measured repetitions per variant follow warmup, with alternating order:
+
+| Options plus one equity | Old step | Compact step | Old peak GPU allocation | Compact peak GPU allocation |
+| --- | --- | --- | --- | --- |
+| 50 | 1.645 s | 1.255 s | 24.15 GiB | 15.71 GiB |
+| 100 | 3.134 s | 2.324 s | 47.54 GiB | 30.80 GiB |
+
+The 100-option step uses 26% less time and 35% less allocated GPU memory.
+These measurements include the supervised and reconstruction forward passes,
+backward, clipping and AdamW update, but exclude warehouse preparation and
+backtesting. They do not establish a full-epoch speedup. Only the compact
+attention change is enabled automatically; issuer sharing and the benchmark's
+larger option sample counts are not notebook defaults. Existing Python kernels
+must restart to load the changed model code.
+
+The larger capacity check in
+`artifacts/multirate_recovery/compact_instrument_benchmark_200` rebuilt the
+2023 AAPL and MSFT documents from the warehouse and trained 200 distinct real
+options plus two equities in one batch. With the compact encoder and the same
+experimental issuer sharing, three measured full steps after warmup had median
+5.187 s and peak allocation 62.18 GiB. Both calls and puts were eligible under
+the existing filters; the surviving pools for these two issuer-years were calls.
+The old implementation was not benchmarked at 200 options; before/after
+comparisons above are limited to 50 and 100 options. This is a capacity and
+throughput check, not a completed training epoch or a new backtest result.

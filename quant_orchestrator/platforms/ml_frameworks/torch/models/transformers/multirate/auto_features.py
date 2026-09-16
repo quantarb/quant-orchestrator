@@ -6,10 +6,43 @@ from typing import Literal
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 AutoFeatureMode = Literal["temporal", "cross_sectional"]
 AGGREGATION_FUNCTIONS = ("mean", "min", "max", "rmse", "q25", "q50", "q75")
+
+
+def family_temporal_attention(
+    attention: nn.MultiheadAttention,
+    tokens: torch.Tensor,
+    dates: torch.Tensor,
+    padding: torch.Tensor,
+    batch: int,
+    families: int,
+) -> torch.Tensor:
+    """Native SDPA with a mask broadcast over heads, keeping instruments isolated.
+
+    MultiheadAttention's public 3-D mask repeats every date mask across all
+    heads before merging padding. Project with its existing parameters and
+    call PyTorch SDPA directly to retain just one mask per family document.
+    """
+    documents, length, width = tokens.shape
+    heads = attention.num_heads
+    qkv = F.linear(tokens, attention.in_proj_weight, attention.in_proj_bias)
+    q, k, v = qkv.reshape(documents, length, 3, heads, width // heads).permute(2, 0, 3, 1, 4).unbind(0)
+    allowed = ~(dates.unsqueeze(-2) > dates.unsqueeze(-1))
+    if allowed.ndim == 2:
+        allowed = allowed[None, None]
+    else:
+        allowed = allowed[:, None]
+    allowed = (allowed & ~padding.reshape(batch, families, 1, length)).reshape(documents, 1, length, length)
+    attended = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=allowed,
+        dropout_p=attention.dropout if attention.training else 0.0,
+    )
+    attended = attended.transpose(1, 2).reshape(documents, length, width)
+    return F.linear(attended, attention.out_proj.weight, attention.out_proj.bias)
 
 
 class LearnedAggregationGate(nn.Module):
@@ -190,16 +223,9 @@ class AutoFeatureEngineer(nn.Module):
         # first position for every document also gives left-padded queries a
         # legal causal key.
         document_padding[:, 0] = False
-        temporal_mask = dates.unsqueeze(-2) > dates.unsqueeze(-1)
-        if temporal_mask.ndim == 3:
-            temporal_mask = temporal_mask.repeat_interleave(family_count * self.temporal_attention.num_heads, dim=0)
-        attended, _ = self.temporal_attention(
-            document_tokens,
-            document_tokens,
-            document_tokens,
-            attn_mask=temporal_mask,
-            key_padding_mask=document_padding,
-            need_weights=False,
+        attended = family_temporal_attention(
+            self.temporal_attention, document_tokens, dates, document_padding,
+            batch, family_count,
         )
         attended = torch.nan_to_num(attended, nan=0.0, posinf=0.0, neginf=0.0)
         attended = attended.reshape(batch, family_count, length, d_model).permute(0, 2, 1, 3)
