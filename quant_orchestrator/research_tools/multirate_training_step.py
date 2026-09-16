@@ -115,8 +115,6 @@ def make_training_step(*, args, trainer, device, annual_state, reconstruction_wi
         }
         if memory_input is not None and not module.config.share_recurrent_issuer_context:
             rate_context_ids = {}
-        issuer_ids = {issuer: i for i, issuer in enumerate(dict.fromkeys(item['issuer'] for item in batch))} if module.config.cross_instrument_attention else {}
-        instrument_groups = torch.tensor([issuer_ids[item['issuer']] for item in batch], device=device) if issuer_ids else None
         output = module(
             daily_batch, annual_batch, quarterly_batch, sparse_batch,
             daily_padding_mask=daily_mask, annual_padding_mask=annual_mask,
@@ -124,7 +122,7 @@ def make_training_step(*, args, trainer, device, annual_state, reconstruction_wi
             daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"),
             quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"),
             daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, daily_batch.shape[1]),
-            rate_context_ids=rate_context_ids, instrument_group_ids=instrument_groups,
+            rate_context_ids=rate_context_ids,
             issuer_streams=issuer_stream_inputs(batch, stack, issuer_context=args.issuer_context, device=device),
             **{f"{rate}_family_presence": family_channels(
                 torch.isfinite(stack(rate)) & ~stack(f"{rate}_padding").bool().unsqueeze(-1),
@@ -143,7 +141,7 @@ def make_training_step(*, args, trainer, device, annual_state, reconstruction_wi
                 daily_dates=stack("daily_timestamps"), annual_dates=stack("annual_timestamps"),
                 quarterly_dates=stack("quarterly_timestamps"), sparse_dates=stack("sparse_timestamps"),
                 daily_modality_ids=torch.tensor([asset_class_ids[item["asset_class"]] for item in batch], device=device)[:, None].expand(-1, daily_batch.shape[1]),
-                rate_context_ids=rate_context_ids, instrument_group_ids=instrument_groups,
+                rate_context_ids=rate_context_ids,
                 **{f"{rate}_family_presence": family_channels(
                     torch.isfinite(stack(rate)) & ~stack(f"{rate}_padding").bool().unsqueeze(-1),
                     reconstruction_widths[rate],

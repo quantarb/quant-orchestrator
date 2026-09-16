@@ -152,7 +152,6 @@ class MultiRateTransformerConfig:
     learned_aggregation_gate: bool = False
     cacheable_rate_states: bool = True
     share_recurrent_issuer_context: bool = False
-    cross_instrument_attention: bool = False
     attention_backend: AttentionBackend = "pytorch"
 
     def __post_init__(self) -> None:
@@ -336,10 +335,6 @@ class MultiRateTransformer(nn.Module):
             nn.GELU(),
         )
         self.issuer_context_fusion = nn.Linear(self.config.d_model, self.config.d_model, bias=False)
-        from .instrument_attention import InstrumentAttention
-        self.cross_instrument_attention = InstrumentAttention(
-            self.config.d_model, self.config.num_heads, self.config.dropout
-        ) if self.config.cross_instrument_attention else None
         self.family_names = tuple(dict.fromkeys(
             name for rate in self.config.rates for name in self.coverage_inputs[rate].family_names
         ))
@@ -757,7 +752,6 @@ class MultiRateTransformer(nn.Module):
         compute_document_outputs: bool = True,
         issuer_streams: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
         annual_memory: Mapping | None = None,
-        instrument_group_ids: torch.Tensor | None = None,
     ) -> dict[str, object]:
         """Encode a multi-rate window and return states plus task outputs.
 
@@ -1112,9 +1106,6 @@ class MultiRateTransformer(nn.Module):
         # Ordered issuer context followed by this instrument's own price states.
         context_parts.append(instrument_states)
         instrument_fused = self.instrument_fusion(torch.cat(context_parts, dim=-1))
-        if self.cross_instrument_attention is not None:
-            instrument_fused = self.cross_instrument_attention(
-                instrument_fused, query_dates, daily_padding_mask, instrument_group_ids)
         supervised_states = {**token_states, "daily": instrument_fused}
         (
             token_outputs, document_outputs, fused_document_state, family_document_state,
