@@ -177,3 +177,5 @@ Equities-only warehouse training (`OPTIONS_PER_SIDE = 0`) uses `equity_training_
 Warehouse document preparation reuses identical equity/issuer-daily and sparse/issuer-sparse raw tensors; GPU staging remains independent. Training progress includes cumulative `batch_wait_seconds`, `training_step_seconds`, and `checkpoint_seconds` to distinguish preparation waits from optimizer work and persistence. Step timing is wall time, not a CUDA-kernel profile.
 
 Full equities-only epoch performance can be measured with `scripts/benchmark_warehouse_epoch.py`, using a prior run’s configuration but fresh weights and warehouse reads. It verifies complete document coverage and stops after the epoch checkpoint, before backtests. See `docs/multirate-warehouse-streaming.md`.
+
+Verified on NVIDIA GB10: the full $10B equities-only epoch (840 equities, 24,706 annual documents) completed in **50m 1s including startup and checkpointing**, with backtests excluded. Full settings and evidence are recorded in `docs/multirate-warehouse-streaming.md` and `docs/benchmarks/10b-equity-epoch-20260916.json`.

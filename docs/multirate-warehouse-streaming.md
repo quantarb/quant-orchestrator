@@ -297,3 +297,32 @@ preserves document order, and at most one complete CPU batch is prefetched.
 A controlled 24-document AAPL benchmark measured 5.97/11.08/14.11/11.86 documents
 per second for 1/2/4/8 workers, respectively, with every output tensor equal.
 This is a preparation benchmark; the full-epoch report is the runtime evidence.
+
+
+### Verified full $10B equities-only epoch
+
+On September 16, 2026, the complete 840-equity universe trained all 24,706 annual
+documents in 424 optimizer batches. Total wall time, including source preparation,
+model setup, and the completed epoch checkpoint, was **3,000.77 seconds (50m 1s)**.
+The epoch timer was 2,994.66 seconds; the first optimizer update arrived at 513.51
+seconds. Backtests were excluded by the benchmark's evaluation-boundary hook.
+
+The run retained all available FMP history from the 1900 warehouse floor through
+the exclusive 2024-01-01 cutoff, CUDA FP32, batch size 64, model width 64, four
+attention heads, two layers, all existing supervised heads, both self-supervised
+objectives, and checkpoints every ten batches. POLARS_MAX_THREADS=8,
+OMP_NUM_THREADS=4, and four ordered preparation workers were used on NVIDIA GB10.
+No previously built corpus or training checkpoint was loaded.
+
+The final checkpoint reports epoch completion, contains 973 finite parameter
+tensors, and accompanies the complete document-count assertion. The ten-batch
+serial/parallel comparison had a loss difference of 9.54e-8 and maximum parameter
+absolute difference of 1.31e-5; training weights are not claimed bitwise identical.
+The measured report is [stored here](benchmarks/10b-equity-epoch-20260916.json).
+Local run artifacts are under
+`artifacts/multirate_recovery/10B/equity_epoch_performance_20260916_v3/`.
+
+Use quant-warehouse main at commit `8ad61b7` or later and the optimized orchestrator
+path introduced in `ee2586d`. An already running training process must be restarted
+to pick up the new implementation. The benchmark retains a completed checkpoint
+but intentionally does not produce evaluation or backtest reports.

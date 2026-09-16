@@ -1,0 +1,63 @@
+{
+  "started_at": "2026-09-16T16:12:41.840464+00:00",
+  "finished_at": "2026-09-16T17:02:42.609469+00:00",
+  "wall_seconds_including_setup": 3000.7690224020043,
+  "epoch_training": {
+    "stage": "training",
+    "epoch": 1,
+    "batch": 424,
+    "active_issuers": [
+      "ED"
+    ],
+    "batch_documents": 1,
+    "loss": 5.035513297566828,
+    "documents": {
+      "equity": 24706
+    },
+    "option_underlyings_seen": 0,
+    "first_optimizer_update_seconds": 513.5133164100043,
+    "elapsed_seconds": 2994.6592374989996,
+    "batch_wait_seconds": 1959.8397742489688,
+    "training_step_seconds": 1011.7833882560517,
+    "checkpoint_seconds": 21.580406712993863,
+    "document_upper_bound": 24706,
+    "epoch_training_complete": true
+  },
+  "equities": 840,
+  "expected_documents": 24706,
+  "evaluation_excluded": true,
+  "checkpoint": "artifacts/multirate_recovery/10B/equity_epoch_performance_20260916_v3/checkpoint_latest.pt",
+  "baseline_configuration": "artifacts/multirate_recovery/10B/warehouse_stream_20260916T154635Z_c63b5bf7/configuration.json",
+  "validation": {
+    "checkpoint_epoch_complete": true,
+    "checkpoint_batch": 424,
+    "model_parameter_tensors": 973,
+    "all_parameters_finite": true,
+    "full_equity_document_count": 24706,
+    "wall_seconds_including_setup": 3000.7690224020043
+  },
+  "implementation": {
+    "warehouse_commit": "8ad61b765ae8d8e410a4679c9cebd4d286f0beca",
+    "orchestrator_base": "2b4a83b4fbf753fcd3d98c02fdd1e2ca5992d299",
+    "gpu": "NVIDIA GB10",
+    "polars_threads": 8,
+    "omp_threads": 4,
+    "preparation_workers": 4,
+    "oracle_scalar_parity_cases": 180,
+    "real_sample_exact_parity_years": [
+      1985,
+      2000,
+      2020,
+      2023
+    ],
+    "parallel_preparation_tensor_parity": true,
+    "old_user_run_paused_pid": 536784,
+    "orchestrator_commit": "ee2586d06d940ebc1c314c54e961e968986260ee"
+  },
+  "parallel_training_comparison": {
+    "batch": 10,
+    "max_parameter_abs_difference": 1.3098644558340311e-05,
+    "loss_difference": 9.536743128535363e-08,
+    "parameter_tensors": 973
+  }
+}

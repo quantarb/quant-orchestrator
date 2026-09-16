@@ -59,6 +59,8 @@ def main():
             equities=len(stream.prices), expected_documents=expected, evaluation_excluded=True,
             checkpoint=str(args.output_dir/'checkpoint_latest.pt'), baseline_configuration=str(cli.configuration))
         (args.output_dir/'epoch_benchmark.json').write_text(json.dumps(report, indent=2)+'\n')
+        (args.output_dir/'status.json').write_text(json.dumps(
+            {**event, 'stage':'training_benchmark_complete', 'evaluation_excluded':True}, indent=2)+'\n')
         print('[epoch-benchmark] '+json.dumps(report), flush=True)
         raise EpochMeasured
     evaluate = training.evaluate_epoch
