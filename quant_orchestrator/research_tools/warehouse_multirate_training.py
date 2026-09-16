@@ -71,9 +71,15 @@ def equity_training_batches(stream, batch_size, seed):
         for symbol, prices in stream.prices.items()
         for year in sorted(prices['date'].dt.year().unique().to_list())
         if year < stream.cutoff.year]
+    def materialize(row):
+        return stream.sample(row['symbol'], row['year'], training=True)
     def batches():
-        for metadata in AnnualCorpus(rows, batch_size).batches(seed=seed):
-            yield [stream.sample(row['symbol'], row['year'], training=True) for row in metadata]
+        # Four workers won the controlled 1/2/4/8-worker preparation benchmark.
+        # map preserves document order; only raw data is prepared ahead.
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            for metadata in AnnualCorpus(rows, batch_size).batches(seed=seed):
+                stream.prepare_equity_sources([row['symbol'] for row in metadata])
+                yield list(workers.map(materialize, metadata))
     try:
         yield from prefetch_batches(batches())
     finally:
@@ -252,7 +258,7 @@ def run_warehouse_training(args):
     args.output_dir.mkdir(parents=True,exist_ok=False)
     args._warehouse_run_started=True
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
-    config.update(training_schedule=('issuer_sequential' if args.options_per_side else 'equity_interleaved'),dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
+    config.update(preparation_workers=1 if args.options_per_side else 4, training_schedule=('issuer_sequential' if args.options_per_side else 'equity_interleaved'),dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
         options=('annual hindsight-filtered sample; score equities first, then model-rank surviving options for triggered equity trades and use held-option Oracle exits' if args.options_per_side else 'disabled; equities only'),
         option_selection=option_policy, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))

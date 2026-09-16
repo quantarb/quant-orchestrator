@@ -48,22 +48,26 @@ def annual_tensor(frame, columns, start):
     dates = torch.full((size,), torch.iinfo(torch.long).max, dtype=torch.long)
     dates[0] = int((start - datetime(1970, 1, 1)).total_seconds()) * 10**9 - 1
     if frame.height:
-        raw = frame.select(columns).cast(pl.Float32).fill_null(float('nan')).to_torch()
+        present = set(frame.columns)
+        selected = [(index, column) for index, column in enumerate(columns) if column in present]
+        raw = frame.select([column for _, column in selected]).cast(pl.Float32).fill_null(float('nan')).to_torch()
         raw = torch.where(torch.isfinite(raw), raw, float('nan'))
         # Fixed, checkpointed transformation: no global data-fitting pass and
         # no changing running statistics between training and inference.
-        values[1:frame.height+1] = raw.sign() * raw.abs().log1p() / 10
+        values[1:frame.height+1, [index for index, _ in selected]] = raw.sign() * raw.abs().log1p() / 10
         padding[1:frame.height+1] = False
         dates[1:frame.height+1] = frame['date'].cast(pl.Datetime('ns')).dt.epoch('ns').to_torch()
     return values, padding, dates
 
 
-def merge_observations(frames, columns):
+def merge_observations(frames, columns, *, pad_schema=True):
     if not frames:
         return pl.DataFrame(schema={'date': pl.Datetime('ns'), **dict.fromkeys(columns, pl.Float32)})
     frame = pl.concat([f.with_columns(pl.col('date').cast(pl.Datetime('ns'))) for f in frames], how='diagonal_relaxed')
     frame = frame.group_by('date').agg(pl.all().drop_nulls().last()).sort('date')
     present = set(frame.columns)
+    if not pad_schema:
+        return frame.select('date', *[c for c in columns if c in present])
     return frame.select('date', *[pl.col(c) if c in present else pl.lit(None, dtype=pl.Float32).alias(c) for c in columns])
 
 
@@ -144,6 +148,7 @@ class WarehouseAnnualStream:
             equity_symbols=sorted(self.prices), option_symbols=sorted(self.expected_option_symbols), excluded=excluded), indent=2))
         self.macro = None
         self.contexts = None
+        self.peer_frames = {}
         self.write_coverage()
 
     def write_coverage(self):
@@ -190,6 +195,13 @@ class WarehouseAnnualStream:
         sparse = pl.concat(events, how='diagonal_relaxed') if events else pl.DataFrame(schema={
             'symbol':pl.String,'date':pl.Datetime('ns'),'event_date':pl.Datetime('ns'),'target_family':pl.String,
             **dict.fromkeys(VALUE_COLUMNS,pl.Float32)})
+        # Collapse annual/quarterly families once before slicing years.
+        # Keep daily family dates separate: peer as-of joins use their native
+        # observation calendars and must not acquire other families' null rows.
+        for rate, frames in rates.items():
+            if frames and rate != 'daily':
+                columns = list(dict.fromkeys(c for frame in frames for c in frame.columns if c != 'date'))
+                rates[rate] = [merge_observations(frames, columns)]
         result = rates, sparse.with_columns(pl.col('date','event_date').cast(pl.Datetime('ns')))
         self.sources[issuer] = result
         # Bounded source cache, independent of the number of annual documents.
@@ -230,8 +242,12 @@ class WarehouseAnnualStream:
         profile=self.profiles[symbol]
         result=[]
         for family,key,frame in self.contexts:
-            local=frame.filter(pl.col(key)==(getattr(profile,key,None) or 'Unknown')).drop(key)
-            result.append(local.rename({c:'value__'+family+'.'+c for c in numeric(local)}))
+            value = getattr(profile, key, None) or 'Unknown'
+            cache_key = (family, key, value)
+            if cache_key not in self.peer_frames:
+                local = frame.filter(pl.col(key) == value).drop(key)
+                self.peer_frames[cache_key] = local.rename({c:'value__'+family+'.'+c for c in numeric(local)})
+            result.append(self.peer_frames[cache_key])
         return result
 
     def prepare_option_cohort(self, symbol, year):
@@ -274,6 +290,17 @@ class WarehouseAnnualStream:
             raise ValueError(f'{symbol}/{year}: sampled contract histories are missing')
         return members, paths
 
+    def prepare_equity_sources(self, symbols):
+        """Warm shared raw data serially before concurrent read-only assembly."""
+        self.source_cache_limit = max(self.source_cache_limit, len(symbols))
+        self.common()
+        for symbol in symbols:
+            self.peer_context(symbol)
+        # Peer initialization visits the universe and may evict active issuers.
+        # Refill last so workers only touch resident, immutable source frames.
+        for symbol in symbols:
+            self.source(symbol)
+
     def sample(self, symbol, year, *, option_symbol=None, members=None, prices=None, training=True, start=None, end=None):
         first = max(datetime(year,1,1),start or self.start)
         last = min(datetime(year,12,31),end or self.end)
@@ -305,12 +332,12 @@ class WarehouseAnnualStream:
             part=filtered_events.filter(pl.col('target_family')==f)
             if part.height:
                 sparse_parts.append(part.select('date',*[pl.col(c).alias(f'{f}:{c}') for c in VALUE_COLUMNS]))
-        sparse_frame=merge_observations(sparse_parts,sparse_columns)
+        sparse_frame=merge_observations(sparse_parts,sparse_columns,pad_schema=False)
         sample=dict(symbol=identity, issuer=self.issuer(symbol), underlying_symbol=symbol, asset_class=asset,
             date=last.date().isoformat(),document_start=first.date().isoformat(),sequence_mode='annual_memory',
             issuer_context_key=(symbol,year),annual_context_key=(symbol,year),quarterly_context_key=(symbol,year))
         for rate in ('annual','quarterly','daily'):
-            frame=merge_observations(streams[rate],self.columns)
+            frame=merge_observations(streams[rate],self.columns,pad_schema=False)
             values,padding,dates=annual_tensor(frame,self.columns,first)
             sample.update({rate:values,rate+'_padding':padding,rate+'_timestamps':dates})
             if rate=='daily':
@@ -320,7 +347,7 @@ class WarehouseAnnualStream:
             for suffix, value in zip(('', '_padding', '_timestamps'), sparse_values):
                 sample[rate + suffix] = value
         if option_symbol:
-            issuer_values = annual_tensor(merge_observations(equity_daily, self.columns), self.columns, first)
+            issuer_values = annual_tensor(merge_observations(equity_daily, self.columns,pad_schema=False), self.columns, first)
         else:
             issuer_values = tuple(sample['daily' + suffix] for suffix in ('', '_padding', '_timestamps'))
         for suffix, value in zip(('', '_padding', '_timestamps'), issuer_values):

@@ -364,7 +364,8 @@ def test_equity_batches_fill_across_issuers_and_preserve_memory_order():
     builds, processed = [], Counter()
     stream = SimpleNamespace(
         prices={s: pl.DataFrame({'date': [datetime(y,1,3) for y in ys+[2024]]}) for s,ys in years.items()},
-        cutoff=datetime(2024,1,1), selection_policy={'contracts_per_side': 0}, sources={})
+        cutoff=datetime(2024,1,1), selection_policy={'contracts_per_side': 0}, sources={},
+        prepare_equity_sources=lambda symbols: None)
     def sample(symbol, year, **kwargs):
         builds.append((symbol,year))
         return dict(symbol=symbol, issuer=symbol, year=year)
@@ -395,6 +396,7 @@ def test_equity_scheduler_reduces_full_epoch_optimizer_steps():
     stream = SimpleNamespace(
         prices={f'S{i}': pl.DataFrame({'date':[datetime(y,1,3) for y in range(1994,2024)]}) for i in range(840)},
         cutoff=datetime(2024,1,1), selection_policy={'contracts_per_side':0}, sources={},
+        prepare_equity_sources=lambda symbols: None,
         sample=lambda symbol, year, **k: dict(symbol=symbol,year=year))
     batches = list(training_batches(stream,64,0))
     assert sum(map(len,batches)) == 25200
@@ -412,3 +414,41 @@ def test_merge_observations_preserves_order_nulls_and_missing_columns():
     expected = pl.DataFrame({'date':[d], 'y':[3.], 'missing':pl.Series([None],dtype=pl.Float32), 'x':[2.]}).with_columns(pl.col('date').cast(pl.Datetime('ns')))
     assert_frame_equal(result, expected)
     assert merge_observations([], ['x']).schema == {'date':pl.Datetime('ns'), 'x':pl.Float32}
+
+
+def test_sparse_schema_tensor_matches_explicit_null_padding():
+    from quant_orchestrator.research_tools.warehouse_multirate import annual_tensor, merge_observations
+    frame = pl.DataFrame({'date':[datetime(2021,1,4),datetime(2021,1,5)],
+                          'observed':[1.,float('inf')]})
+    columns = ['absent_before','observed','absent_after']
+    full = merge_observations([frame],columns)
+    compact = merge_observations([frame],columns,pad_schema=False)
+    for a,b in zip(annual_tensor(full,columns,datetime(2021,1,1)),
+                   annual_tensor(compact,columns,datetime(2021,1,1))):
+        torch.testing.assert_close(a,b,rtol=0,atol=0,equal_nan=True)
+
+
+def test_peer_context_cache_preserves_native_dates():
+    from types import SimpleNamespace
+    from quant_orchestrator.research_tools.warehouse_multirate import WarehouseAnnualStream
+    stream = WarehouseAnnualStream.__new__(WarehouseAnnualStream)
+    stream.peer_frames = {}
+    stream.profiles = {'A':SimpleNamespace(sector='Tech'), 'B':SimpleNamespace(sector='Tech')}
+    stream.contexts = [('peer','sector',pl.DataFrame({'date':[datetime(2021,1,4)],'sector':['Tech'],'value':[2.]}))]
+    first,second = stream.peer_context('A'),stream.peer_context('B')
+    assert first[0] is second[0]
+    assert first[0]['date'].to_list() == [datetime(2021,1,4)]
+    assert first[0]['value__peer.value'].to_list() == [2.]
+
+
+def test_equity_sources_warm_after_peer_initialization():
+    from quant_orchestrator.research_tools.warehouse_multirate import WarehouseAnnualStream
+    stream = WarehouseAnnualStream.__new__(WarehouseAnnualStream)
+    stream.source_cache_limit = 1
+    calls = []
+    stream.common = lambda: calls.append(('macro',None))
+    stream.peer_context = lambda s: calls.append(('peer',s))
+    stream.source = lambda s: calls.append(('source',s))
+    stream.prepare_equity_sources(['A','B'])
+    assert stream.source_cache_limit == 2
+    assert calls == [('macro',None),('peer','A'),('peer','B'),('source','A'),('source','B')]

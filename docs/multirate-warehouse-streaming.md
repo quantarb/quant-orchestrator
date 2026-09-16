@@ -274,3 +274,26 @@ seconds. Batch wait includes initial document setup; preparation overlapped with
 GPU work is not counted as waiting. Periodic checkpoint time appears in the next
 progress event. Training-step wall time includes staging, forward/backward, and
 optimizer work; it is not a synchronized CUDA-kernel breakdown.
+
+## Full equity epoch timing
+
+Equities-only preparation keeps absent fields out of intermediate Polars frames
+and scatters observed fields into the unchanged full-width tensors. Annual and
+quarterly issuer families are merged once per raw-source cache entry; daily
+family calendars remain separate for peer as-of joins. Peer frames are cached
+within the run by sector/industry. Oracle single-k targets use quant-warehouse's
+Numba solver with the original scalar recurrence and tie breaks.
+
+`scripts/benchmark_warehouse_epoch.py --configuration <run>/configuration.json
+--output-dir <new-run>` reproduces the full training configuration from fresh
+weights and warehouse reads. It measures through the completed epoch checkpoint,
+then stops at the evaluation boundary. It never loads the old run's corpus or
+checkpoint. `epoch_benchmark.json` verifies the complete equity-document count
+and reports both epoch time and wall time including setup; backtests are excluded.
+
+Equities-only batches use four preparation workers after serially warming the
+batch's source and peer caches. Only immutable frames are shared; ordered map
+preserves document order, and at most one complete CPU batch is prefetched.
+A controlled 24-document AAPL benchmark measured 5.97/11.08/14.11/11.86 documents
+per second for 1/2/4/8 workers, respectively, with every output tensor equal.
+This is a preparation benchmark; the full-epoch report is the runtime evidence.
