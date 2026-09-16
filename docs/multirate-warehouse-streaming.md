@@ -326,3 +326,51 @@ Use quant-warehouse main at commit `8ad61b7` or later and the optimized orchestr
 path introduced in `ee2586d`. An already running training process must be restarted
 to pick up the new implementation. The benchmark retains a completed checkpoint
 but intentionally does not produce evaluation or backtest reports.
+
+## Backtest a completed warehouse checkpoint
+
+Use `evaluate_warehouse_checkpoint` from
+`quant_orchestrator.research_tools.warehouse_multirate_training` to score and
+backtest saved weights without another training epoch:
+
+```python
+from quant_orchestrator.research_tools.warehouse_multirate_training import evaluate_warehouse_checkpoint
+
+reports = evaluate_warehouse_checkpoint(
+    "artifacts/multirate_recovery/10B/<run>/epoch_0001.pt",
+    "artifacts/multirate_recovery/10B/<run>/saved_epoch_backtest",
+    device="cuda",
+)
+```
+
+The output directory must be new. Keep the original `universe.json` beside the
+checkpoint. The evaluator restores the saved architecture and settings, checks
+the feature schema, normalization, document contract and equity universe, then
+uses the same evaluation function as training. It performs no optimizer steps
+and initializes inference memory empty, just as normal epoch evaluation does.
+Warehouse data is read fresh, so this is not a frozen historical data snapshot.
+The checkpoint hash, status, predictions, prices, yearly long/short reports and
+trade artifacts are saved in the evaluation directory. An equities-only
+checkpoint skips option evaluation. Reports use the saved prediction dates;
+calendar years are separate books rather than one compounded portfolio.
+
+Equity evaluation now uses the same raw-source warming and one-batch prefetch
+helpers as training, with four tensor-preparation workers. It holds one bounded
+block of issuers across prediction years before moving to the next block, avoiding
+annual reloads of the same issuer history. Annual memory remains isolated by
+instrument and chronological within each instrument. Score export converts whole
+head tensors to Python arrays instead of extracting each scalar separately.
+Inference logs separate cumulative batch preparation wait from prediction time;
+portfolio simulation remains the existing shared-book engine. The earlier
+completed-checkpoint backtest used the previous serial evaluation path; its wall
+time is not a benchmark of these new evaluation changes.
+
+Completed saved-epoch evaluation (September 16): 537,722 daily equity scores
+took 2,041.00 seconds, followed by 7.55 seconds for the six shared-book reports.
+Net capital returns for long/short books were +28.38%/-30.96% in 2024,
++24.34%/-20.75% in 2025, and +9.21%/-7.38% through September 9, 2026.
+Each book starts with $100,000 and uses next-session execution and 5.5 bps
+modeled costs. These are research results on the selected warehouse universe,
+not a point-in-time universe reconstruction. This run precedes the new inference
+scheduler. Full metrics and checkpoint provenance:
+[`benchmarks/10b-equity-backtest-20260916.json`](benchmarks/10b-equity-backtest-20260916.json).

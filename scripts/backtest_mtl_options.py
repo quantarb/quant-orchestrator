@@ -76,12 +76,14 @@ def main() -> None:
     parser.add_argument("--option-panel", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--fee-bps", type=float, default=0.0)
-    parser.add_argument("--slippage-bps", type=float, default=0.0)
+    parser.add_argument("--fee-bps", type=float, default=0.5)
+    parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--option-start-date", default="2025-01-01")
     parser.add_argument("--option-end-date")
     parser.add_argument("--option-dte", type=int, help="Restrict the panel to one DTE bucket.")
     args = parser.parse_args()
+    if args.fee_bps < 0.0 or args.slippage_bps < 0.0 or args.fee_bps + args.slippage_bps <= 0.0:
+        parser.error("transaction costs must be nonzero: set --fee-bps and/or --slippage-bps above zero")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     predictions = pd.read_csv(args.predictions, parse_dates=["date"])
@@ -166,7 +168,7 @@ def main() -> None:
             "annualized_sharpe": float(np.sqrt(252) * year_returns.mean() / year_returns.std()) if year_returns.std() > 0 else 0.0,
         })
     pd.DataFrame(yearly_rows).to_csv(args.output_dir / "yearly_summary.csv", index=False)
-    summary = _summary(daily["equity"], daily["active"], len(active), len(daily), args.threshold, args.fee_bps + args.slippage_bps)
+    summary = _summary(daily["equity"], daily["active"], len(active), len(daily), args.threshold, 2.0 * (args.fee_bps + args.slippage_bps))
     pd.DataFrame([summary]).to_csv(args.output_dir / "summary.csv", index=False)
     (args.output_dir / "metadata.json").write_text(json.dumps({
         "predictions": str(args.predictions), "option_panel": str(args.option_panel),

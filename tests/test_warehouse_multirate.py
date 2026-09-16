@@ -129,6 +129,32 @@ def test_streamed_inference_scores_only_observed_prices_without_warmup():
         result=predict_batch(model,[sample],AnnualMemory(),layout)
     assert len(result)==1 and result[0]['date']==first and result[0]['symbol']=='X'
     assert 0<=result[0]['oracle_is_buy']<=1
+    # Reordering independent instruments into source-reusing blocks must keep
+    # every prediction, including the following year's recurrent predictions.
+    documents = {}
+    for year in (2024, 2025):
+        offset = datetime(year,1,2) - first
+        for symbol in ('A','B','C'):
+            item = dict(sample, symbol=symbol, underlying_symbol=symbol,
+                document_start=f'{year}-01-01', date=f'{year}-12-31',
+                daily_dates=[d+offset for d in sample['daily_dates']])
+            for rate in ('annual','quarterly','daily','sparse','issuer_daily','issuer_sparse'):
+                item[rate+'_timestamps'] = sample[rate+'_timestamps'] + int(offset.total_seconds()*1e9)
+            documents[symbol,year] = item
+    serial = [['A2024','B2024'],['C2024','A2025'],['B2025','C2025']]
+    blocked = [['A2024','B2024'],['A2025','B2025'],['C2024'],['C2025']]
+    def score(order):
+        memory = AnnualMemory()
+        rows = []
+        with torch.inference_mode():
+            for keys in order:
+                rows.extend(predict_batch(model,[documents[k[0],int(k[1:])] for k in keys],memory,layout))
+        return {(r['symbol'],r['date']):{k:v for k,v in r.items() if isinstance(v,float)} for r in rows}
+    expected, actual = score(serial), score(blocked)
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        torch.testing.assert_close(torch.tensor(list(actual[key].values())),
+            torch.tensor(list(expected[key].values())), rtol=1e-5, atol=1e-6)
     # Exercise the exact shared training step after its extraction, including
     # issuer streams and option-specific supervised contributions.
     from collections import Counter
@@ -340,7 +366,8 @@ def test_equities_only_evaluation_does_not_run_option_backtests(monkeypatch, tmp
     day = datetime(2024,1,2)
     prices = pl.DataFrame({'date': [day], **{k: [1.] for k in ('open','high','low','close','volume')}})
     sample = dict(symbol='A', asset_class='equity', prices=prices)
-    stream = SimpleNamespace(documents=lambda **k: iter([sample]), layout={},
+    stream = SimpleNamespace(prices={'A':prices}, sample=lambda *a, **k: sample,
+        prepare_equity_sources=lambda symbols: None, layout={},
         selection_policy={'contracts_per_side': 0})
     monkeypatch.setattr(module, 'predict_batch', lambda *a: [dict(symbol='A', date=day,
         **{name: .5 for name in module.SUPERVISED_TARGET_TASK_NAMES})])

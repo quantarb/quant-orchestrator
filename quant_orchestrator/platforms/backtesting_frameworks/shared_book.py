@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Literal
 
 import numpy as np
@@ -14,6 +15,14 @@ StrategyVariant = Literal["long_only", "short_only", "long_short"]
 class SharedBookCostModel:
     commission_bps: float
     slippage_bps: float
+
+    def __post_init__(self) -> None:
+        commission = float(self.commission_bps)
+        slippage = float(self.slippage_bps)
+        if not all(math.isfinite(value) and value >= 0.0 for value in (commission, slippage)):
+            raise ValueError("commission_bps and slippage_bps must be finite and non-negative")
+        if commission + slippage <= 0.0:
+            raise ValueError("backtests require nonzero transaction costs")
 
     @property
     def total_bps(self) -> float:

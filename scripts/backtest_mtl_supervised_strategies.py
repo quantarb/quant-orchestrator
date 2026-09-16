@@ -29,6 +29,10 @@ SHORT_SCORE_COLUMNS = (
 
 def _read_prices(warehouse: Warehouse, symbol: str, start: str, end: str, provider: str) -> pd.DataFrame:
     frame = warehouse.read_prices(symbol, provider=provider, start=start, end=end)
+    if hasattr(frame, "is_empty"):
+        if frame.is_empty():
+            return pd.DataFrame()
+        frame = frame.to_pandas()
     if frame.empty:
         return pd.DataFrame()
     frame = frame.rename(columns=str.lower).reset_index()
@@ -62,9 +66,11 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--provider", default="fmp")
     parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--fee-bps", type=float, default=0.0)
-    parser.add_argument("--slippage-bps", type=float, default=0.0)
+    parser.add_argument("--fee-bps", type=float, default=0.5)
+    parser.add_argument("--slippage-bps", type=float, default=5.0)
     args = parser.parse_args()
+    if args.fee_bps < 0.0 or args.slippage_bps < 0.0 or args.fee_bps + args.slippage_bps <= 0.0:
+        parser.error("transaction costs must be nonzero: set --fee-bps and/or --slippage-bps above zero")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     predictions = pd.read_csv(args.predictions, parse_dates=["date"])
@@ -105,7 +111,7 @@ def main() -> None:
         daily["equity"] = (1.0 + daily["strategy_return"]).cumprod()
         daily["strategy"] = strategy
         daily.reset_index().to_csv(args.output_dir / f"{strategy}_daily.csv", index=False)
-        summaries.append({"strategy": strategy, "threshold": args.threshold, "friction_bps_round_trip": args.fee_bps + args.slippage_bps, **_metrics(daily["equity"], daily["positions"].gt(0))})
+        summaries.append({"strategy": strategy, "threshold": args.threshold, "friction_bps_round_trip": 2.0 * (args.fee_bps + args.slippage_bps), **_metrics(daily["equity"], daily["positions"].gt(0))})
         for year, year_frame in daily.groupby(daily.index.year):
             year_returns = year_frame["strategy_return"]
             year_equity = (1.0 + year_returns).cumprod()

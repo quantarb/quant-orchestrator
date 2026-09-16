@@ -7,6 +7,55 @@ from typing import Iterable
 import polars as pl
 
 
+def frozen_ten_option_members(chain: pl.DataFrame, *, first_session) -> pl.DataFrame:
+    """Select five observed expiries per right; retain every strike in each.
+
+    Selection uses only the actual first session, never a later fallback.
+    Quantile selection spans available positive DTEs without mixing expiries.
+    Equal contract weights are fixed at entry and must not be renormalized
+    when a constituent quote subsequently disappears.
+    """
+    first = chain.filter(_date_expr("snapshot_date") == first_session).with_columns(
+        ( _date_expr("expiration") - pl.lit(first_session)).dt.total_days().alias("dte"),
+        pl.col("option_type").str.to_lowercase(),
+    ).filter(pl.col("dte") > 0).unique("contract_symbol")
+    selected = []
+    for right in ("call", "put"):
+        part = first.filter(pl.col("option_type") == right)
+        expiries = sorted(part["dte"].unique().to_list())
+        if len(expiries) < 5:
+            raise ValueError(f"First-session {right} cohort has {len(expiries)} DTEs; five required")
+        chosen = [expiries[round(i * (len(expiries) - 1) / 4)] for i in range(5)]
+        selected.append(part.filter(pl.col("dte").is_in(chosen)))
+    return pl.concat(selected).with_columns(
+        pl.concat_str([pl.lit("OPT_"), pl.col("underlying_symbol"),
+                       pl.lit(f"_{first_session.year}_"), pl.col("option_type").str.to_uppercase(),
+                       pl.lit("_DTE_"), pl.col("dte")]).alias("document_symbol"),
+    ).with_columns((1.0 / pl.len().over("document_symbol")).alias("weight"))
+
+
+def frozen_option_paths(quotes: pl.DataFrame, members: pl.DataFrame) -> pl.DataFrame:
+    """Produce executable basket paths only where every frozen member is quoted.
+
+    Missing constituents invalidate a day's basket, rather than changing its
+    composition. No forward fill and no post-expiration extension are allowed.
+    """
+    joined = quotes.join(members.select("contract_symbol", "document_symbol", "weight"),
+                         on="contract_symbol", how="inner").with_columns(_date_expr("snapshot_date").alias("date"))
+    joined = joined.filter((pl.col("bid") >= 0) & (pl.col("ask") > 0)
+                           & (pl.col("ask") >= pl.col("bid"))
+                           & pl.col("bid").is_finite() & pl.col("ask").is_finite()
+                           & (pl.col("date") <= _date_expr("expiration")))
+    expected = members.group_by("document_symbol").len().rename({"len": "expected"})
+    return joined.unique(["document_symbol", "contract_symbol", "date"]).group_by("document_symbol", "date").agg(
+        (pl.col("bid") * pl.col("weight")).sum().alias("low"),
+        (pl.col("ask") * pl.col("weight")).sum().alias("high"),
+        pl.col("volume").sum().alias("volume"), pl.len().alias("observed"),
+    ).join(expected, on="document_symbol").filter(pl.col("observed") == pl.col("expected")).with_columns(
+        ((pl.col("low") + pl.col("high")) / 2).alias("close"),
+    ).with_columns(pl.col("close").alias("open")).rename({"document_symbol": "symbol"}).sort("symbol", "date")
+
+
 def _date_expr(name: str) -> pl.Expr:
     return pl.col(name).cast(pl.Datetime, strict=False).dt.replace_time_zone(None).dt.truncate("1d")
 

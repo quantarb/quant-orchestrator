@@ -93,6 +93,24 @@ def training_batches(stream, batch_size, seed):
         yield from equity_training_batches(stream, batch_size, seed)
 
 
+def equity_inference_batches(stream, batch_size, start, end):
+    """Reuse each bounded issuer block across years; preserve per-symbol memory order."""
+    symbols = sorted(stream.prices)
+    def batches():
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            for offset in range(0, len(symbols), batch_size):
+                block = symbols[offset:offset+batch_size]
+                years = {symbol:set(stream.prices[symbol]['date'].dt.year().to_list()) for symbol in block}
+                stream.prepare_equity_sources(block)
+                for year in range(start.year, end.year+1):
+                    eligible = [symbol for symbol in block if year in years[symbol]]
+                    if eligible:
+                        def materialize(symbol):
+                            return stream.sample(symbol, year, training=False, start=start, end=end)
+                        yield list(workers.map(materialize, eligible))
+    yield from prefetch_batches(batches())
+
+
 class EpochProgress:
     """Bound streaming progress output without counting/materializing the corpus."""
     def __init__(self, upper_bound, limit):
@@ -140,14 +158,14 @@ def predict_batch(model, batch, memory, layout):
         daily_modality_ids=torch.tensor([0 if b['asset_class']=='equity' else 1 for b in batch],device=device)[:,None].expand(-1,values['daily'].shape[1]),
         issuer_streams=issuer,compute_document_outputs=False,annual_memory=memory.inputs(batch,model))
     memory.update(batch,result)
-    predictions={name:(value.sigmoid() if name not in HITS_SUPERVISED_TASK_NAMES else value).squeeze(-1).cpu()
+    predictions={name:(value.sigmoid() if name not in HITS_SUPERVISED_TASK_NAMES else value).squeeze(-1).cpu().tolist()
                  for name,value in result['token_outputs'].items()}
     rows=[]
     for i,item in enumerate(batch):
         for j,(date,valid) in enumerate(zip(item['daily_dates'],item['daily_score_valid']),1):
             if valid:
                 rows.append(dict(symbol=item['symbol'],underlying_symbol=item['underlying_symbol'],asset_class=item['asset_class'],date=date,
-                    **{name:float(value[i,j]) for name,value in predictions.items()},
+                    **{name:value[i][j] for name,value in predictions.items()},
                     **({k:item[k] for k in ('option_type','expiration','settlement')} if item['asset_class']=='option' else {})))
     return rows
 
@@ -158,13 +176,19 @@ def evaluate_epoch(model, stream, args, epoch):
     start,end=map(datetime.fromisoformat,(args.prediction_start_date,args.prediction_end_date))
     memory=AnnualMemory();memory.begin_epoch(epoch)
     model.eval();rows=[];prices=[];began=perf_counter()
+    batch_wait_seconds = prediction_seconds = 0.
+    waiting = perf_counter()
     with torch.inference_mode():
-        for step,batch in enumerate(prefetch_batches(document_batches(stream.documents(training=False,start=start,end=end,include_options=False),args.batch_size)),1):
+        for step,batch in enumerate(equity_inference_batches(stream,args.batch_size,start,end),1):
+            batch_wait_seconds += perf_counter() - waiting
+            prediction_started = perf_counter()
             rows.extend(predict_batch(model,batch,memory,stream.layout))
+            prediction_seconds += perf_counter() - prediction_started
             for item in batch:
                 prices.append(item['prices'].select('date','open','high','low','close','volume').with_columns(
                     pl.lit(item['symbol']).alias('symbol'),pl.lit(item['asset_class']).alias('asset_class')))
-            print(f'[warehouse-inference] epoch={epoch} batch={step} scores={len(rows)} seconds={perf_counter()-began:.1f}',flush=True)
+            print(f'[warehouse-inference] epoch={epoch} batch={step} scores={len(rows)} seconds={perf_counter()-began:.1f} batch_wait_seconds={batch_wait_seconds:.1f} prediction_seconds={prediction_seconds:.1f}',flush=True)
+            waiting = perf_counter()
     scores=pl.DataFrame(rows, infer_schema_length=None).with_columns(pl.col('date').cast(pl.Datetime('ns')))
     quotes=pl.concat(prices,how='diagonal_relaxed').with_columns(pl.col('date').cast(pl.Datetime('ns')))
     if scores.select(pl.struct('symbol','date').is_duplicated().any()).item():
@@ -219,10 +243,80 @@ def evaluate_epoch(model, stream, args, epoch):
             print('[warehouse-backtest-book] '+json.dumps(dict(epoch=epoch,**report)),flush=True)
     (output/'results.json').write_text(json.dumps(reports,indent=2))
     timing=dict(inference_seconds=inference_seconds,backtest_seconds=perf_counter()-began,predictions=scores.height,
+                batch_wait_seconds=batch_wait_seconds,prediction_seconds=prediction_seconds,
                 inference_initialization='empty_memory_no_warmup', inference_assets=['equity'], training_option_selection=stream.selection_policy, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (output/'timing.json').write_text(json.dumps(timing,indent=2))
     print('[warehouse-backtest] '+json.dumps(dict(epoch=epoch,reports=reports,**timing)),flush=True)
     return reports
+
+
+def warehouse_model(stream, args, device):
+    """Construct the same architecture for training and saved-checkpoint evaluation."""
+    asset_classes = ['equity', 'option'] if args.options_per_side else ['equity']
+    widths={**{r:tuple(stream.layout.values()) for r in ('annual','quarterly','daily')},'sparse':(8,)*len(SPARSE_FAMILIES)}
+    family_names=[*stream.layout,*SPARSE_FAMILIES]
+    bundle=add_subtoken_temporal_tasks([],family_names,{n:['unused'] for n in DOCUMENT_TASK_NAMES[1:]},feature_dimensions=widths)
+    model=MultiRateTransformer({**{r:len(stream.features) for r in ('annual','quarterly','daily')},'sparse':8*len(SPARSE_FAMILIES)},
+        config=MultiRateTransformerConfig(backbone='encoder_decoder',d_model=args.d_model,num_heads=args.num_heads,layers=args.layers,
+            document_pool='mean',max_position=512,cacheable_rate_states=True,learned_aggregation_gate=args.learned_aggregation_gate),
+        feature_families={**{r:stream.layout for r in ('annual','quarterly','daily')},'sparse':dict.fromkeys(SPARSE_FAMILIES,8)},
+        modalities=asset_classes,tasks=bundle.supervised_tasks,prediction_tasks=bundle.prediction_tasks).to(device)
+    return model, bundle, widths, family_names
+
+
+def evaluate_warehouse_checkpoint(checkpoint, output_dir, *, device='cuda'):
+    """Backtest a completed warehouse epoch using its saved settings and universe.
+
+    Reads fresh warehouse data, validates the schema/universe, and starts empty
+    inference memory as in epoch evaluation. Never creates an optimizer.
+    The checkpoint's original universe.json must remain beside it.
+    """
+    import hashlib
+
+    checkpoint, output = Path(checkpoint).resolve(), Path(output_dir)
+    payload = torch.load(checkpoint, map_location='cpu', weights_only=True)
+    if not payload['metrics']['epoch_complete']:
+        raise ValueError('A completed epoch checkpoint is required')
+    if payload.get('normalization') != 'signed_log1p_div10':
+        raise ValueError('Checkpoint normalization differs from warehouse normalization')
+    args = SimpleNamespace(**{**payload['configuration'], 'output_dir': output})
+    if args.document_contract != ANNUAL_CONTRACT:
+        raise ValueError('Checkpoint annual document contract differs from the current contract')
+    expected = json.loads((checkpoint.parent/'universe.json').read_text())['equity_symbols']
+    output.mkdir(parents=True, exist_ok=False)
+    status = output/'status.json'
+    status.write_text(json.dumps(dict(stage='loading_warehouse')))
+    try:
+        stream = WarehouseAnnualStream(min_market_cap=args.min_market_cap,
+            start=args.warehouse_start_date, end=args.prediction_end_date,
+            cutoff=args.train_end_date, output=output,
+            option_start=args.warehouse_option_start_date, options_per_side=args.options_per_side)
+        if stream.features != payload['feature_schema']:
+            raise ValueError('Checkpoint feature schema differs from current schema')
+        if sorted(stream.prices) != sorted(expected):
+            raise ValueError('Warehouse universe changed since training')
+        asset_classes = ['equity', 'option'] if args.options_per_side else ['equity']
+        if payload['asset_classes'] != asset_classes:
+            raise ValueError('Checkpoint asset classes differ from its configuration')
+        model, _, _, _ = warehouse_model(stream, args, torch.device('cpu'))
+        model.load_state_dict(payload['state_dict'], strict=True)
+        model.to(torch.device(device))
+        with checkpoint.open('rb') as handle:
+            digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+        provenance = dict(checkpoint=str(checkpoint), checkpoint_sha256=digest,
+            metrics=payload['metrics'], equities=len(expected),
+            prediction_start=args.prediction_start_date, prediction_end=args.prediction_end_date,
+            options_per_side=args.options_per_side, optimizer_steps=0, device=str(device))
+        (output/'provenance.json').write_text(json.dumps(provenance, indent=2))
+        (output/'configuration.json').write_text(json.dumps(payload['configuration'], indent=2))
+        del payload
+        status.write_text(json.dumps(dict(stage='evaluating', **provenance), indent=2))
+        reports = evaluate_epoch(model, stream, args, provenance['metrics']['epoch'])
+        status.write_text(json.dumps(dict(stage='complete', reports=reports, **provenance), indent=2))
+        return reports
+    except Exception as exc:
+        status.write_text(json.dumps(dict(stage='failed', error=str(exc)), indent=2))
+        raise
 
 
 def run_warehouse_training(args):
@@ -269,14 +363,7 @@ def run_warehouse_training(args):
     print(f'[warehouse-stream] metadata_ready_seconds={perf_counter()-started:.2f} equities={len(stream.prices)} option_underlyings={len(stream.expected_option_symbols)} corpus_built=false',flush=True)
     asset_classes = ['equity', 'option'] if args.options_per_side else ['equity']
     device=torch.device(args.device);torch.manual_seed(args.seed)
-    widths={**{r:tuple(stream.layout.values()) for r in ('annual','quarterly','daily')},'sparse':(8,)*len(SPARSE_FAMILIES)}
-    family_names=[*stream.layout,*SPARSE_FAMILIES]
-    bundle=add_subtoken_temporal_tasks([],family_names,{n:['unused'] for n in DOCUMENT_TASK_NAMES[1:]},feature_dimensions=widths)
-    model=MultiRateTransformer({**{r:len(stream.features) for r in ('annual','quarterly','daily')},'sparse':8*len(SPARSE_FAMILIES)},
-        config=MultiRateTransformerConfig(backbone='encoder_decoder',d_model=args.d_model,num_heads=args.num_heads,layers=args.layers,
-            document_pool='mean',max_position=512,cacheable_rate_states=True,learned_aggregation_gate=args.learned_aggregation_gate),
-        feature_families={**{r:stream.layout for r in ('annual','quarterly','daily')},'sparse':dict.fromkeys(SPARSE_FAMILIES,8)},
-        modalities=asset_classes,tasks=bundle.supervised_tasks,prediction_tasks=bundle.prediction_tasks).to(device)
+    model, bundle, widths, family_names = warehouse_model(stream, args, device)
     optimizer=torch.optim.AdamW(model.parameters(),lr=2e-4,weight_decay=1e-4)
     prediction_names={n for n in PREDICTION_TASK_NAMES if args.self_supervision=='both' or n.startswith(args.self_supervision+'_')}
     tasks=tuple(Task(t.name,t.spec,args.reconstruction_weight if t.name in prediction_names else t.loss_weight)

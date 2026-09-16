@@ -179,3 +179,5 @@ Warehouse document preparation reuses identical equity/issuer-daily and sparse/i
 Full equities-only epoch performance can be measured with `scripts/benchmark_warehouse_epoch.py`, using a prior run’s configuration but fresh weights and warehouse reads. It verifies complete document coverage and stops after the epoch checkpoint, before backtests. See `docs/multirate-warehouse-streaming.md`.
 
 Verified on NVIDIA GB10: the full $10B equities-only epoch (840 equities, 24,706 annual documents) completed in **50m 1s including startup and checkpointing**, with backtests excluded. Full settings and evidence are recorded in `docs/multirate-warehouse-streaming.md` and `docs/benchmarks/10b-equity-epoch-20260916.json`.
+
+Completed warehouse epochs can now be evaluated without retraining through `evaluate_warehouse_checkpoint` in `research_tools/warehouse_multirate_training.py`. It validates the saved schema and universe and writes checkpoint provenance plus the normal yearly backtest artifacts. See `docs/multirate-warehouse-streaming.md` for usage.
