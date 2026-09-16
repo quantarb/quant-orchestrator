@@ -94,7 +94,7 @@ def inference_day(document, day):
 
 
 class WarehouseAnnualStream:
-    def __init__(self, *, min_market_cap, start, end, cutoff, output, warehouse=None, option_start=None, options_per_side=5):
+    def __init__(self, *, min_market_cap, start, end, cutoff, output, warehouse=None, option_start=None, options_per_side=5, source_cache_limit=16):
         self.selection_policy = selection_policy(options_per_side)
         self.warehouse = warehouse or Warehouse()
         self.start, self.end, self.cutoff = map(datetime.fromisoformat, (start, end, cutoff))
@@ -110,6 +110,7 @@ class WarehouseAnnualStream:
         self.layout = feature_family_layout(self.features)
         self.columns = ['value__' + f for f in self.features]
         self.feature_set = set(self.features)
+        self.source_cache_limit = source_cache_limit
         self.sources = OrderedDict()
         self.selected_cohorts = set()
         self.coverage, self.observed = {}, {}
@@ -191,7 +192,7 @@ class WarehouseAnnualStream:
         result = rates, sparse.with_columns(pl.col('date','event_date').cast(pl.Datetime('ns')))
         self.sources[issuer] = result
         # Bounded source cache, independent of the number of annual documents.
-        while len(self.sources) > 16:
+        while len(self.sources) > self.source_cache_limit:
             self.sources.popitem(last=False)
         return result
 

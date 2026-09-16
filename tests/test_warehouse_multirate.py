@@ -345,3 +345,50 @@ def test_equities_only_evaluation_does_not_run_option_backtests(monkeypatch, tmp
         prediction_end_date='2024-12-31', batch_size=1)
     reports = module.evaluate_epoch(SimpleNamespace(eval=lambda: None), stream, args, 1)
     assert [(r['asset_class'], r['side']) for r in reports] == [('equity','long'), ('equity','short')]
+
+
+def test_equity_batches_fill_across_issuers_and_preserve_memory_order():
+    from types import SimpleNamespace
+    from collections import Counter
+    from quant_orchestrator.research_tools.warehouse_multirate_training import training_batches
+    years = {'A': [2020,2021,2022], 'B': [2019,2022], 'C': [2021,2022,2023],
+             'D': [2020], 'E': [2018,2023]}
+    builds, processed = [], Counter()
+    stream = SimpleNamespace(
+        prices={s: pl.DataFrame({'date': [datetime(y,1,3) for y in ys+[2024]]}) for s,ys in years.items()},
+        cutoff=datetime(2024,1,1), selection_policy={'contracts_per_side': 0}, sources={})
+    def sample(symbol, year, **kwargs):
+        builds.append((symbol,year))
+        return dict(symbol=symbol, issuer=symbol, year=year)
+    stream.sample = sample
+    batches = training_batches(stream, 3, 0)
+    assert not builds
+    seen = []
+    for batch in batches:
+        assert len(batch) <= 3
+        assert len({r['symbol'] for r in batch}) == len(batch)
+        for row in batch:
+            symbol = row['symbol']
+            # Simulate the memory update after each forward/optimizer step.
+            assert row['year'] == years[symbol][processed[symbol]]
+            processed[symbol] += 1
+        seen.append(batch)
+    assert len(seen[0]) == 3
+    assert sum(map(len, seen)) == sum(map(len, years.values()))
+    assert len(seen) < sum(map(len, years.values()))
+    assert not stream.sources
+    repeat = list(training_batches(stream, 3, 0))
+    assert repeat == seen
+
+
+def test_equity_scheduler_reduces_full_epoch_optimizer_steps():
+    from types import SimpleNamespace
+    from quant_orchestrator.research_tools.warehouse_multirate_training import training_batches
+    stream = SimpleNamespace(
+        prices={f'S{i}': pl.DataFrame({'date':[datetime(y,1,3) for y in range(1994,2024)]}) for i in range(840)},
+        cutoff=datetime(2024,1,1), selection_policy={'contracts_per_side':0}, sources={},
+        sample=lambda symbol, year, **k: dict(symbol=symbol,year=year))
+    batches = list(training_batches(stream,64,0))
+    assert sum(map(len,batches)) == 25200
+    assert len(batches) == 420  # 13 full groups and one partial group, 30 years each.
+    assert all(len({r['symbol'] for r in b})==len(b) for b in batches)

@@ -340,3 +340,5 @@ The family temporal encoder now uses native PyTorch scaled-dot-product attention
 with a compact mask broadcast over heads. This preserves independent instrument
 histories and the existing model weights while reducing attention-mask allocation.
 See the compact instrument benchmark in `docs/multirate-warehouse-streaming.md`.
+
+Equities-only warehouse training (`OPTIONS_PER_SIDE = 0`) uses `equity_training_batches` in `research_tools/warehouse_multirate_training.py` to interleave independent equities up to `BATCH_SIZE`, preserving each equity’s chronological annual memory. Only metadata is scheduled ahead; raw documents are assembled with one CPU batch prefetched. The raw issuer-source cache holds at least one configured batch. Options-enabled runs retain issuer-sequential scheduling. Progress reports `batch_documents` and `active_issuers`; this changes optimizer grouping, so losses and weights need not match the old single-document schedule.

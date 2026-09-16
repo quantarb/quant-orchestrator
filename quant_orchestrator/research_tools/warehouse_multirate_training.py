@@ -12,7 +12,7 @@ import torch
 
 from .warehouse_multirate import WarehouseAnnualStream, SPARSE_FAMILIES
 from .sampled_options import selection_policy
-from .annual_memory import AnnualMemory, ANNUAL_CONTRACT
+from .annual_memory import AnnualMemory, AnnualCorpus, ANNUAL_CONTRACT
 from .multirate_batch import BatchTensors
 from .multirate_training_step import make_training_step
 from .multirate_objectives import family_channels
@@ -58,6 +58,33 @@ def issuer_training_batches(stream, batch_size, seed):
         yield from prefetch_batches(batches)
         # Only raw source features are released; recurrent model state remains.
         stream.sources.clear()
+
+
+def equity_training_batches(stream, batch_size, seed):
+    """Interleave independent equities; materialize only the next CPU batch.
+
+    Reuse AnnualCorpus's chronological scheduler with lightweight metadata, not
+    a materialized training corpus. Each equity's detached memory is updated by
+    the training loop before its next document is forwarded through the model.
+    """
+    rows = [dict(symbol=symbol, date=datetime(year, 1, 1), year=year)
+        for symbol, prices in stream.prices.items()
+        for year in sorted(prices['date'].dt.year().unique().to_list())
+        if year < stream.cutoff.year]
+    def batches():
+        for metadata in AnnualCorpus(rows, batch_size).batches(seed=seed):
+            yield [stream.sample(row['symbol'], row['year'], training=True) for row in metadata]
+    try:
+        yield from prefetch_batches(batches())
+    finally:
+        stream.sources.clear()
+
+
+def training_batches(stream, batch_size, seed):
+    if stream.selection_policy['contracts_per_side']:
+        yield from issuer_training_batches(stream, batch_size, seed)
+    else:
+        yield from equity_training_batches(stream, batch_size, seed)
 
 
 class EpochProgress:
@@ -225,13 +252,14 @@ def run_warehouse_training(args):
     args.output_dir.mkdir(parents=True,exist_ok=False)
     args._warehouse_run_started=True
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
-    config.update(training_schedule='issuer_sequential',dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
+    config.update(training_schedule=('issuer_sequential' if args.options_per_side else 'equity_interleaved'),dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
         options=('annual hindsight-filtered sample; score equities first, then model-rank surviving options for triggered equity trades and use held-option Oracle exits' if args.options_per_side else 'disabled; equities only'),
         option_selection=option_policy, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))
     stream=WarehouseAnnualStream(min_market_cap=args.min_market_cap,start=args.warehouse_start_date,
         end=args.prediction_end_date,cutoff=args.train_end_date,output=args.output_dir,option_start=args.warehouse_option_start_date,
-        options_per_side=args.options_per_side)
+        options_per_side=args.options_per_side,
+        source_cache_limit=16 if args.options_per_side else max(16, args.batch_size))
     print(f'[warehouse-stream] metadata_ready_seconds={perf_counter()-started:.2f} equities={len(stream.prices)} option_underlyings={len(stream.expected_option_symbols)} corpus_built=false',flush=True)
     asset_classes = ['equity', 'option'] if args.options_per_side else ['equity']
     device=torch.device(args.device);torch.manual_seed(args.seed)
@@ -274,7 +302,7 @@ def run_warehouse_training(args):
     for epoch in range(1,args.epochs+1):
         clock.current_epoch=epoch;model.train();total=0.;counts=Counter();seen_options=set();began=perf_counter()
         progress=EpochProgress(document_upper_bound,args.progress_updates_per_epoch)
-        for batch_index,batch in enumerate(issuer_training_batches(stream,args.batch_size,args.seed+epoch),1):
+        for batch_index,batch in enumerate(training_batches(stream,args.batch_size,args.seed+epoch),1):
             clock.current_step=batch_index;optimizer.zero_grad(set_to_none=True)
             losses=training_step(model,batch,tasks)
             loss=sum(t.loss_weight*losses[t.name] for t in tasks)
@@ -292,7 +320,7 @@ def run_warehouse_training(args):
                     key=item['underlying_symbol'];record=stream.observed.setdefault(key,dict(documents=0,price_observations=0,temporal_documents=0))
                     record['documents']+=1;record['price_observations']+=item['prices'].height
                     record['temporal_documents']+=int(item['prices'].height>1)
-            status=dict(stage='training',epoch=epoch,batch=batch_index,active_issuer=batch[-1]['issuer'],loss=total/batch_index,documents=dict(counts),
+            status=dict(stage='training',epoch=epoch,batch=batch_index,active_issuers=sorted({item['issuer'] for item in batch}),batch_documents=len(batch),loss=total/batch_index,documents=dict(counts),
                 option_underlyings_seen=len(seen_options),first_optimizer_update_seconds=first_update,elapsed_seconds=perf_counter()-began)
             (args.output_dir/'status.json').write_text(json.dumps(status,indent=2))
             status.update(document_upper_bound=document_upper_bound,epoch_training_complete=False)
