@@ -11,7 +11,7 @@ import polars as pl
 import torch
 
 from .warehouse_multirate import WarehouseAnnualStream, SPARSE_FAMILIES
-from .sampled_options import SELECTION_POLICY
+from .sampled_options import selection_policy
 from .annual_memory import AnnualMemory, ANNUAL_CONTRACT
 from .multirate_batch import BatchTensors
 from .multirate_training_step import make_training_step
@@ -184,7 +184,7 @@ def evaluate_epoch(model, stream, args, epoch):
             print('[warehouse-backtest-book] '+json.dumps(dict(epoch=epoch,**report)),flush=True)
     (output/'results.json').write_text(json.dumps(reports,indent=2))
     timing=dict(inference_seconds=inference_seconds,backtest_seconds=perf_counter()-began,predictions=scores.height,
-                inference_initialization='empty_memory_no_warmup', inference_assets=['equity'], training_option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
+                inference_initialization='empty_memory_no_warmup', inference_assets=['equity'], training_option_selection=stream.selection_policy, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (output/'timing.json').write_text(json.dumps(timing,indent=2))
     print('[warehouse-backtest] '+json.dumps(dict(epoch=epoch,reports=reports,**timing)),flush=True)
     return reports
@@ -192,6 +192,7 @@ def evaluate_epoch(model, stream, args, epoch):
 
 def run_warehouse_training(args):
     started=perf_counter()
+    option_policy = selection_policy(args.options_per_side)
     EpochProgress(1,args.progress_updates_per_epoch)  # Validate before opening the warehouse.
     if not args.min_market_cap>0 or args.epochs<1 or args.batch_size<1:
         raise ValueError('Positive market cap, epochs and batch size are required')
@@ -224,10 +225,11 @@ def run_warehouse_training(args):
     config={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     config.update(training_schedule='issuer_sequential',dataset_mode='warehouse_on_demand',normalization='signed_log1p_div10',document_contract=ANNUAL_CONTRACT,
         options='annual hindsight-filtered sample; score equities first, then model-rank surviving options for triggered equity trades and use held-option Oracle exits',
-        option_selection=SELECTION_POLICY, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
+        option_selection=option_policy, supervised_context_order=['annual','quarterly','daily','sparse','instrument'])
     (args.output_dir/'configuration.json').write_text(json.dumps(config,indent=2))
     stream=WarehouseAnnualStream(min_market_cap=args.min_market_cap,start=args.warehouse_start_date,
-        end=args.prediction_end_date,cutoff=args.train_end_date,output=args.output_dir,option_start=args.warehouse_option_start_date)
+        end=args.prediction_end_date,cutoff=args.train_end_date,output=args.output_dir,option_start=args.warehouse_option_start_date,
+        options_per_side=args.options_per_side)
     print(f'[warehouse-stream] metadata_ready_seconds={perf_counter()-started:.2f} equities={len(stream.prices)} option_underlyings={len(stream.expected_option_symbols)} corpus_built=false',flush=True)
     device=torch.device(args.device);torch.manual_seed(args.seed)
     widths={**{r:tuple(stream.layout.values()) for r in ('annual','quarterly','daily')},'sparse':(8,)*len(SPARSE_FAMILIES)}
@@ -254,7 +256,7 @@ def run_warehouse_training(args):
     document_upper_bound = sum(
         frame.filter(pl.col('date') < stream.cutoff)['date'].dt.year().n_unique()
         for frame in stream.prices.values()) + sum(
-        sum(year < stream.cutoff.year for year in years) * 2 * SELECTION_POLICY['contracts_per_side']
+        sum(year < stream.cutoff.year for year in years) * 2 * stream.selection_policy['contracts_per_side']
         for years in stream.option_years.values())
     first_update=None
     def checkpoint(epoch,batch,complete,loss):

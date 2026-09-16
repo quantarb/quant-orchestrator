@@ -277,18 +277,28 @@ def test_option_preparation_only_reads_requested_symbol_year(monkeypatch,tmp_pat
     from quant_orchestrator.research_tools import warehouse_multirate as module
     stream=module.WarehouseAnnualStream.__new__(module.WarehouseAnnualStream)
     stream.output=tmp_path;stream.end=datetime(2023,12,31)
+    stream.selection_policy=module.selection_policy(8)
     stream.selected_cohorts=set();stream.option_years={'A':[2021],'B':[2021]}
     stream.coverage={s:dict(cohorts=[]) for s in ('A','B')}
     stream.warehouse=SimpleNamespace(backend=None);stream.write_coverage=lambda:None
     reads=[]
     def candidates(warehouse,symbol,year,*args):
         reads.append((symbol,year))
-        audit=pl.DataFrame([dict(underlying_symbol=symbol,contract_symbol=symbol+'C',document_symbol=symbol+'C',
-            option_type='call',moneyness=1.,profit_pct=20.,valid_quote_days=30,quote_coverage=1.)])
-        return audit,pl.DataFrame({'symbol':[symbol+'C'],'date':[datetime(year,1,4)]}),'audited'
+        audit=pl.DataFrame([dict(underlying_symbol=symbol,contract_symbol=f'{symbol}C{i}',document_symbol=f'{symbol}C{i}',
+            option_type='call',moneyness=1.,profit_pct=20.,valid_quote_days=30,quote_coverage=1.) for i in range(20)])
+        return audit,pl.DataFrame({'symbol':audit['contract_symbol'],'date':[datetime(year,1,4)]*20}),'audited'
     monkeypatch.setattr(module,'contract_candidates',candidates)
-    assert stream.cohorts('A',2021)[0].height==1
-    assert stream.cohorts('A',2021)[0].height==1
+    assert stream.cohorts('A',2021)[0].height==8
+    assert stream.cohorts('A',2021)[0].height==8
     assert reads==[('A',2021)]
     assert stream.coverage['B']['cohorts']==[]
     assert not (tmp_path/'sampled_contracts/2021/B').exists()
+
+
+def test_invalid_option_sample_size_fails_before_warehouse_access():
+    import pytest
+    from quant_orchestrator.research_tools.warehouse_multirate import WarehouseAnnualStream
+    for count in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match='options_per_side'):
+            WarehouseAnnualStream(min_market_cap=1e10, start='2021-01-01', end='2024-01-01',
+                cutoff='2024-01-01', output='unused', options_per_side=count)

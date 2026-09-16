@@ -87,3 +87,16 @@ def test_three_years_four_books_are_visible_before_and_during_backtesting():
     assert s['live_return_table']().notna().all().all()
     s['run_complete']=True
     exec(notebook.cells[38].source,s)
+
+
+def test_options_per_side_reaches_training_and_invalidates_old_results():
+    notebook, s = state()
+    s['OPTIONS_PER_SIDE'] = 17
+    s['run_settings'] = s['current_run_settings']().copy()
+    exec(notebook.cells[29].source, s)
+    command = s['training_command'](Path('/tmp/options-run'))
+    assert command[command.index('--options-per-side') + 1] == '17'
+    assert s['run_settings']['options_per_side'] == 17
+    s['OPTIONS_PER_SIDE'] = 23
+    with pytest.raises(RuntimeError, match='Settings changed'):
+        s['result_frame']()

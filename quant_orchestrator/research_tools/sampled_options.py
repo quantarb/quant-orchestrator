@@ -12,6 +12,12 @@ SELECTION_POLICY = dict(same_expiration_year=True, positive_expiration_moneyness
     contracts_per_side=5, seed=0, hindsight_selection=True, fixed_universe=True)
 
 
+def selection_policy(options_per_side=5):
+    if not isinstance(options_per_side, int) or isinstance(options_per_side, bool) or options_per_side < 1:
+        raise ValueError('options_per_side must be a positive integer')
+    return {**SELECTION_POLICY, 'contracts_per_side': options_per_side}
+
+
 def sample_options_per_side(options, count=5, seed=0):
     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
         raise ValueError('Contracts per side must be a positive integer')
@@ -25,8 +31,9 @@ def sample_options_per_side(options, count=5, seed=0):
     return pl.concat(groups, how='diagonal_relaxed').sort('underlying_symbol', 'contract_symbol')
 
 
-def select_contracts(audit):
+def select_contracts(audit, *, options_per_side=5):
     """Apply stacked filters, then per-underlying/right medians and sampling."""
+    selection_policy(options_per_side)
     if audit.is_empty():
         return audit
     eligible = audit.filter(pl.col('moneyness').is_finite() & (pl.col('moneyness') > 0)
@@ -34,7 +41,7 @@ def select_contracts(audit):
         & (pl.col('valid_quote_days') >= 20) & (pl.col('quote_coverage') >= .80))
     cutoffs = eligible.group_by('underlying_symbol','option_type').agg(pl.col('profit_pct').quantile(.50, interpolation='linear').alias('profit_cutoff_pct'))
     survivors = eligible.join(cutoffs, on=['underlying_symbol','option_type']).filter(pl.col('profit_pct') >= pl.col('profit_cutoff_pct'))
-    return sample_options_per_side(survivors)
+    return sample_options_per_side(survivors, count=options_per_side)
 
 
 def contract_candidates(warehouse, symbol, year, end, read, calendar):

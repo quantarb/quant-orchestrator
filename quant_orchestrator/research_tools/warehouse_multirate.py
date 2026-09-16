@@ -23,7 +23,7 @@ from quant_warehouse.platforms.data_providers.thetadata.options import (
 )
 from quant_warehouse.warehouse.storage import provider_library
 from quant_warehouse.warehouse.sections import DEFAULT_ECONOMIC_SERIES
-from .sampled_options import contract_candidates, select_contracts, SELECTION_POLICY
+from .sampled_options import contract_candidates, select_contracts, selection_policy
 from .multirate_corpus import statement_fields
 from .multirate_targets import materialize_instrument_targets, VALUE_COLUMNS
 from .multirate_supervision import StreamingSupervision
@@ -94,7 +94,8 @@ def inference_day(document, day):
 
 
 class WarehouseAnnualStream:
-    def __init__(self, *, min_market_cap, start, end, cutoff, output, warehouse=None, option_start=None):
+    def __init__(self, *, min_market_cap, start, end, cutoff, output, warehouse=None, option_start=None, options_per_side=5):
+        self.selection_policy = selection_policy(options_per_side)
         self.warehouse = warehouse or Warehouse()
         self.start, self.end, self.cutoff = map(datetime.fromisoformat, (start, end, cutoff))
         requested_option_start = datetime.fromisoformat(option_start) if option_start else self.start
@@ -145,7 +146,7 @@ class WarehouseAnnualStream:
 
     def write_coverage(self):
         (self.output/'option_coverage.json').write_text(json.dumps(dict(source='warehouse',
-            construction='on_demand', option_start=self.option_start.date().isoformat(), selection_policy=SELECTION_POLICY, coverage=self.coverage, trained=self.observed), indent=2, default=str))
+            construction='on_demand', option_start=self.option_start.date().isoformat(), selection_policy=self.selection_policy, coverage=self.coverage, trained=self.observed), indent=2, default=str))
 
     def issuer(self, symbol):
         return {'GOOG': 'GOOGL', 'BRK-A': 'BRK-B'}.get(symbol, symbol)
@@ -243,7 +244,7 @@ class WarehouseAnnualStream:
         read = lambda a,b: read_thetadata_eod_option_chain(symbol, start_date=a, end_date=b, backend=self.warehouse.backend)
         audit, paths, status = contract_candidates(self.warehouse, symbol, year,
             min(datetime(year,12,31), self.end), read, calendar)
-        selected = select_contracts(audit) if status == 'audited' else audit.head(0)
+        selected = select_contracts(audit, options_per_side=self.selection_policy["contracts_per_side"]) if status == 'audited' else audit.head(0)
         if status == 'audited':
             paths = paths.filter(pl.col('symbol').is_in(selected['contract_symbol'].to_list()))
             if selected.is_empty():
@@ -251,7 +252,7 @@ class WarehouseAnnualStream:
         audit.write_parquet(directory/'audit.parquet')
         selected.write_parquet(directory/'selection.parquet')
         paths.write_parquet(directory/'prices.parquet')
-        (directory/'policy.json').write_text(json.dumps(SELECTION_POLICY, indent=2))
+        (directory/'policy.json').write_text(json.dumps(self.selection_policy, indent=2))
         self.coverage[symbol]['cohorts'].append(dict(year=year, status=status,
             candidates=audit.height, selected_contracts=selected.height))
         self.selected_cohorts.add(key)

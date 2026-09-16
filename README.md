@@ -487,7 +487,7 @@ The full $10B epoch-one no-warmup evaluation completed: 2,385 documents, 511,815
 The warehouse training notebook uses
 `platforms/backtesting_frameworks/equity_option_trade_backtest.py` for its option
 strategy: equity entries trigger ranking within the annual hindsight-filtered
-sample (up to five calls and five puts per symbol), then the held option's own
+sample (up to the configured `OPTIONS_PER_SIDE` calls and puts each per symbol), then the held option's own
 Oracle predictions control exit. HITS ranks long option returns for both rights.
 Only entry candidates and held contracts require option inference. Signals use
 next-observation execution; expiration forces settlement, with no roll. The replay
@@ -510,3 +510,5 @@ The family temporal encoder now uses native PyTorch scaled-dot-product attention
 with a compact mask broadcast over heads. This preserves independent instrument
 histories and the existing model weights while reducing attention-mask allocation.
 See the compact instrument benchmark in `docs/multirate-warehouse-streaming.md`.
+
+The training notebook forwards `OPTIONS_PER_SIDE` as `--options-per-side` (CLI default: 5). This positive integer controls EDA and the per-underlying/year sample used by training and option backtests. Run configuration and selection audits record the chosen limit; fewer surviving contracts remain fewer. Other EDA filter settings do not override the trainer policy.

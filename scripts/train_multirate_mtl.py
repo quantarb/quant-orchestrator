@@ -599,6 +599,7 @@ def main() -> None:
     source_group.add_argument("--min-market-cap", type=float, help="Train directly from warehouse annual equity and sampled-option documents; no prebuilt corpus")
     parser.add_argument("--warehouse-start-date", default="1900-01-01", help="Earliest warehouse observations (default all available history)")
     parser.add_argument("--warehouse-option-start-date", default=None, help="Earliest option year (January 1); defaults to warehouse start, independent of FMP history")
+    parser.add_argument("--options-per-side", type=int, default=5, help="Maximum sampled calls and puts each per underlying/year for warehouse training and backtests (positive integer; default: 5)")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, help="Load an existing multirate_mtl_model.pt for inference without optimizer steps.")
     parser.add_argument("--inference-only", action="store_true", help="Skip training and export predictions from --checkpoint.")

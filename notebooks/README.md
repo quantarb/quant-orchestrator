@@ -28,11 +28,11 @@ Filters consume the preceding stage's survivors: `all_options` →
 positive; the final filter keeps returns at or above the 50th percentile
 separately for each underlying’s calls and puts among its history-filter survivors. `filtered_options` exposes the current
 survivors with the original first-day columns for further filtering.
-The final sampling cell randomly selects up to 5 calls and 5 puts per symbol
+The final sampling cell randomly selects up to `OPTIONS_PER_SIDE` calls and puts each per symbol
 without replacement, with a reproducible seed per symbol and option type. Each
 side with fewer survivors keeps all of them; spare slots are not transferred
 between calls and puts. The plot uses these sampled options. The annual hindsight sample is also the backtest candidate pool. Equity entry
-signals trigger option-model ranking of at most five calls or puts. The selected
+signals trigger option-model ranking of at most `OPTIONS_PER_SIDE` calls or puts. The selected
 contract's own Oracle predictions determine exits on the next observed quote;
 equity exit dates do not determine option exits. Expiration settles intrinsically.
 The ask-to-bid return cell describes premium returns for those survivors, using
@@ -167,3 +167,5 @@ The family temporal encoder now uses native PyTorch scaled-dot-product attention
 with a compact mask broadcast over heads. This preserves independent instrument
 histories and the existing model weights while reducing attention-mask allocation.
 See the compact instrument benchmark in `docs/multirate-warehouse-streaming.md`.
+
+The training notebook forwards `OPTIONS_PER_SIDE` as `--options-per-side` (CLI default: 5). This positive integer controls EDA and the per-underlying/year sample used by training and option backtests. Run configuration and selection audits record the chosen limit; fewer surviving contracts remain fewer. Other EDA filter settings do not override the trainer policy.

@@ -16,6 +16,10 @@ def test_filters_then_separate_right_medians_then_fixed_balanced_sample():
     audit=pl.DataFrame(rows)
     picked=select_contracts(audit)
     assert picked.height==20
+    larger = select_contracts(audit, options_per_side=8)
+    assert larger.group_by("underlying_symbol", "option_type").len()["len"].to_list() == [8]*4
+    assert larger.equals(select_contracts(audit.reverse(), options_per_side=8))
+    assert select_contracts(audit, options_per_side=50).height == 40
     assert picked.group_by('underlying_symbol','option_type').len()['len'].to_list()==[5]*4
     assert picked.equals(select_contracts(audit.reverse()))
     assert picked.filter(pl.col('option_type')=='call')['profit_pct'].min()>=1050

@@ -61,7 +61,7 @@ underlying/years are recorded separately from missing source history.
 `sampled_options.py` applies same-year expiration, positive terminal moneyness,
 positive first-ask/last-bid profit, at least 20 valid quote days and 80% coverage,
 and the median profit separately for each underlying’s calls and puts. Valid quotes
-have finite bid > 0, ask > 0, and ask >= bid. Up to five calls and five puts per
+have finite bid > 0, ask > 0, and ask >= bid. Up to the configured number of calls and puts each per
 underlying are sampled independently with seed 0. Fewer survivors stay fewer.
 Each real contract has its own identity and historical series; strikes are never
 averaged. Both training and backtests intentionally use this hindsight-selected
@@ -244,3 +244,5 @@ the existing filters; the surviving pools for these two issuer-years were calls.
 The old implementation was not benchmarked at 200 options; before/after
 comparisons above are limited to 50 and 100 options. This is a capacity and
 throughput check, not a completed training epoch or a new backtest result.
+
+The training notebook forwards `OPTIONS_PER_SIDE` as `--options-per-side` (CLI default: 5). This positive integer controls EDA and the per-underlying/year sample used by training and option backtests. Run configuration and selection audits record the chosen limit; fewer surviving contracts remain fewer. Other EDA filter settings do not override the trainer policy.
