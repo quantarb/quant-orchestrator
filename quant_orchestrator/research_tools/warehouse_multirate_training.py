@@ -302,7 +302,11 @@ def run_warehouse_training(args):
     for epoch in range(1,args.epochs+1):
         clock.current_epoch=epoch;model.train();total=0.;counts=Counter();seen_options=set();began=perf_counter()
         progress=EpochProgress(document_upper_bound,args.progress_updates_per_epoch)
+        batch_wait_seconds = training_step_seconds = checkpoint_seconds = 0.
+        wait_started = perf_counter()
         for batch_index,batch in enumerate(training_batches(stream,args.batch_size,args.seed+epoch),1):
+            step_started = perf_counter()
+            batch_wait_seconds += step_started - wait_started
             clock.current_step=batch_index;optimizer.zero_grad(set_to_none=True)
             losses=training_step(model,batch,tasks)
             loss=sum(t.loss_weight*losses[t.name] for t in tasks)
@@ -310,6 +314,7 @@ def run_warehouse_training(args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True)
             optimizer.step();total+=float(loss.detach())
+            training_step_seconds += perf_counter() - step_started
             if first_update is None:
                 first_update=perf_counter()-started
                 (args.output_dir/'startup_timing.json').write_text(json.dumps(dict(first_optimizer_update_seconds=first_update,corpus_built=False),indent=2))
@@ -321,13 +326,17 @@ def run_warehouse_training(args):
                     record['documents']+=1;record['price_observations']+=item['prices'].height
                     record['temporal_documents']+=int(item['prices'].height>1)
             status=dict(stage='training',epoch=epoch,batch=batch_index,active_issuers=sorted({item['issuer'] for item in batch}),batch_documents=len(batch),loss=total/batch_index,documents=dict(counts),
-                option_underlyings_seen=len(seen_options),first_optimizer_update_seconds=first_update,elapsed_seconds=perf_counter()-began)
+                option_underlyings_seen=len(seen_options),first_optimizer_update_seconds=first_update,elapsed_seconds=perf_counter()-began,
+                batch_wait_seconds=batch_wait_seconds, training_step_seconds=training_step_seconds, checkpoint_seconds=checkpoint_seconds)
             (args.output_dir/'status.json').write_text(json.dumps(status,indent=2))
             status.update(document_upper_bound=document_upper_bound,epoch_training_complete=False)
             if progress.due(sum(counts.values())):
                 print('[warehouse-training] '+json.dumps(status),flush=True)
             if args.checkpoint_every_batches and batch_index%args.checkpoint_every_batches==0:
+                checkpoint_started = perf_counter()
                 checkpoint(epoch,batch_index,False,total/batch_index);stream.write_coverage()
+                checkpoint_seconds += perf_counter() - checkpoint_started
+            wait_started = perf_counter()
         eligible=set()
         for symbol, coverage in stream.coverage.items():
             for record in coverage['cohorts']:

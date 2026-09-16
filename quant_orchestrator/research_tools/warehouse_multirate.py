@@ -63,7 +63,8 @@ def merge_observations(frames, columns):
         return pl.DataFrame(schema={'date': pl.Datetime('ns'), **dict.fromkeys(columns, pl.Float32)})
     frame = pl.concat([f.with_columns(pl.col('date').cast(pl.Datetime('ns'))) for f in frames], how='diagonal_relaxed')
     frame = frame.group_by('date').agg(pl.all().drop_nulls().last()).sort('date')
-    return frame.with_columns(*[pl.lit(None, dtype=pl.Float32).alias(c) for c in columns if c not in frame.columns]).select('date', *columns)
+    present = set(frame.columns)
+    return frame.select('date', *[pl.col(c) if c in present else pl.lit(None, dtype=pl.Float32).alias(c) for c in columns])
 
 
 def inference_day(document, day):
@@ -314,10 +315,16 @@ class WarehouseAnnualStream:
             sample.update({rate:values,rate+'_padding':padding,rate+'_timestamps':dates})
             if rate=='daily':
                 daily_frame=frame
-        for rate,frame,columns in [('sparse',sparse_frame,sparse_columns),
-                ('issuer_sparse',sparse_frame,sparse_columns),('issuer_daily',merge_observations(equity_daily,self.columns),self.columns)]:
-            values,padding,dates=annual_tensor(frame,columns,first)
-            sample.update({rate:values,rate+'_padding':padding,rate+'_timestamps':dates})
+        sparse_values = annual_tensor(sparse_frame, sparse_columns, first)
+        for rate in ('sparse', 'issuer_sparse'):
+            for suffix, value in zip(('', '_padding', '_timestamps'), sparse_values):
+                sample[rate + suffix] = value
+        if option_symbol:
+            issuer_values = annual_tensor(merge_observations(equity_daily, self.columns), self.columns, first)
+        else:
+            issuer_values = tuple(sample['daily' + suffix] for suffix in ('', '_padding', '_timestamps'))
+        for suffix, value in zip(('', '_padding', '_timestamps'), issuer_values):
+            sample['issuer_daily' + suffix] = value
         length=len(sample['daily'])
         sample['supervised_targets']=torch.zeros(length,len(SUPERVISED_TARGET_TASK_NAMES))
         sample['supervised_valid']=torch.zeros(length,len(SUPERVISED_TARGET_TASK_NAMES),dtype=torch.bool)

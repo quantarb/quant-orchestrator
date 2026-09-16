@@ -250,3 +250,27 @@ The training notebook forwards `OPTIONS_PER_SIDE` as `--options-per-side` (CLI d
 Set `OPTIONS_PER_SIDE = 0` in the notebook (CLI: `--options-per-side 0`) for equities-only training and evaluation. All option EDA cells, option warehouse discovery, sampling, and option backtests are skipped; completion requires only the long/short equity reports. Negative values are rejected.
 
 Equities-only warehouse training (`OPTIONS_PER_SIDE = 0`) uses `equity_training_batches` in `research_tools/warehouse_multirate_training.py` to interleave independent equities up to `BATCH_SIZE`, preserving each equity’s chronological annual memory. Only metadata is scheduled ahead; raw documents are assembled with one CPU batch prefetched. The raw issuer-source cache holds at least one configured batch. Options-enabled runs retain issuer-sequential scheduling. Progress reports `batch_documents` and `active_issuers`; this changes optimizer grouping, so losses and weights need not match the old single-document schedule.
+
+
+## Document preparation measurement (2026-09-16)
+
+Profiling three warmed AAPL annual documents found 0.997 of 1.945 seconds in
+`merge_observations`, including repeated wide-schema lookups. Preparation now
+checks column membership once per merge and avoids rebuilding identical
+issuer-daily and issuer-sparse tensors for equities. Option daily and issuer
+daily remain distinct. Raw tensor aliases are read-only; `BatchTensors` stages
+fields separately before training masks are applied.
+
+A same-process alternating comparison on four AAPL years (2020–2023), with
+POLARS_MAX_THREADS=8 and OMP_NUM_THREADS=4, measured baseline totals of
+1.894/1.849/2.335 seconds and optimized totals of 1.254/1.306/1.074 seconds.
+Median document preparation improved 1.51x. All sample tensors matched exactly,
+including labels, masks, timestamps, and prices. This measures warmed preparation
+for one issuer, not a full training epoch or a GPU speedup; the live run continued
+while the comparison ran. No current-run process was interrupted.
+
+Progress now records cumulative batch-wait, training-step wall, and checkpoint
+seconds. Batch wait includes initial document setup; preparation overlapped with
+GPU work is not counted as waiting. Periodic checkpoint time appears in the next
+progress event. Training-step wall time includes staging, forward/backward, and
+optimizer work; it is not a synchronized CUDA-kernel breakdown.

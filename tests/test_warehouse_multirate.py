@@ -190,7 +190,15 @@ def test_option_target_builder_receives_contract_prices_not_issuer_prices(monkey
     call=stream.sample('AAPL',2023,option_symbol='AAPL230217C00150000',members=members,prices=prices([2.,4.]))
     stream.prices['AAPL']=prices([900.,800.])
     stream.sample('AAPL',2023,option_symbol='AAPL230217C00150000',members=members,prices=prices([2.,4.]))
-    stream.sample('AAPL',2023)
+    equity=stream.sample('AAPL',2023)
+    assert equity['daily'] is equity['issuer_daily']
+    assert equity['sparse'] is equity['issuer_sparse']
+    assert call['daily'] is not call['issuer_daily']
+    from quant_orchestrator.research_tools.multirate_batch import BatchTensors
+    staged = BatchTensors([equity], 'cpu')
+    before = staged('issuer_daily').clone()
+    staged('daily').zero_()
+    torch.testing.assert_close(staged('issuer_daily'), before, equal_nan=True)
     assert seen==[('AAPL230217C00150000',[2.,4.]),('AAPL230217C00150000',[2.,4.]),('AAPL',[900.,800.])]
     assert call['option_type']=='call' and call['expiration']==datetime(2023,2,17)
 
@@ -392,3 +400,15 @@ def test_equity_scheduler_reduces_full_epoch_optimizer_steps():
     assert sum(map(len,batches)) == 25200
     assert len(batches) == 420  # 13 full groups and one partial group, 30 years each.
     assert all(len({r['symbol'] for r in b})==len(b) for b in batches)
+
+
+def test_merge_observations_preserves_order_nulls_and_missing_columns():
+    from quant_orchestrator.research_tools.warehouse_multirate import merge_observations
+    from polars.testing import assert_frame_equal
+    d = datetime(2023,1,3)
+    frames = [pl.DataFrame({'date':[d,d], 'x':[1.,None]}),
+              pl.DataFrame({'date':[d], 'x':[2.], 'y':[3.]})]
+    result = merge_observations(frames, ['y','missing','x'])
+    expected = pl.DataFrame({'date':[d], 'y':[3.], 'missing':pl.Series([None],dtype=pl.Float32), 'x':[2.]}).with_columns(pl.col('date').cast(pl.Datetime('ns')))
+    assert_frame_equal(result, expected)
+    assert merge_observations([], ['x']).schema == {'date':pl.Datetime('ns'), 'x':pl.Float32}
