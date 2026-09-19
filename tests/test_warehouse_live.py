@@ -1,4 +1,6 @@
 from datetime import datetime
+import json
+import os
 from types import SimpleNamespace
 
 import polars as pl
@@ -36,6 +38,62 @@ def test_latest_training_includes_partial_year_and_disables_backtests(tmp_path,m
     assert live.train_latest_warehouse_model(tmp_path/'new',warehouse=object())=={'stage':'complete'}
     with pytest.raises(FileExistsError):
         live.train_latest_warehouse_model(tmp_path,warehouse=object())
+
+
+def test_latest_training_reuses_recent_compatible_complete_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, 'latest_warehouse_equity_date', lambda *a, **k: '2026-06-02')
+    run = tmp_path / 'latest_previous'
+    run.mkdir()
+    checkpoint = run / 'checkpoint_latest.pt'
+    predictions = run / 'latest_predictions.parquet'
+    prices = run / 'latest_prices.parquet'
+    for path in (checkpoint, predictions, prices):
+        path.write_bytes(b'test')
+    configuration = dict(
+        min_market_cap=10_000_000_000, epochs=1, batch_size=64,
+        d_model=64, num_heads=4, layers=2, seed=0,
+        reconstruction_weight=0.1, train_end_date='2026-06-03',
+        prediction_start_date='2026-06-02', prediction_end_date='2026-06-02',
+        options_per_side=0, self_supervision='both',
+    )
+    (run / 'configuration.json').write_text(json.dumps(configuration))
+    status = dict(stage='complete', score_date='2026-06-02',
+                  checkpoint=str(checkpoint.resolve()), prediction_path=str(predictions.resolve()),
+                  prices_path=str(prices.resolve()), predictions=2)
+    (run / 'status.json').write_text(json.dumps(status))
+    monkeypatch.setattr(training, 'run_warehouse_training',
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError('must reuse recent model')))
+    result = live.train_latest_warehouse_model(tmp_path / 'latest_new', warehouse=object())
+    assert result['reused'] is True
+    assert result['source_output_dir'] == str(run.resolve())
+    assert result['checkpoint'] == str(checkpoint.resolve())
+
+
+def test_latest_training_does_not_reuse_old_model(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, 'latest_warehouse_equity_date', lambda *a, **k: '2026-06-02')
+    run = tmp_path / 'latest_previous'
+    run.mkdir()
+    checkpoint = run / 'checkpoint_latest.pt'; checkpoint.write_bytes(b'test')
+    old = datetime.now().timestamp() - 25 * 3600
+    os.utime(checkpoint, (old, old))
+    for name in ('latest_predictions.parquet', 'latest_prices.parquet'):
+        (run / name).write_bytes(b'test')
+    configuration = dict(
+        min_market_cap=10_000_000_000, epochs=1, batch_size=64,
+        d_model=64, num_heads=4, layers=2, seed=0,
+        reconstruction_weight=0.1, train_end_date='2026-06-03',
+        prediction_start_date='2026-06-02', prediction_end_date='2026-06-02',
+        options_per_side=0, self_supervision='both',
+    )
+    (run / 'configuration.json').write_text(json.dumps(configuration))
+    (run / 'status.json').write_text(json.dumps({
+        'stage': 'complete', 'score_date': '2026-06-02',
+        'checkpoint': str(checkpoint.resolve()),
+        'prediction_path': str((run / 'latest_predictions.parquet').resolve()),
+        'prices_path': str((run / 'latest_prices.parquet').resolve()),
+    }))
+    monkeypatch.setattr(training, 'run_warehouse_training', lambda *a, **k: {'stage': 'complete', 'reused': False})
+    assert live.train_latest_warehouse_model(tmp_path / 'latest_new', warehouse=object())['reused'] is False
 
 
 def test_scheduler_trains_partial_current_year_but_not_post_cutoff():

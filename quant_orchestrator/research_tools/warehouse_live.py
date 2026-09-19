@@ -15,6 +15,49 @@ import torch
 from quant_warehouse.warehouse.api import Warehouse
 
 
+def _recent_compatible_run(parent, *, score_date, max_age_hours, expected):
+    """Return the newest complete, configuration-matched live run within the age limit."""
+    if max_age_hours <= 0 or not parent.exists():
+        return None
+    now = datetime.now().timestamp()
+    candidates = []
+    for run in parent.iterdir():
+        if not run.is_dir():
+            continue
+        required = {
+            "status": run / "status.json",
+            "configuration": run / "configuration.json",
+            "checkpoint": run / "checkpoint_latest.pt",
+            "predictions": run / "latest_predictions.parquet",
+            "prices": run / "latest_prices.parquet",
+        }
+        if not all(path.is_file() for path in required.values()):
+            continue
+        age_hours = (now - required["checkpoint"].stat().st_mtime) / 3600.0
+        if age_hours < 0 or age_hours >= max_age_hours:
+            continue
+        try:
+            status = json.loads(required["status"].read_text())
+            configuration = json.loads(required["configuration"].read_text())
+        except (OSError, ValueError, TypeError):
+            continue
+        if status.get("stage") != "complete" or status.get("score_date") != score_date:
+            continue
+        if any(configuration.get(name) != value for name, value in expected.items()):
+            continue
+        if status.get("prediction_path") != str(required["predictions"].resolve()):
+            continue
+        if status.get("prices_path") != str(required["prices"].resolve()):
+            continue
+        if status.get("checkpoint") != str(required["checkpoint"].resolve()):
+            continue
+        candidates.append((required["checkpoint"].stat().st_mtime, age_hours, run, status))
+    if not candidates:
+        return None
+    _, age_hours, run, status = max(candidates, key=lambda item: item[0])
+    return run, age_hours, status
+
+
 def latest_warehouse_equity_date(min_market_cap, *, warehouse=None):
     """Latest finite equity close in the requested stored US stock universe."""
     if min_market_cap <= 0:
@@ -38,7 +81,7 @@ def latest_warehouse_equity_date(min_market_cap, *, warehouse=None):
 def train_latest_warehouse_model(output_dir, *, min_market_cap=10_000_000_000,
         epochs=1, batch_size=64, d_model=64, num_heads=4, layers=2, device='cuda', seed=0,
         reconstruction_weight=0.1, checkpoint_every_batches=10, progress_updates_per_epoch=10,
-        warehouse=None):
+        reuse_max_age_hours=24.0, warehouse=None):
     """Train fresh weights on all stored history, including the partial latest year.
 
     The architecture/objectives match the completed warehouse equity model.
@@ -47,12 +90,30 @@ def train_latest_warehouse_model(output_dir, *, min_market_cap=10_000_000_000,
     """
     from .warehouse_multirate_training import run_warehouse_training
 
-    output = Path(output_dir)
-    if output.exists():
-        raise FileExistsError(output)
+    output = Path(output_dir).resolve()
     warehouse = warehouse or Warehouse()
     score_date = latest_warehouse_equity_date(min_market_cap, warehouse=warehouse)
     cutoff = (datetime.fromisoformat(score_date) + timedelta(days=1)).date().isoformat()
+    expected = dict(
+        min_market_cap=min_market_cap, epochs=epochs, batch_size=batch_size,
+        d_model=d_model, num_heads=num_heads, layers=layers, seed=seed,
+        reconstruction_weight=reconstruction_weight, train_end_date=cutoff,
+        prediction_start_date=score_date, prediction_end_date=score_date,
+        options_per_side=0, self_supervision='both',
+    )
+    recent = _recent_compatible_run(
+        output.parent, score_date=score_date,
+        max_age_hours=float(reuse_max_age_hours), expected=expected,
+    )
+    if recent is not None:
+        run, age_hours, status = recent
+        result = dict(status)
+        result.update(reused=True, reuse_age_hours=age_hours,
+                      source_output_dir=str(run.resolve()), requested_output_dir=str(output))
+        print(f'[warehouse-live] reusing={run} checkpoint_age_hours={age_hours:.2f} score_date={score_date}', flush=True)
+        return result
+    if output.exists():
+        raise FileExistsError(output)
     args = SimpleNamespace(output_dir=output, min_market_cap=min_market_cap,
         warehouse_start_date='1900-01-01', warehouse_option_start_date=None,
         train_end_date=cutoff, prediction_start_date=score_date, prediction_end_date=score_date,
