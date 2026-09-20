@@ -3,7 +3,7 @@
 Uses the shared warehouse model, objectives, scheduler and prediction adapter.
 These same-date fitted scores are deployment inputs, not out-of-sample results.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from time import perf_counter
@@ -15,11 +15,11 @@ import torch
 from quant_warehouse.warehouse.api import Warehouse
 
 
-def _recent_compatible_run(parent, *, score_date, max_age_hours, expected):
-    """Return the newest complete, configuration-matched live run within the age limit."""
-    if max_age_hours <= 0 or not parent.exists():
+def _same_date_compatible_run(parent, *, score_date, expected):
+    """Return the newest complete, configuration-matched live run created today."""
+    if not parent.exists():
         return None
-    now = datetime.now().timestamp()
+    local_today = datetime.now().astimezone().date()
     candidates = []
     for run in parent.iterdir():
         if not run.is_dir():
@@ -33,8 +33,11 @@ def _recent_compatible_run(parent, *, score_date, max_age_hours, expected):
         }
         if not all(path.is_file() for path in required.values()):
             continue
-        age_hours = (now - required["checkpoint"].stat().st_mtime) / 3600.0
-        if age_hours < 0 or age_hours >= max_age_hours:
+        checkpoint_mtime = required["checkpoint"].stat().st_mtime
+        checkpoint_date = datetime.fromtimestamp(
+            checkpoint_mtime, tz=timezone.utc
+        ).astimezone().date()
+        if checkpoint_date != local_today:
             continue
         try:
             status = json.loads(required["status"].read_text())
@@ -51,11 +54,11 @@ def _recent_compatible_run(parent, *, score_date, max_age_hours, expected):
             continue
         if status.get("checkpoint") != str(required["checkpoint"].resolve()):
             continue
-        candidates.append((required["checkpoint"].stat().st_mtime, age_hours, run, status))
+        candidates.append((checkpoint_mtime, run, status))
     if not candidates:
         return None
-    _, age_hours, run, status = max(candidates, key=lambda item: item[0])
-    return run, age_hours, status
+    _, run, status = max(candidates, key=lambda item: item[0])
+    return run, local_today, status
 
 
 def latest_warehouse_equity_date(min_market_cap, *, warehouse=None):
@@ -81,7 +84,7 @@ def latest_warehouse_equity_date(min_market_cap, *, warehouse=None):
 def train_latest_warehouse_model(output_dir, *, min_market_cap=10_000_000_000,
         epochs=1, batch_size=64, d_model=64, num_heads=4, layers=2, device='cuda', seed=0,
         reconstruction_weight=0.1, checkpoint_every_batches=10, progress_updates_per_epoch=10,
-        reuse_max_age_hours=24.0, warehouse=None):
+        reuse_if_trained_today=True, warehouse=None):
     """Train fresh weights on all stored history, including the partial latest year.
 
     The architecture/objectives match the completed warehouse equity model.
@@ -101,16 +104,15 @@ def train_latest_warehouse_model(output_dir, *, min_market_cap=10_000_000_000,
         prediction_start_date=score_date, prediction_end_date=score_date,
         options_per_side=0, self_supervision='both',
     )
-    recent = _recent_compatible_run(
-        output.parent, score_date=score_date,
-        max_age_hours=float(reuse_max_age_hours), expected=expected,
-    )
-    if recent is not None:
-        run, age_hours, status = recent
+    reusable = _same_date_compatible_run(
+        output.parent, score_date=score_date, expected=expected,
+    ) if reuse_if_trained_today else None
+    if reusable is not None:
+        run, trained_date, status = reusable
         result = dict(status)
-        result.update(reused=True, reuse_age_hours=age_hours,
+        result.update(reused=True, reuse_date=trained_date.isoformat(),
                       source_output_dir=str(run.resolve()), requested_output_dir=str(output))
-        print(f'[warehouse-live] reusing={run} checkpoint_age_hours={age_hours:.2f} score_date={score_date}', flush=True)
+        print(f'[warehouse-live] reusing={run} trained_date={trained_date} score_date={score_date}', flush=True)
         return result
     if output.exists():
         raise FileExistsError(output)

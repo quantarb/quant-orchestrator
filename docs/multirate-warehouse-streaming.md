@@ -385,6 +385,8 @@ training cutoff to the following day. The current partial year is included in
 the annual scheduler and supervised labels. Standard historical backtests still
 require a January 1 cutoff before their evaluation period; this deployment mode
 is explicitly separate and writes `evaluation_mode=latest_date_in_sample`.
+When enabled, reuse selects the newest complete configuration-matched model whose
+checkpoint was written on the current local calendar date.
 
 The model architecture, objectives, optimizer, source preparation and training
 loop are shared with warehouse research. Options remain disabled. After the last

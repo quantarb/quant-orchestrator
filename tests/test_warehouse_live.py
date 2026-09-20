@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 from types import SimpleNamespace
@@ -40,7 +40,7 @@ def test_latest_training_includes_partial_year_and_disables_backtests(tmp_path,m
         live.train_latest_warehouse_model(tmp_path,warehouse=object())
 
 
-def test_latest_training_reuses_recent_compatible_complete_run(tmp_path, monkeypatch):
+def test_latest_training_reuses_compatible_complete_run_from_today(tmp_path, monkeypatch):
     monkeypatch.setattr(live, 'latest_warehouse_equity_date', lambda *a, **k: '2026-06-02')
     run = tmp_path / 'latest_previous'
     run.mkdir()
@@ -65,16 +65,19 @@ def test_latest_training_reuses_recent_compatible_complete_run(tmp_path, monkeyp
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError('must reuse recent model')))
     result = live.train_latest_warehouse_model(tmp_path / 'latest_new', warehouse=object())
     assert result['reused'] is True
+    assert result['reuse_date'] == datetime.now().astimezone().date().isoformat()
     assert result['source_output_dir'] == str(run.resolve())
     assert result['checkpoint'] == str(checkpoint.resolve())
 
 
-def test_latest_training_does_not_reuse_old_model(tmp_path, monkeypatch):
+def test_latest_training_does_not_reuse_model_from_yesterday(tmp_path, monkeypatch):
     monkeypatch.setattr(live, 'latest_warehouse_equity_date', lambda *a, **k: '2026-06-02')
     run = tmp_path / 'latest_previous'
     run.mkdir()
     checkpoint = run / 'checkpoint_latest.pt'; checkpoint.write_bytes(b'test')
-    old = datetime.now().timestamp() - 25 * 3600
+    local_now = datetime.now().astimezone()
+    yesterday = local_now.date() - timedelta(days=1)
+    old = datetime.combine(yesterday, datetime.max.time(), tzinfo=local_now.tzinfo).timestamp()
     os.utime(checkpoint, (old, old))
     for name in ('latest_predictions.parquet', 'latest_prices.parquet'):
         (run / name).write_bytes(b'test')
