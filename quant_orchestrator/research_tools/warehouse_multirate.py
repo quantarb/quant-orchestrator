@@ -120,7 +120,8 @@ class WarehouseAnnualStream:
         self.selected_cohorts = set()
         self.coverage, self.observed = {}, {}
         profiles = self.warehouse.catalog.query_symbol_profiles(provider='fmp', min_market_cap=min_market_cap,
-            country='US', exchanges=['NASDAQ', 'NYSE'], exclude_etf=True, exclude_fund=True)
+            country='US', exchanges=['NASDAQ', 'NYSE'], exclude_etf=True, exclude_fund=True,
+            supported_equities_only=True)
         self.prices, self.profiles, excluded = {}, {}, []
         for profile in profiles:
             frame = self.warehouse.read_prices(profile.symbol, provider='fmp', start=start, end=end)

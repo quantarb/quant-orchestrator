@@ -67,7 +67,8 @@ def latest_warehouse_equity_date(min_market_cap, *, warehouse=None):
         raise ValueError('min_market_cap must be positive')
     warehouse = warehouse or Warehouse()
     profiles = warehouse.catalog.query_symbol_profiles(provider='fmp', min_market_cap=min_market_cap,
-        country='US', exchanges=['NASDAQ','NYSE'], exclude_etf=True, exclude_fund=True)
+        country='US', exchanges=['NASDAQ','NYSE'], exclude_etf=True, exclude_fund=True,
+        supported_equities_only=True)
     dates = []
     for profile in profiles:
         prices = warehouse.read_prices(profile.symbol, provider='fmp', start='1900-01-01')
